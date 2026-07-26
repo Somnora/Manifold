@@ -14,6 +14,10 @@ class CloudInstanceTypeSpec(BaseModel):
     price_cents_per_hour: int
     regions_available: List[str]
 
+    @property
+    def regions_with_capacity(self) -> List[str]:
+        return self.regions_available
+
 class CloudInstanceInfo(BaseModel):
     id: str
     provider: str
@@ -25,6 +29,29 @@ class CloudInstanceInfo(BaseModel):
     created_at: datetime
     price_cents_per_hour: int
     ssh_key_name: Optional[str] = None
+    gpu_description: str = ""
+    gpu_type: Optional[str] = None
+    file_system_names: List[str] = []
+
+    @property
+    def filesystem_names(self) -> List[str]:
+        return self.file_system_names
+
+    @property
+    def ip(self) -> Optional[str]:
+        return self.ip_address
+
+    @property
+    def hourly_rate_cents(self) -> int:
+        return self.price_cents_per_hour
+
+    @property
+    def is_running(self) -> bool:
+        return self.status in ("booting", "active", "unhealthy")
+
+    @property
+    def gpu_description(self) -> str:
+        return self.gpu_type or ""
 
 class CloudProvider(ABC):
     @abstractmethod
@@ -40,7 +67,7 @@ class CloudProvider(ABC):
         pass
 
     @abstractmethod
-    async def launch_instance(self, region: str, instance_type: str, ssh_key_names: List[str], filesystem_names: List[str], name: str = "") -> str:
+    async def launch_instance(self, region: str, instance_type: str, ssh_key_names: List[str], filesystem_names: List[str], name: str = "", user_data: str = "") -> str:
         pass
 
     @abstractmethod

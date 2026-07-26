@@ -69,6 +69,7 @@ from .task_queue import SQLiteTaskQueue
 from .templates import load_templates
 from .ide_attach import write_ssh_config_block, get_ide_urls
 from .terminal_sessions import TerminalSession, TerminalSessionManager
+from .providers import ProviderRegistry, LambdaProvider, GCPProvider, MockGCPProvider, RealGCPProvider
 
 logger = logging.getLogger("manifold.main")
 

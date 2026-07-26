@@ -39,6 +39,8 @@ class LambdaProvider(CloudProvider):
                 status=i.status,
                 created_at=datetime.now(timezone.utc), # mock created at for lambda since it's not in InstanceInfo
                 price_cents_per_hour=i.hourly_rate_cents,
+                gpu_description=i.gpu_description,
+                file_system_names=i.file_system_names,
             ) for i in instances
         ]
 
@@ -55,17 +57,20 @@ class LambdaProvider(CloudProvider):
                 status=i.status,
                 created_at=datetime.now(timezone.utc),
                 price_cents_per_hour=i.hourly_rate_cents,
+                gpu_description=i.gpu_description,
+                file_system_names=i.file_system_names,
             )
         except Exception:
             return None
 
-    async def launch_instance(self, region: str, instance_type: str, ssh_key_names: List[str], filesystem_names: List[str], name: str = "") -> str:
+    async def launch_instance(self, region: str, instance_type: str, ssh_key_names: List[str], filesystem_names: List[str], name: str = "", user_data: str = "") -> str:
         return await self.client.launch_instance(
             instance_type=instance_type,
             region=region,
             ssh_key_names=ssh_key_names,
             filesystem_names=filesystem_names,
-            name=name
+            name=name,
+            user_data=user_data,
         )
 
     async def terminate_instance(self, instance_id: str) -> bool:

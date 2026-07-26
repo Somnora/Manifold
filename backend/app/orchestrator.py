@@ -65,6 +65,7 @@ from .lambda_api import (
 from .model_client import ModelClient, RealModelClient
 from .sidecar_client import RealSidecarClient, SidecarClient, SidecarError
 from .ide_attach import remove_ssh_config_block
+from .providers import ProviderRegistry
 
 logger = logging.getLogger("manifold.orchestrator")
 
@@ -124,6 +125,7 @@ class LaunchPlan:
     types_to_try: list[str]          # requested type first, then fallbacks
     prices: dict[str, int]           # cents/hour per candidate type
     name: str
+    provider: str = "lambda"
 
 
 # A launch a poller can stop watching: nothing further will change on its own.
@@ -268,8 +270,19 @@ class Orchestrator:
         notifier=None,       # NotificationCenter: pings on rescue/blocked
     ):
         self.settings = settings
+        if not isinstance(providers, ProviderRegistry):
+            from .providers import CloudProvider, LambdaProvider
+            if isinstance(providers, CloudProvider):
+                reg = ProviderRegistry()
+                reg.register('lambda', providers)
+                providers = reg
+            else:
+                reg = ProviderRegistry()
+                reg.register('lambda', LambdaProvider(providers))
+                providers = reg
         self.providers = providers
-        self.client = providers.get_provider('lambda').client
+        lambda_prov = providers.get_provider('lambda')
+        self.client = getattr(lambda_prov, 'client', None)
         self.db = db
         # Both optional so a bare Orchestrator (tests, scripts) keeps working:
         # no prefs means the built-in defaults, no notifier means no pings.
@@ -454,6 +467,7 @@ class Orchestrator:
             types_to_try=candidates,
             prices={t: types[t].price_cents_per_hour for t in candidates},
             name=name or f"manifold-{launch_id}",
+            provider=provider,
         )
         self._launch_tasks[launch_id] = asyncio.create_task(self._run_launch(plan))
         return self.db.get_launch(launch_id)

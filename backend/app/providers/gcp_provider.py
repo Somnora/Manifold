@@ -67,7 +67,7 @@ class MockGCPProvider(GCPProvider):
     async def get_instance(self, instance_id: str) -> Optional[CloudInstanceInfo]:
         return self.instances.get(instance_id)
 
-    async def launch_instance(self, region: str, instance_type: str, ssh_key_names: List[str], filesystem_names: List[str], name: str = "") -> str:
+    async def launch_instance(self, region: str, instance_type: str, ssh_key_names: List[str], filesystem_names: List[str], name: str = "", user_data: str = "") -> str:
         instance_id = uuid.uuid4().hex
         ts = self._types[instance_type]
         self.instances[instance_id] = CloudInstanceInfo(
@@ -100,15 +100,21 @@ class RealGCPProvider(GCPProvider):
         self.credentials_file = credentials_file
 
     async def list_instance_types(self) -> List[CloudInstanceTypeSpec]:
-        raise NotImplementedError()
+        if not self.project_id:
+            return []
+        raise NotImplementedError("Real GCP API integration pending credentials")
 
     async def list_instances(self) -> List[CloudInstanceInfo]:
-        raise NotImplementedError()
+        if not self.project_id:
+            return []
+        raise NotImplementedError("Real GCP API integration pending credentials")
 
     async def get_instance(self, instance_id: str) -> Optional[CloudInstanceInfo]:
-        raise NotImplementedError()
+        if not self.project_id:
+            return None
+        raise NotImplementedError("Real GCP API integration pending credentials")
 
-    async def launch_instance(self, region: str, instance_type: str, ssh_key_names: List[str], filesystem_names: List[str], name: str = "") -> str:
+    async def launch_instance(self, region: str, instance_type: str, ssh_key_names: List[str], filesystem_names: List[str], name: str = "", user_data: str = "") -> str:
         raise NotImplementedError()
 
     async def terminate_instance(self, instance_id: str) -> bool:
