@@ -256,3 +256,79 @@ def load_templates(directory: Path) -> tuple[dict[str, JobTemplate], dict[str, s
         except (TemplateError, yaml.YAMLError) as exc:
             errors[path.name] = str(exc)
     return templates, errors
+
+def render_template(template: JobTemplate, parameters: dict, filesystem: str = "<filesystem>") -> dict:
+    """Render a template YAML with parameters substituted, for the UI live preview."""
+    import shlex
+    import yaml
+
+    rendered_dict = {
+        "name": template.name,
+        "description": template.description,
+        "image": template.image,
+    }
+    
+    persistent_root = f"/lambda/nfs/{filesystem}"
+    
+    command = template.command
+    for name, value in parameters.items():
+        command = command.replace("{{" + name + "}}", shlex.quote(str(value)))
+    rendered_dict["command"] = command
+    
+    if template.volumes:
+        volumes = []
+        for volume in template.volumes:
+            host = volume.host.replace(PERSISTENT_TOKEN, persistent_root)
+            for name, value in parameters.items():
+                host = host.replace("{{" + name + "}}", str(value))
+            v = {"host": host, "container": volume.container}
+            if volume.read_only:
+                v["read_only"] = True
+            volumes.append(v)
+        rendered_dict["volumes"] = volumes
+        
+    if template.ports:
+        rendered_dict["ports"] = [{"host": p.host, "container": p.container} for p in template.ports]
+        
+    if template.env:
+        rendered_dict["env"] = template.env
+        
+    if template.gpu:
+        rendered_dict["gpu"] = template.gpu
+        
+    if template.network:
+        rendered_dict["network"] = template.network
+
+    class Dumper(yaml.SafeDumper):
+        pass
+    def str_presenter(dumper, data):
+        if len(data.splitlines()) > 1:
+            return dumper.represent_scalar('tag:yaml.org,2002:str', data, style='|')
+        return dumper.represent_scalar('tag:yaml.org,2002:str', data)
+    Dumper.add_representer(str, str_presenter)
+    
+    rendered_yaml_str = yaml.dump(rendered_dict, sort_keys=False, Dumper=Dumper)
+    
+    rendered_lines = rendered_yaml_str.splitlines()
+    param_line_mapping = {}
+    for p in template.parameters:
+        lines = []
+        if "{{" + p.name + "}}" in template.command:
+            for i, line in enumerate(rendered_lines):
+                if line.startswith("command:"):
+                    lines.append(i + 1)
+                    break
+        for v in template.volumes:
+            if "{{" + p.name + "}}" in v.host:
+                for i, line in enumerate(rendered_lines):
+                    if line.startswith("volumes:"):
+                        lines.append(i + 1)
+                        break
+                break
+        param_line_mapping[p.name] = lines
+
+    return {
+        "template_name": template.name,
+        "rendered": rendered_yaml_str,
+        "param_line_mapping": param_line_mapping
+    }

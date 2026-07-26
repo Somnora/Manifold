@@ -1929,6 +1929,29 @@ def create_app(
         db.record_audit("api", "template_deleted", f"custom template '{name}'")
         return {"deleted": name, "restored_bundled": name in templates}
 
+    @app.post("/templates/{name}/render")
+    async def render_template_route(name: str, parameters: dict):
+        template = templates.get(name)
+        if template is None:
+            raise HTTPException(404, f"Unknown template '{name}'")
+        try:
+            from .dispatcher import coerce_parameters
+            from .templates import render_template
+            coerced = coerce_parameters(template, parameters)
+            # Find an existing filesystem to use as the token replacement, or default to <filesystem>
+            filesystems = []
+            if not mock and isinstance(lambda_client, SwappableLambdaClient):
+                try:
+                    filesystems = await lambda_client.list_filesystems()
+                except Exception:
+                    pass
+            filesystem_name = filesystems[0].name if filesystems else "<filesystem>"
+            return render_template(template, coerced, filesystem_name)
+        except ParameterError as exc:
+            raise HTTPException(400, str(exc))
+        except Exception as exc:
+            raise HTTPException(500, f"Render failed: {exc}")
+
     # -- tasks ------------------------------------------------------------------------
 
     @app.post("/tasks", status_code=202)

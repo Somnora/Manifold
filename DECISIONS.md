@@ -3094,3 +3094,9 @@ Implemented one-click IDE attach feature for VS Code and Cursor. Generated SSH c
 - Added `MockGCPProvider` and `RealGCPProvider` for Google Cloud support.
 - Updated Dashboard forms and components to support provider toggling and badging.
 - Plumbed `provider` through database schemas (`launches` table) and endpoints.
+
+## Phase 70 — The Config Rosetta Stone (2026-07-25)
+
+**Decided:** Implemented `render_template` in the backend to share the exact same string substitution and quoting rules as the dispatch execution, and added a `POST /templates/{name}/render` endpoint. The frontend `ParameterForm` now uses a split-pane layout to preview the rendered YAML configuration live as parameters are typed, with line highlighting based on the focused field. Added an "Edit as config" promotion flow that shifts the rendered configuration into the TemplateEditor.
+
+**Why:** Rendering the configuration server-side ensures the preview never drifts from what the dispatcher actually executes. The split pane builds trust by showing exactly what will run, and the promotion flow allows easy transition from parameter entry to custom template authoring.

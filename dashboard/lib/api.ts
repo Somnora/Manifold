@@ -645,6 +645,19 @@ export const api = {
       method: "DELETE",
     }),
 
+  renderTemplate: (
+    name: string,
+    parameters: Record<string, unknown>,
+  ) =>
+    request<{
+      template_name: string;
+      rendered: string;
+      param_line_mapping: Record<string, number[]>;
+    }>(`/templates/${encodeURIComponent(name)}/render`, {
+      method: "POST",
+      body: JSON.stringify(parameters),
+    }),
+
   updatePreferences: (patch: PreferencesPatch) =>
     request<{ preferences: Preferences }>("/preferences", {
       method: "PUT",

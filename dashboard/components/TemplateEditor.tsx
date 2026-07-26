@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { api, ApiError, type Template } from "@/lib/api";
 
 // Author your own job templates, right where you queue jobs. A template is
@@ -51,13 +51,26 @@ export function TemplateEditor({
     setNotice("");
   }
 
-  function startEdit(t: Template) {
+  function startEdit(t: Template | { name: string; yaml: string }) {
     setEditing(t.name);
     setYaml(t.yaml || "");
     setOpen(true);
     setError("");
     setNotice("");
   }
+
+  // Listen for 'editCustomTemplate' event to edit an ad-hoc or promoted template.
+  // This allows ParameterForm (or other components) to trigger the editor with pre-rendered YAML.
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const customEvent = e as CustomEvent;
+      if (customEvent.detail && customEvent.detail.yaml) {
+        startEdit({ name: customEvent.detail.name || "promoted-template", yaml: customEvent.detail.yaml });
+      }
+    };
+    window.addEventListener("editCustomTemplate", handler);
+    return () => window.removeEventListener("editCustomTemplate", handler);
+  }, []);
 
   async function save() {
     setBusy(true);
