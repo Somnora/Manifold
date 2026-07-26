@@ -116,6 +116,8 @@ class TaskSettings:
 @dataclass(frozen=True)
 class IdleSettings:
     timeout_seconds: float = 1800.0
+    timeout_max_seconds: float = 14400.0
+    timeout_min_seconds: float = 300.0
     poll_seconds: float = 15.0
 
 
@@ -372,6 +374,8 @@ def load_settings(
         ),
         idle=IdleSettings(
             timeout_seconds=float(idle.get("timeout_seconds", 1800)),
+            timeout_max_seconds=float(idle.get("timeout_max_seconds", 14400)),
+            timeout_min_seconds=float(idle.get("timeout_min_seconds", 300)),
             poll_seconds=float(idle.get("poll_seconds", 15)),
         ),
         watches=WatchSettings(

@@ -52,6 +52,8 @@ export function InstanceCard({
   const { dockInstance, dockPanel } = useTerminalDock();
   const [renaming, setRenaming] = useState(false);
   const [newName, setNewName] = useState("");
+  const [editingTimeout, setEditingTimeout] = useState(false);
+  const [newTimeout, setNewTimeout] = useState("");
   const [busy, setBusy] = useState<"" | "terminating" | "rescuing">("");
   // Set when termination was REFUSED: the rescue ran and some file still
   // could not be saved. `blockedRescue` says what it did manage to save.
@@ -341,6 +343,48 @@ export function InstanceCard({
               )}
               m left)
             </span>
+          )}
+          {editingTimeout ? (
+            <form
+              onSubmit={async (e) => {
+                e.preventDefault();
+                try {
+                  await api.setIdleTimeout(instance.id, newTimeout ? parseInt(newTimeout, 10) : null);
+                  setEditingTimeout(false);
+                  onChanged();
+                } catch (err) {
+                  setError(err instanceof ApiError ? err.message : String(err));
+                }
+              }}
+              className="flex items-center gap-1.5"
+            >
+              <select
+                autoFocus
+                value={newTimeout}
+                onChange={(e) => setNewTimeout(e.target.value)}
+                className="rounded border border-zinc-300 bg-white px-2 py-0.5 text-xs"
+              >
+                <option value="">Default</option>
+                <option value="1800">30 min</option>
+                <option value="3600">1 hour</option>
+                <option value="7200">2 hours</option>
+                <option value="14400">4 hours</option>
+                <option value="28800">8 hours</option>
+              </select>
+              <button type="submit" className="rounded bg-zinc-900 px-2 py-0.5 text-xs text-white">Save</button>
+              <button type="button" onClick={() => setEditingTimeout(false)} className="text-zinc-500">Cancel</button>
+            </form>
+          ) : (
+            <button
+              onClick={() => {
+                setNewTimeout(instance.idle!.timeout_seconds.toString());
+                setEditingTimeout(true);
+              }}
+              className="text-zinc-400 hover:text-zinc-700"
+              title="Edit idle timeout"
+            >
+              (edit)
+            </button>
           )}
           <button
             onClick={toggleKeepAlive}

@@ -159,6 +159,7 @@ export type LaunchRequest = {
   connection_mode: string;
   ssh_key_name?: string;
   name?: string;
+  idle_timeout_seconds?: number;
 };
 
 export type TemplateParameter = {
@@ -458,6 +459,12 @@ export const api = {
     request<{ keep_alive: boolean }>(`/instances/${instanceId}/keep-alive`, {
       method: "POST",
       body: JSON.stringify({ enabled }),
+    }),
+
+  setIdleTimeout: (instanceId: string, timeoutSeconds: number | null) =>
+    request<{ idle_timeout_seconds: number | null }>(`/instances/${instanceId}/idle-timeout`, {
+      method: "POST",
+      body: JSON.stringify({ idle_timeout_seconds: timeoutSeconds }),
     }),
 
   diagnoseSidecar: (instanceId: string) =>

@@ -3073,3 +3073,14 @@ pointed at undelivered SIGHUP; the test spawner also waits for the
 child's pgid to equal its pid before tearing down, and keeps master fds
 open for the child's lifetime like production does (closing them early
 put children in racy orphaned-tty states).
+
+## Phase 68 — Per-Instance Idle Timeout (2026-07-25)
+
+**What:** Users can set a custom `idle_timeout_seconds` per instance, both at launch (in the LaunchRequest/UI) and later (via `POST /instances/{id}/idle-timeout` and the Instance card). The value is clamped to a configurable min/max (default 5 min to 4 hours) to prevent unbounded billing or aggressive auto-termination. The `Dispatcher._check_idle` loop queries the database for this specific value, falling back to the global default.
+
+**Why:** Idle timeout needs to be flexible based on the task (e.g., long background process vs quick interactive shell) while maintaining financial safety. A user-configurable timeout allows balancing convenience against cost. Clamping provides a hard limit against mistakes.
+
+**Design choices:**
+- Clamping is centralized in the orchestrator (at launch) and API (at update) so the database always contains valid values.
+- Updates are audited to provide transparency.
+- A nullable `idle_timeout_seconds` column allows older records or defaults to fall back to the global settings dynamically.

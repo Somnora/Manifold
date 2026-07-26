@@ -61,7 +61,8 @@ CREATE TABLE IF NOT EXISTS launches (
     launched_at         TEXT,                   -- when Lambda accepted the launch (billing starts)
     active_at           TEXT,                   -- when the instance reached "active"
     terminated_at       TEXT,
-    keep_alive          INTEGER NOT NULL DEFAULT 0   -- idle auto-termination switched off
+    keep_alive          INTEGER NOT NULL DEFAULT 0,  -- idle auto-termination switched off
+    idle_timeout_seconds REAL
 );
 
 CREATE TABLE IF NOT EXISTS audit_log (
@@ -239,6 +240,7 @@ class Database:
         # (CREATE TABLE IF NOT EXISTS does not alter existing tables).
         self._ensure_column("launches", "keep_alive",
                             "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("launches", "idle_timeout_seconds", "REAL")
         # Auto-manage columns (Phase 24) for databases created earlier.
         self._ensure_column("tasks", "auto_manage",
                             "INTEGER NOT NULL DEFAULT 0")
@@ -285,15 +287,16 @@ class Database:
         filesystem: str | None,
         connection_mode: str,
         hourly_rate_cents: int,
+        idle_timeout_seconds: float | None = None,
     ) -> str:
         launch_id = uuid.uuid4().hex[:12]
         self._execute(
             """INSERT INTO launches
                (id, created_at, requested_type, region, filesystem,
-                connection_mode, hourly_rate_cents, status)
-               VALUES (?, ?, ?, ?, ?, ?, ?, 'launching')""",
+                connection_mode, hourly_rate_cents, status, idle_timeout_seconds)
+               VALUES (?, ?, ?, ?, ?, ?, ?, 'launching', ?)""",
             (launch_id, utcnow(), requested_type, region, filesystem,
-             connection_mode, hourly_rate_cents),
+             connection_mode, hourly_rate_cents, idle_timeout_seconds),
         )
         return launch_id
 
@@ -302,6 +305,7 @@ class Database:
             "status", "attempts", "error", "lambda_instance_id",
             "launched_type", "hourly_rate_cents",
             "launched_at", "active_at", "terminated_at", "keep_alive",
+            "idle_timeout_seconds",
         }
         unknown = set(fields) - allowed
         if unknown:

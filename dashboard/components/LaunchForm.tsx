@@ -37,6 +37,7 @@ export function LaunchForm({ onLaunched }: { onLaunched: () => void }) {
   const [filesystem, setFilesystem] = useState("");
   const [sshKey, setSshKey] = useState("");
   const [mode, setMode] = useState("direct-ssh");
+  const [idleTimeout, setIdleTimeout] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState("");
   const [loadError, setLoadError] = useState("");
@@ -147,6 +148,7 @@ export function LaunchForm({ onLaunched }: { onLaunched: () => void }) {
         filesystem: scratchOnly ? "" : filesystem,
         connection_mode: mode,
         ssh_key_name: sshKey || undefined,
+        idle_timeout_seconds: idleTimeout ? parseFloat(idleTimeout) : undefined,
       });
       onLaunched();
     } catch (err) {
@@ -260,6 +262,21 @@ export function LaunchForm({ onLaunched }: { onLaunched: () => void }) {
           >
             <option value="direct-ssh">direct-ssh</option>
             <option value="tailscale">tailscale</option>
+          </select>
+        </label>
+        <label className="block text-xs font-medium text-zinc-600">
+          Idle Timeout
+          <select
+            className={`${field} mt-1`}
+            value={idleTimeout}
+            onChange={(e) => setIdleTimeout(e.target.value)}
+          >
+            <option value="">Default</option>
+            <option value="1800">30 min</option>
+            <option value="3600">1 hour</option>
+            <option value="7200">2 hours</option>
+            <option value="14400">4 hours</option>
+            <option value="28800">8 hours</option>
           </select>
         </label>
       </div>

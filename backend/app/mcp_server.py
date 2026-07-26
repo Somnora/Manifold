@@ -195,6 +195,7 @@ async def launch_gpu(
     region: str,
     filesystem: str,
     connection_mode: str | None = None,
+    idle_timeout_seconds: float | None = None,
     note: str = "",
 ) -> dict:
     """Launch a GPU instance. Flows through ALL backend guards (budget,
@@ -213,6 +214,8 @@ async def launch_gpu(
     }
     if connection_mode:
         body["connection_mode"] = connection_mode
+    if idle_timeout_seconds is not None:
+        body["idle_timeout_seconds"] = idle_timeout_seconds
     return await _call(
         "launch_gpu", "POST", "/instances",
         note=note, args=body, body=body,

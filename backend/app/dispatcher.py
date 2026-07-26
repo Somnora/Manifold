@@ -480,6 +480,12 @@ class Dispatcher:
                 f"defaulted off (switch it on from the instance card)",
             )
 
+    def _effective_timeout(self, instance_id: str) -> float:
+        launch = self.db.find_launch_by_instance(instance_id)
+        if launch and launch.get("idle_timeout_seconds") is not None:
+            return launch["idle_timeout_seconds"]
+        return self.settings.idle.timeout_seconds
+
     def idle_status(self, instance_id: str) -> dict:
         """Idle countdown info for the instance card. idle_seconds counts
         from the last job/terminal activity (0 if none recorded yet)."""
@@ -487,7 +493,7 @@ class Dispatcher:
         idle = max(0.0, self._clock() - last) if last is not None else 0.0
         return {
             "idle_seconds": round(idle),
-            "timeout_seconds": round(self.settings.idle.timeout_seconds),
+            "timeout_seconds": round(self._effective_timeout(instance_id)),
             "keep_alive": self.keep_alive_enabled(instance_id),
         }
 
@@ -1002,7 +1008,6 @@ class Dispatcher:
         full quiet period before it is eligible.
         """
         now = self._clock()
-        timeout = self.settings.idle.timeout_seconds
         # Instances an auto-managed job owns are governed by that job's
         # lifecycle, which owns teardown (sync -> terminate). The idle loop
         # must not race it: skip them entirely, keep-alive or not. If the
@@ -1022,6 +1027,7 @@ class Dispatcher:
                 continue
             if self.keep_alive_enabled(instance_id):
                 continue
+            timeout = self._effective_timeout(instance_id)
             last = self.last_activity.setdefault(instance_id, now)
             if now - last < timeout:
                 continue

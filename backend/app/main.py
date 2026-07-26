@@ -164,6 +164,11 @@ class LaunchRequest(BaseModel):
     connection_mode: str | None = None
     ssh_key_name: str | None = None    # falls back to ssh.key_name in config.yaml
     name: str = Field(default="", max_length=64)
+    idle_timeout_seconds: float | None = None
+
+
+class IdleTimeoutRequest(BaseModel):
+    idle_timeout_seconds: float | None = None
 
 
 class TaskRequest(BaseModel):
@@ -793,8 +798,31 @@ def create_app(
             connection_mode=req.connection_mode,
             ssh_key_name=req.ssh_key_name,
             name=req.name,
+            idle_timeout_seconds=req.idle_timeout_seconds,
         )
         return {"launch": launch}
+
+    @app.post("/instances/{instance_id}/idle-timeout")
+    async def set_idle_timeout(instance_id: str, req: IdleTimeoutRequest):
+        """Update the per-instance idle timeout. clamped to min/max."""
+        launch = db.find_launch_by_instance(instance_id)
+        if not launch:
+            raise HTTPException(404, f"No launch found for instance {instance_id}")
+        
+        value = req.idle_timeout_seconds
+        if value is not None:
+            value = max(
+                settings.idle.timeout_min_seconds,
+                min(value, settings.idle.timeout_max_seconds)
+            )
+        
+        db.update_launch(launch["id"], idle_timeout_seconds=value)
+        if value is not None:
+            db.record_audit("backend", "idle_timeout_update", f"{instance_id} timeout set to {value}s")
+        else:
+            db.record_audit("backend", "idle_timeout_update", f"{instance_id} timeout restored to default")
+            
+        return {"idle_timeout_seconds": value}
 
     @app.get("/ssh-keys")
     async def list_ssh_keys():

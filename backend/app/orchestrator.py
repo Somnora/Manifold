@@ -304,6 +304,7 @@ class Orchestrator:
         connection_mode: str | None = None,
         ssh_key_name: str | None = None,
         name: str = "",
+        idle_timeout_seconds: float | None = None,
     ) -> dict:
         """Validate and admit a launch; returns the persisted launch row.
 
@@ -321,6 +322,18 @@ class Orchestrator:
                 f"Unknown instance type '{instance_type}'. "
                 f"Valid types: {', '.join(sorted(types))}",
             )
+
+        if idle_timeout_seconds is not None:
+            clamped = max(
+                self.settings.idle.timeout_min_seconds,
+                min(idle_timeout_seconds, self.settings.idle.timeout_max_seconds)
+            )
+            if clamped != idle_timeout_seconds:
+                self.db.record_audit(
+                    "backend", "idle_timeout_clamp",
+                    f"requested {idle_timeout_seconds}s clamped to {clamped}s"
+                )
+                idle_timeout_seconds = clamped
 
         # Filesystem is OPTIONAL (Phase 39): "" launches a scratch-only
         # instance in any region, including ones where the user has no
@@ -422,6 +435,7 @@ class Orchestrator:
             filesystem=filesystem,
             connection_mode=mode,
             hourly_rate_cents=price,
+            idle_timeout_seconds=idle_timeout_seconds,
         )
         plan = LaunchPlan(
             launch_id=launch_id,
