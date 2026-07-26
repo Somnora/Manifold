@@ -108,10 +108,12 @@ class SQLiteTaskQueue(TaskQueue):
                 region: str | None = None,
                 filesystem: str | None = None,
                 target_instance_id: str | None = None) -> str:
-        return self._db.create_task(
+        task_id = self._db.create_task(
             template=template, parameters=parameters, auto_manage=auto_manage,
             gpu_type=gpu_type, region=region, filesystem=filesystem,
             target_instance_id=target_instance_id)
+        self._db.record_task_event(task_id, "queued")
+        return task_id
 
     def next_queued(self) -> dict | None:
         return self._db.next_queued_task()

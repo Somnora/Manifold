@@ -2049,6 +2049,12 @@ def create_app(
             raise HTTPException(404, f"task {task_id} not found")
         return {"task_id": task_id, "lines": queue.get_logs(task_id, tail)}
 
+    @app.get("/tasks/{task_id}/events")
+    async def get_task_events(task_id: str):
+        if queue.get(task_id) is None:
+            raise HTTPException(404, f"task {task_id} not found")
+        return {"task_id": task_id, "events": db.get_task_events(task_id)}
+
     # Literal path declared BEFORE /tasks/{task_id} so "finished" is not
     # captured as a task id.
     @app.delete("/tasks/finished")

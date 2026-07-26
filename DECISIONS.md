@@ -3100,3 +3100,8 @@ Implemented one-click IDE attach feature for VS Code and Cursor. Generated SSH c
 **Decided:** Implemented `render_template` in the backend to share the exact same string substitution and quoting rules as the dispatch execution, and added a `POST /templates/{name}/render` endpoint. The frontend `ParameterForm` now uses a split-pane layout to preview the rendered YAML configuration live as parameters are typed, with line highlighting based on the focused field. Added an "Edit as config" promotion flow that shifts the rendered configuration into the TemplateEditor.
 
 **Why:** Rendering the configuration server-side ensures the preview never drifts from what the dispatcher actually executes. The split pane builds trust by showing exactly what will run, and the promotion flow allows easy transition from parameter entry to custom template authoring.
+
+## Phase 71: Structured Lifecycle Events
+We added a `task_events` table to the database to record task lifecycle events (`queued`, `launched`, `started`, `checkpointed`, `interrupted`, `resumed`, `synced`, `finished`, `failed`) and the instance ID they occurred on, as well as `cost_cents_at_event`. 
+This is critical for providing a rich timeline and audit trail for end-to-end task execution.
+The `GET /tasks/{task_id}/events` route exposes these events to the frontend.

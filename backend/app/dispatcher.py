@@ -359,6 +359,12 @@ class Dispatcher:
             self._cancel_requested.discard(task_id)
             error = "cancelled by user"
             notify = False
+            self.db.record_task_event(task_id, "interrupted", detail=error)
+        elif exit_code == 0 and not error:
+            self.db.record_task_event(task_id, "finished", detail=f"exit {exit_code}")
+        else:
+            self.db.record_task_event(task_id, "failed", detail=error or f"exit {exit_code}")
+
         self.queue.mark_finished(task_id, exit_code=exit_code,
                                  output_paths=output_paths, error=error)
         self._worklog_task(task_id)
@@ -683,6 +689,7 @@ class Dispatcher:
                            reason: str = "backend restarted") -> None:
         task_id = task["id"]
         instance_id = task.get("instance_id") or ""
+        self.db.record_task_event(task_id, "resumed", instance_id=instance_id, detail=reason)
         launch = self.db.find_launch_by_instance(instance_id)
         filesystem = (launch or {}).get("filesystem")
         if not filesystem:
@@ -784,6 +791,7 @@ class Dispatcher:
     async def _run_task(self, task: dict, instance_id: str,
                         conn: ManagedConnection) -> None:
         task_id = task["id"]
+        self.db.record_task_event(task_id, "launched", instance_id=instance_id, detail="Assigned to instance")
         template = self.templates.get(task["template"])
         if template is None:
             self._finish_task(
@@ -854,6 +862,7 @@ class Dispatcher:
 
         for attempt in (1, 2):
             try:
+                self.db.record_task_event(task_id, "started", instance_id=instance_id, detail="Command execution started")
                 exit_code, stdout, stderr = await self._stream_run(
                     conn, wrapped, task_id
                 )
@@ -1267,6 +1276,7 @@ class Dispatcher:
     async def _auto_sync(self, job: dict) -> None:
         """syncing -> terminating. Always sync ephemeral scratch first."""
         iid = self._job_instance_id(job)
+        self.db.record_task_event(job["id"], "synced", instance_id=iid, detail="Syncing outputs")
         if iid:
             try:
                 await self.orchestrator.sync_ephemeral(iid)

@@ -108,6 +108,19 @@ CREATE TABLE IF NOT EXISTS task_logs (
     PRIMARY KEY (task_id, seq)
 );
 
+CREATE TABLE IF NOT EXISTS task_events (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id             TEXT NOT NULL,
+    at                  TEXT NOT NULL,
+    kind                TEXT NOT NULL,
+    detail              TEXT,
+    instance_id         TEXT,
+    cost_cents_at_event INTEGER DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_task_events_task_id
+    ON task_events(task_id);
+
+
 CREATE TABLE IF NOT EXISTS agent_runs (
     id                  TEXT PRIMARY KEY,
     created_at          TEXT NOT NULL,
@@ -684,6 +697,25 @@ class Database:
                 "SELECT * FROM task_logs WHERE task_id = ? ORDER BY seq",
                 (task_id,),
             ).fetchall()
+        return [dict(r) for r in rows]
+
+    # -- task events (Phase 71) --------------------------------------------------
+
+    def record_task_event(self, task_id: str, kind: str, detail: dict | str | None = None,
+                          instance_id: str | None = None, cost_cents_at_event: int = 0) -> None:
+        if detail is not None and not isinstance(detail, str):
+            detail = json.dumps(detail)
+        self._execute(
+            """INSERT INTO task_events (task_id, at, kind, detail, instance_id, cost_cents_at_event)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (task_id, utcnow(), kind, detail, instance_id, cost_cents_at_event),
+        )
+
+    def get_task_events(self, task_id: str) -> list[dict]:
+        rows = self._execute(
+            "SELECT * FROM task_events WHERE task_id = ? ORDER BY id",
+            (task_id,),
+        ).fetchall()
         return [dict(r) for r in rows]
 
     # -- autopilot runs ---------------------------------------------------------------
