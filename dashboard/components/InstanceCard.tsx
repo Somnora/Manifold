@@ -244,6 +244,8 @@ export function InstanceCard({
                 <div className="relative">
                   <button
                     onClick={() => setMenuOpen((o) => !o)}
+                    aria-label="More actions"
+                    aria-expanded={menuOpen}
                     title="More panels (not enough room to show every button)"
                     className="rounded border border-zinc-300 px-2 py-1 font-mono text-xs font-medium text-zinc-700 hover:bg-zinc-50"
                   >
@@ -275,7 +277,7 @@ export function InstanceCard({
                 onClick={() => terminate(false)}
                 disabled={busy !== ""}
                 title="Saves the instance's scratch files first (Settings decides where), then stops the billing"
-                className="rounded bg-red-600 px-3 py-1 text-xs font-medium text-zinc-900 hover:bg-red-500 disabled:opacity-50"
+                className="rounded bg-red-600 px-3 py-1 text-xs font-medium text-white hover:bg-red-500 disabled:opacity-50"
               >
                 {busy === "terminating"
                   ? "Saving your files..."

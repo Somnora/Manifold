@@ -23,12 +23,12 @@ Host manifold-{instance_id}
     os.makedirs(os.path.dirname(SSH_CONFIG_PATH), exist_ok=True)
     
     if not os.path.exists(SSH_CONFIG_PATH):
-        with open(SSH_CONFIG_PATH, "w") as f:
+        with open(SSH_CONFIG_PATH, "w", encoding="utf-8") as f:
             f.write(block)
         os.chmod(SSH_CONFIG_PATH, 0o600)
         return
         
-    with open(SSH_CONFIG_PATH, "r") as f:
+    with open(SSH_CONFIG_PATH, "r", encoding="utf-8") as f:
         content = f.read()
         
     pattern = re.compile(rf"{re.escape(start)}.*?{re.escape(end)}\n?", re.DOTALL)
@@ -37,7 +37,7 @@ Host manifold-{instance_id}
     else:
         new_content = content.rstrip() + "\n\n" + block
         
-    with open(SSH_CONFIG_PATH, "w") as f:
+    with open(SSH_CONFIG_PATH, "w", encoding="utf-8") as f:
         f.write(new_content)
     os.chmod(SSH_CONFIG_PATH, 0o600)
 
@@ -46,13 +46,13 @@ def remove_ssh_config_block(instance_id: str):
         return
         
     start, end = _get_block_delimiters(instance_id)
-    with open(SSH_CONFIG_PATH, "r") as f:
+    with open(SSH_CONFIG_PATH, "r", encoding="utf-8") as f:
         content = f.read()
         
     pattern = re.compile(rf"{re.escape(start)}.*?{re.escape(end)}\n?", re.DOTALL)
     if pattern.search(content):
         new_content = pattern.sub("", content)
-        with open(SSH_CONFIG_PATH, "w") as f:
+        with open(SSH_CONFIG_PATH, "w", encoding="utf-8") as f:
             f.write(new_content)
 
 def get_ide_urls(instance_id: str):

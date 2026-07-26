@@ -49,10 +49,6 @@ class CloudInstanceInfo(BaseModel):
     def is_running(self) -> bool:
         return self.status in ("booting", "active", "unhealthy")
 
-    @property
-    def gpu_description(self) -> str:
-        return self.gpu_type or ""
-
 class CloudProvider(ABC):
     @abstractmethod
     async def list_instance_types(self) -> List[CloudInstanceTypeSpec]:

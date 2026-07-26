@@ -358,7 +358,7 @@ class Orchestrator:
         # {persistent} refuse to run, sync has nowhere to go, and the
         # termination rescue can only save files by downloading them here.
         # The launch form says all of this before the user clicks.
-        if filesystem:
+        if filesystem and self.client:
             filesystems = {fs.name: fs
                            for fs in await self.client.list_filesystems()}
             if filesystem not in filesystems:
@@ -1041,6 +1041,12 @@ class Orchestrator:
             launch_rec = self.db.get_launch(plan.launch_id)
             p_name = launch_rec['provider'] if launch_rec else 'lambda'
             instance = await self.providers.get_provider(p_name).get_instance(instance_id)
+            if instance is None:
+                self.db.update_launch(
+                    plan.launch_id, status="failed",
+                    error=f"instance {instance_id} no longer exists",
+                )
+                return None
             if instance.status == "active" and instance.ip:
                 return instance
             if instance.status in ("terminated", "terminating", "preempted", "unhealthy"):

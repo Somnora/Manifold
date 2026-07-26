@@ -69,7 +69,9 @@ class MockGCPProvider(GCPProvider):
 
     async def launch_instance(self, region: str, instance_type: str, ssh_key_names: List[str], filesystem_names: List[str], name: str = "", user_data: str = "") -> str:
         instance_id = uuid.uuid4().hex
-        ts = self._types[instance_type]
+        ts = self._types.get(instance_type)
+        if not ts:
+            raise ValueError(f"Unknown instance type: {instance_type}")
         self.instances[instance_id] = CloudInstanceInfo(
             id=instance_id,
             provider="gcp",

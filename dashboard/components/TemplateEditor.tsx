@@ -89,6 +89,9 @@ export function TemplateEditor({
   }
 
   async function remove(name: string) {
+    if (!window.confirm(`Are you sure you want to delete the custom template '${name}'? This cannot be undone.`)) {
+      return;
+    }
     setError("");
     try {
       await api.deleteCustomTemplate(name);
@@ -175,6 +178,7 @@ export function TemplateEditor({
               bg-zinc-950 rendered ink-on-ink. This box is a terminal-style
               editor; give it the terminal's own fixed palette. */}
           <textarea
+            aria-label="YAML Template Editor"
             value={yaml}
             onChange={(e) => setYaml(e.target.value)}
             rows={16}
