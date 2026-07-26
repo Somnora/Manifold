@@ -134,9 +134,26 @@ def create_app(nvml=None, ephemeral_root: Path | None = None,
         return True
 
     def read_metrics() -> dict:
+        ide_processes = []
+        try:
+            out = subprocess.check_output(["ps", "-eo", "comm,args"], text=True)
+            for line in out.splitlines():
+                if "vscode-server" in line and "vscode" not in ide_processes:
+                    ide_processes.append("vscode")
+                elif "cursor-server" in line and "cursor" not in ide_processes:
+                    ide_processes.append("cursor")
+                elif "sshd:" in line and "@pts" in line and "ssh" not in ide_processes:
+                    ide_processes.append("ssh")
+        except Exception:
+            pass
+
+        base = {"active_ide_processes": ide_processes}
+
         if not ensure_nvml():
-            return {"available": False, "gpus": [],
-                    "error": "pynvml unavailable or no NVIDIA driver"}
+            base.update({"available": False, "gpus": [],
+                    "error": "pynvml unavailable or no NVIDIA driver"})
+            return base
+
         gpus = []
         for i in range(nvml.nvmlDeviceGetCount()):
             handle = nvml.nvmlDeviceGetHandleByIndex(i)
@@ -152,8 +169,11 @@ def create_app(nvml=None, ephemeral_root: Path | None = None,
                 "utilization_pct": util.gpu,
                 "temperature_c": temp,
             })
-        return {"available": True, "gpus": gpus,
-                "at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+        
+        base.update({"available": True, "gpus": gpus,
+                "at": datetime.now(timezone.utc).isoformat(timespec="seconds")})
+        return base
+
 
     @app.get("/health")
     async def health():

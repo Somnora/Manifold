@@ -1434,6 +1434,8 @@ class Dispatcher:
                     metrics = await sidecar.metrics()
                     gpus = (metrics.get("gpus")
                             if metrics.get("available") else None)
+                    if metrics.get("active_ide_processes"):
+                        self.touch_activity(instance_id)
                 except Exception:
                     gpus = None   # sidecar not up yet / not installed
             if not gpus:

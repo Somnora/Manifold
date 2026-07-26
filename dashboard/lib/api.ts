@@ -449,6 +449,16 @@ export const api = {
       timeoutMs: 10 * 60_000,
     }),
 
+  attachIDE: (instanceId: string) =>
+    request<{
+      vscode_url: string;
+      cursor_url: string;
+      ssh_alias: string;
+      ssh_command: string;
+    }>(`/instances/${instanceId}/ide-attach`, {
+      method: "POST",
+    }),
+
   renameInstance: (instanceId: string, name: string) =>
     request<{ name: string }>(`/instances/${instanceId}/name`, {
       method: "POST",

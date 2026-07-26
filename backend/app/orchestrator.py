@@ -64,6 +64,7 @@ from .lambda_api import (
 )
 from .model_client import ModelClient, RealModelClient
 from .sidecar_client import RealSidecarClient, SidecarClient, SidecarError
+from .ide_attach import remove_ssh_config_block
 
 logger = logging.getLogger("manifold.orchestrator")
 
@@ -631,6 +632,7 @@ class Orchestrator:
             self.db.update_launch(
                 launch["id"], status="terminated", terminated_at=utcnow()
             )
+        remove_ssh_config_block(instance_id)
         return {"instance_id": instance_id, "terminated": True,
                 "rescue": report}
 

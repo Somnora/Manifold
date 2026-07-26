@@ -63,6 +63,14 @@ export function InstanceCard({
   const [blockedRescue, setBlockedRescue] = useState<RescueReport | null>(null);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
+  const [ideInfo, setIdeInfo] = useState<{
+    vscode_url: string;
+    cursor_url: string;
+    ssh_alias: string;
+    ssh_command: string;
+  } | null>(null);
+  const [attachingIde, setAttachingIde] = useState(false);
+  const [copiedCmd, setCopiedCmd] = useState(false);
 
   // Latch "has been connected". The SSH supervisor can briefly flip to
   // reconnecting when the box is saturated (e.g. downloading a 15GB model),
@@ -396,6 +404,57 @@ export function InstanceCard({
       )}
 
       {everConnected && <TelemetryChart instanceId={instance.id} />}
+
+      {everConnected && (
+        <div className="mt-3 rounded border border-zinc-200 bg-zinc-50 p-3">
+          <div className="flex items-center justify-between">
+            <span className="text-sm font-medium text-zinc-700">IDE & SSH</span>
+            {!ideInfo ? (
+              <button
+                onClick={async () => {
+                  setAttachingIde(true);
+                  try {
+                    const info = await api.attachIDE(instance.id);
+                    setIdeInfo(info);
+                  } catch (err) {
+                    setError(err instanceof ApiError ? err.message : String(err));
+                  } finally {
+                    setAttachingIde(false);
+                  }
+                }}
+                disabled={attachingIde}
+                className="rounded bg-zinc-900 px-3 py-1 text-xs font-medium text-white hover:bg-zinc-700 disabled:opacity-50"
+              >
+                {attachingIde ? "Configuring..." : "Configure Attach"}
+              </button>
+            ) : (
+              <div className="flex items-center gap-2">
+                <a href={ideInfo.vscode_url} className="rounded border border-zinc-300 bg-white px-3 py-1 text-xs font-medium text-zinc-700 hover:bg-zinc-50">
+                  Open in VS Code
+                </a>
+                <a href={ideInfo.cursor_url} className="rounded border border-zinc-300 bg-white px-3 py-1 text-xs font-medium text-zinc-700 hover:bg-zinc-50">
+                  Open in Cursor
+                </a>
+              </div>
+            )}
+          </div>
+          {ideInfo && (
+            <div className="mt-2 flex items-center gap-2 rounded bg-white p-2 text-xs font-mono text-zinc-600 border border-zinc-200">
+              <span className="flex-1">{ideInfo.ssh_command}</span>
+              <button
+                onClick={() => {
+                  navigator.clipboard.writeText(ideInfo.ssh_command);
+                  setCopiedCmd(true);
+                  setTimeout(() => setCopiedCmd(false), 2000);
+                }}
+                className="rounded border border-zinc-300 px-2 py-0.5 hover:bg-zinc-50"
+              >
+                {copiedCmd ? "Copied!" : "Copy"}
+              </button>
+            </div>
+          )}
+        </div>
+      )}
 
       {/* Terminal, Chat, Files, and Browse all live in the DOCK (buttons
           above): they survive page navigation there, snap bottom or right,

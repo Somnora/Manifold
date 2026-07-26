@@ -3084,3 +3084,7 @@ put children in racy orphaned-tty states).
 - Clamping is centralized in the orchestrator (at launch) and API (at update) so the database always contains valid values.
 - Updates are audited to provide transparency.
 - A nullable `idle_timeout_seconds` column allows older records or defaults to fall back to the global settings dynamically.
+
+### Phase 69: One-Click IDE Attach
+
+Implemented one-click IDE attach feature for VS Code and Cursor. Generated SSH config block with `# >>> manifold managed <instance_id> >>>` delimiters. Detected active IDE processes (`vscode-server`, `cursor-server`, and interactive SSH sessions) in sidecar telemetry to prevent idle auto-termination while the user is actively working in an IDE. Added UI to copy the ssh command and click links to open VS Code/Cursor remotely.

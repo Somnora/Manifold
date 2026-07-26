@@ -67,6 +67,7 @@ from .image_checker import MockImageChecker, RealImageChecker
 from .storage import MockStorage, S3AdapterStorage, StorageClient
 from .task_queue import SQLiteTaskQueue
 from .templates import load_templates
+from .ide_attach import write_ssh_config_block, get_ide_urls
 from .terminal_sessions import TerminalSession, TerminalSessionManager
 
 logger = logging.getLogger("manifold.main")
@@ -877,6 +878,22 @@ def create_app(
         down to this machine. The same code termination runs — so the report
         you get here is exactly what a termination would do."""
         return {"rescue": await orchestrator.rescue(instance_id)}
+
+    @app.post("/instances/{instance_id}/ide-attach")
+    async def attach_ide(instance_id: str):
+        conn = orchestrator.connections.get(instance_id)
+        if conn is None or conn.ssh_connection() is None:
+            raise HTTPException(409, f"no connected instance {instance_id}")
+        
+        write_ssh_config_block(
+            instance_id=instance_id,
+            host_ip=conn.host,
+            ssh_key_path=str(settings.ssh_key_path.resolve()),
+            host_keys_file_path=str(settings.host_keys_path.resolve()),
+        )
+        
+        db.record_audit("api", "ide_attach", f"Generated SSH config block for instance {instance_id}")
+        return get_ide_urls(instance_id)
 
     @app.post("/instances/{instance_id}/run")
     async def run_instance_command(instance_id: str, req: RunCommandRequest):
