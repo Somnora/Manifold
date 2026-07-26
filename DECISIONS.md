@@ -3088,3 +3088,9 @@ put children in racy orphaned-tty states).
 ### Phase 69: One-Click IDE Attach
 
 Implemented one-click IDE attach feature for VS Code and Cursor. Generated SSH config block with `# >>> manifold managed <instance_id> >>>` delimiters. Detected active IDE processes (`vscode-server`, `cursor-server`, and interactive SSH sessions) in sidecar telemetry to prevent idle auto-termination while the user is actively working in an IDE. Added UI to copy the ssh command and click links to open VS Code/Cursor remotely.
+## 2026-07-25: Multi-Cloud Provider Abstraction (GCP)
+- Implemented an abstract `CloudProvider` base class and `ProviderRegistry`.
+- Migrated existing Lambda functionality to `LambdaProvider` implementation.
+- Added `MockGCPProvider` and `RealGCPProvider` for Google Cloud support.
+- Updated Dashboard forms and components to support provider toggling and badging.
+- Plumbed `provider` through database schemas (`launches` table) and endpoints.
