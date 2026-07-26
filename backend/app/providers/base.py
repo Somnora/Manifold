@@ -1,0 +1,52 @@
+from abc import ABC, abstractmethod
+from typing import List, Optional, Dict, Any
+from pydantic import BaseModel
+from datetime import datetime
+
+class CloudInstanceTypeSpec(BaseModel):
+    name: str
+    description: str
+    vcpus: int
+    ram_gb: int
+    gpus: int
+    gpu_type: Optional[str] = None
+    gpu_ram_gb: int
+    price_cents_per_hour: int
+    regions_available: List[str]
+
+class CloudInstanceInfo(BaseModel):
+    id: str
+    provider: str
+    name: str
+    instance_type: str
+    region: str
+    ip_address: Optional[str] = None
+    status: str
+    created_at: datetime
+    price_cents_per_hour: int
+    ssh_key_name: Optional[str] = None
+
+class CloudProvider(ABC):
+    @abstractmethod
+    async def list_instance_types(self) -> List[CloudInstanceTypeSpec]:
+        pass
+
+    @abstractmethod
+    async def list_instances(self) -> List[CloudInstanceInfo]:
+        pass
+
+    @abstractmethod
+    async def get_instance(self, instance_id: str) -> Optional[CloudInstanceInfo]:
+        pass
+
+    @abstractmethod
+    async def launch_instance(self, region: str, instance_type: str, ssh_key_names: List[str], filesystem_names: List[str], name: str = "") -> str:
+        pass
+
+    @abstractmethod
+    async def terminate_instance(self, instance_id: str) -> bool:
+        pass
+
+    @abstractmethod
+    async def ensure_ssh_key(self, public_key: str, name: str) -> str:
+        pass

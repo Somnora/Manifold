@@ -102,6 +102,7 @@ export type Filesystem = {
 
 export type Instance = {
   id: string;
+  provider?: string;
   name: string;
   status: string;
   ip: string | null;
@@ -123,6 +124,7 @@ export type Instance = {
 
 export type Launch = {
   id: string;
+  provider?: string;
   created_at: string;
   requested_type: string;
   launched_type: string | null;
@@ -153,6 +155,7 @@ export type StoredFile = {
 };
 
 export type LaunchRequest = {
+  provider?: string;
   instance_type: string;
   region: string;
   filesystem: string;
@@ -389,8 +392,8 @@ export type AgentStep = {
 };
 
 export const api = {
-  instanceTypes: () =>
-    request<Record<string, InstanceTypeInfo>>("/instance-types"),
+  instanceTypes: (provider?: string) =>
+    request<Record<string, InstanceTypeInfo>>(`/instance-types${provider ? `?provider=${provider}` : ""}`),
 
   regions: () =>
     request<{ regions: Region[] }>("/regions").then((r) => r.regions),
@@ -546,6 +549,7 @@ export const api = {
       mock: boolean;
       lambda_configured: boolean;
       s3_configured: boolean;
+      gcp_configured: boolean;
       tailscale_available: boolean;
       env_path: string;
     }>("/settings/status"),
@@ -555,6 +559,16 @@ export const api = {
       "/settings/lambda-key",
       { method: "POST", body: JSON.stringify({ api_key: apiKey }) },
     ),
+
+  setGcpConfig: (projectId: string, zone: string, credentialsPath: string) =>
+    request<{ saved: boolean }>("/settings/gcp", {
+      method: "POST",
+      body: JSON.stringify({
+        project_id: projectId,
+        default_zone: zone,
+        credentials_file: credentialsPath,
+      }),
+    }),
 
   setS3Keys: (accessKeyId: string, secretAccessKey: string) =>
     request<{ saved: boolean; validated: boolean }>("/settings/s3-keys", {

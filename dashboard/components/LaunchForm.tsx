@@ -40,11 +40,12 @@ export function LaunchForm({ onLaunched }: { onLaunched: () => void }) {
   const [idleTimeout, setIdleTimeout] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState("");
+  const [provider, setProvider] = useState("lambda");
   const [loadError, setLoadError] = useState("");
 
   useEffect(() => {
     Promise.all([
-      api.instanceTypes(),
+      api.instanceTypes(provider),
       api.regions(),
       api.filesystems(),
       api.sshKeys(),
@@ -63,10 +64,10 @@ export function LaunchForm({ onLaunched }: { onLaunched: () => void }) {
         const firstAvailable = Object.entries(t)
           .filter(([, info]) => info.regions_with_capacity.length > 0)
           .sort((a, b) => a[1].price_usd_per_hour - b[1].price_usd_per_hour)[0];
-        setInstanceType((v) => v || firstAvailable?.[0] || Object.keys(t)[0] || "");
+        setInstanceType(firstAvailable?.[0] || Object.keys(t)[0] || "");
       })
       .catch((e) => setLoadError(e.message));
-  }, []);
+  }, [provider]);
 
   const selectedType = types[instanceType];
   const fsRegions = useMemo(
@@ -143,6 +144,7 @@ export function LaunchForm({ onLaunched }: { onLaunched: () => void }) {
     setError("");
     try {
       await api.launch({
+        provider,
         instance_type: instanceType,
         region,
         filesystem: scratchOnly ? "" : filesystem,
@@ -174,6 +176,26 @@ export function LaunchForm({ onLaunched }: { onLaunched: () => void }) {
       onSubmit={submit}
       className="rounded-lg border border-zinc-200 bg-white p-4"
     >
+      <div className="mb-4 flex items-center gap-4 border-b border-zinc-200 pb-4">
+        <label className="text-xs font-medium text-zinc-600 mr-2">Provider</label>
+        <div className="flex bg-zinc-100 p-1 rounded-md">
+          <button
+            type="button"
+            className={`px-3 py-1 text-xs font-medium rounded-sm ${provider === "lambda" ? "bg-white shadow-sm text-zinc-900" : "text-zinc-500 hover:text-zinc-700"}`}
+            onClick={() => setProvider("lambda")}
+          >
+            Lambda AI
+          </button>
+          <button
+            type="button"
+            className={`px-3 py-1 text-xs font-medium rounded-sm ${provider === "gcp" ? "bg-white shadow-sm text-zinc-900" : "text-zinc-500 hover:text-zinc-700"}`}
+            onClick={() => setProvider("gcp")}
+          >
+            Google Cloud
+          </button>
+        </div>
+      </div>
+
       {/* GPU gets its own full-width row: price is the primary decision
           variable and must never be truncated. Each option LEADS with the
           full $/hr, then the GPU name + VRAM, so even a narrow closed control

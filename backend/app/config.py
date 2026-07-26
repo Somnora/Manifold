@@ -206,6 +206,13 @@ class AutoManageSettings:
 
 
 @dataclass(frozen=True)
+class GCPSettings:
+    project_id: str = ""
+    default_zone: str = "us-central1-a"
+    credentials_file: str = ""
+
+
+@dataclass(frozen=True)
 class Settings:
     # Secrets (from .env). Empty string means "not configured".
     lambda_api_key: str = ""
@@ -232,6 +239,7 @@ class Settings:
     hub: HubSettings = field(default_factory=HubSettings)
     telemetry: TelemetrySettings = field(default_factory=TelemetrySettings)
     auto_manage: AutoManageSettings = field(default_factory=AutoManageSettings)
+    gcp: GCPSettings = field(default_factory=GCPSettings)
     preferences: "Preferences" = field(default_factory=lambda: Preferences())
     default_connection_mode: str = "direct-ssh"
     db_path: str = str(DATA_ROOT / "manifold.db")
@@ -336,6 +344,7 @@ def load_settings(
     hub = raw.get("hub", {})
     telemetry = raw.get("telemetry", {})
     auto_manage = raw.get("auto_manage", {})
+    gcp = raw.get("gcp", {})
     # Defaults for the Settings-page policies. A garbage value here can never
     # stop the backend from starting: preferences_from_dict ignores what it
     # does not understand and clamps what it does.
@@ -428,6 +437,11 @@ def load_settings(
             keepalive_count_max=int(ssh.get("keepalive_count_max", 3)),
             command_timeout_seconds=float(
                 ssh.get("command_timeout_seconds", 120)),
+        ),
+        gcp=GCPSettings(
+            project_id=str(gcp.get("project_id", os.environ.get("GCP_PROJECT_ID", ""))),
+            default_zone=str(gcp.get("default_zone", os.environ.get("GCP_DEFAULT_ZONE", "us-central1-a"))),
+            credentials_file=str(gcp.get("credentials_file", os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", ""))),
         ),
         default_connection_mode=str(conn.get("default_mode", "direct-ssh")),
         db_path=db_path,

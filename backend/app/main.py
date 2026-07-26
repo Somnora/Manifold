@@ -166,10 +166,12 @@ class LaunchRequest(BaseModel):
     ssh_key_name: str | None = None    # falls back to ssh.key_name in config.yaml
     name: str = Field(default="", max_length=64)
     idle_timeout_seconds: float | None = None
+    provider: str = 'lambda'
 
 
 class IdleTimeoutRequest(BaseModel):
     idle_timeout_seconds: float | None = None
+    provider: str = 'lambda'
 
 
 class TaskRequest(BaseModel):
@@ -271,7 +273,12 @@ class ChatRequest(BaseModel):
 
 
 class LambdaKeyRequest(BaseModel):
-    api_key: str = Field(min_length=8)
+    api_key: str
+
+class GCPConfigRequest(BaseModel):
+    project_id: str
+    default_zone: str
+    credentials_file: str = Field(min_length=8)
 
 
 class S3KeysRequest(BaseModel):
@@ -421,8 +428,14 @@ def create_app(
                 else ((lambda title, body: None) if mock else os_notify)),
     )
 
+    providers = ProviderRegistry()
+    providers.register('lambda', LambdaProvider(lambda_client))
+    if mock:
+        providers.register('gcp', MockGCPProvider())
+    else:
+        providers.register('gcp', RealGCPProvider(settings.gcp.project_id, settings.gcp.default_zone, settings.gcp.credentials_file))
     orchestrator = Orchestrator(
-        settings, lambda_client, db,
+        settings, providers, db,
         connect_fn=connect_fn, sidecar_factory=sidecar_factory,
         model_client_factory=model_client_factory,
         prefs=prefs, notifier=notifier,
@@ -593,6 +606,7 @@ def create_app(
         return {
             "mock": mock,
             "lambda_configured": bool(settings.lambda_api_key),
+            "gcp_configured": bool(settings.gcp.project_id),
             "s3_configured": bool(
                 settings.s3_access_key_id and settings.s3_secret_access_key
             ),
@@ -641,6 +655,24 @@ def create_app(
             "instance_types_visible": len(types),
             "applied_live": not mock,
         }
+
+    @app.post("/settings/gcp-config")
+    async def set_gcp_config(req: GCPConfigRequest):
+        update_env_file(
+            env_file,
+            {
+                "GCP_PROJECT_ID": req.project_id,
+                "GCP_DEFAULT_ZONE": req.default_zone,
+                "GOOGLE_APPLICATION_CREDENTIALS": req.credentials_file,
+            },
+        )
+        # Assuming providers.register handles hot-swapping if we implemented it,
+        # but for now we just save to .env
+        db.record_audit(
+            "api", "settings_gcp_config",
+            "GCP configuration saved to .env",
+        )
+        return {"valid": True, "applied_live": False}
 
     @app.post("/settings/s3-keys")
     async def set_s3_keys(req: S3KeysRequest):
@@ -800,6 +832,7 @@ def create_app(
             ssh_key_name=req.ssh_key_name,
             name=req.name,
             idle_timeout_seconds=req.idle_timeout_seconds,
+        provider=req.provider,
         )
         return {"launch": launch}
 

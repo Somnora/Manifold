@@ -43,6 +43,12 @@ export default function SettingsPage() {
               badLabel="missing"
             />
             <StatusItem
+              label="Google Cloud"
+              ok={status.gcp_configured}
+              okLabel="configured"
+              badLabel="missing"
+            />
+            <StatusItem
               label="S3 storage keys"
               ok={status.s3_configured}
               okLabel="configured"
@@ -70,6 +76,7 @@ export default function SettingsPage() {
       )}
 
       <LambdaKeyForm onSaved={refresh} />
+      <GcpConfigForm onSaved={refresh} />
       <S3KeysForm onSaved={refresh} />
 
       <PolicySettings />
@@ -255,6 +262,79 @@ function S3KeysForm({ onSaved }: { onSaved: () => void }) {
           <button
             type="submit"
             disabled={busy || !accessKey.trim() || secretKey.trim().length < 8}
+            className="rounded bg-zinc-900 px-4 py-1.5 text-sm font-medium text-white hover:bg-zinc-700 disabled:opacity-50"
+          >
+            {busy ? "Saving..." : "Save"}
+          </button>
+        </div>
+      </form>
+      {notice && <p className="mt-2 text-xs text-emerald-700">{notice}</p>}
+      {error && <p className="mt-2 text-xs text-red-700">{error}</p>}
+    </section>
+  );
+}
+
+function GcpConfigForm({ onSaved }: { onSaved: () => void }) {
+  const [projectId, setProjectId] = useState("");
+  const [zone, setZone] = useState("");
+  const [credentialsPath, setCredentialsPath] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [notice, setNotice] = useState("");
+  const [error, setError] = useState("");
+
+  async function submit(e: React.FormEvent) {
+    e.preventDefault();
+    setBusy(true);
+    setError("");
+    setNotice("");
+    try {
+      await api.setGcpConfig(projectId.trim(), zone.trim(), credentialsPath.trim());
+      setNotice("Google Cloud configuration saved.");
+      setProjectId("");
+      setZone("");
+      setCredentialsPath("");
+      onSaved();
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <section className="rounded-lg border border-zinc-200 bg-white p-4">
+      <h2 className="text-sm font-semibold uppercase tracking-wide text-zinc-500">
+        Google Cloud Configuration
+      </h2>
+      <form onSubmit={submit} className="mt-3 space-y-2">
+        <input
+          type="text"
+          className="w-full rounded border border-zinc-300 bg-white px-2.5 py-1.5 font-mono text-sm"
+          placeholder="Project ID (e.g. manifold-ai)"
+          value={projectId}
+          onChange={(e) => setProjectId(e.target.value)}
+          autoComplete="off"
+        />
+        <div className="flex gap-2">
+          <input
+            type="text"
+            className="flex-1 rounded border border-zinc-300 bg-white px-2.5 py-1.5 font-mono text-sm"
+            placeholder="Default Zone (e.g. us-central1-a)"
+            value={zone}
+            onChange={(e) => setZone(e.target.value)}
+            autoComplete="off"
+          />
+          <input
+            type="text"
+            className="flex-1 rounded border border-zinc-300 bg-white px-2.5 py-1.5 font-mono text-sm"
+            placeholder="Credentials JSON Path (absolute path)"
+            value={credentialsPath}
+            onChange={(e) => setCredentialsPath(e.target.value)}
+            autoComplete="off"
+          />
+          <button
+            type="submit"
+            disabled={busy || !projectId.trim() || !zone.trim() || !credentialsPath.trim()}
             className="rounded bg-zinc-900 px-4 py-1.5 text-sm font-medium text-white hover:bg-zinc-700 disabled:opacity-50"
           >
             {busy ? "Saving..." : "Save"}

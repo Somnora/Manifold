@@ -258,7 +258,7 @@ class Orchestrator:
     def __init__(
         self,
         settings: Settings,
-        lambda_client: LambdaClient,
+        providers: 'ProviderRegistry',
         db: Database,
         *,
         connect_fn: Callable[[str], Callable[[], Awaitable]] | None = None,
@@ -268,7 +268,8 @@ class Orchestrator:
         notifier=None,       # NotificationCenter: pings on rescue/blocked
     ):
         self.settings = settings
-        self.client = lambda_client
+        self.providers = providers
+        self.client = providers.get_provider('lambda').client
         self.db = db
         # Both optional so a bare Orchestrator (tests, scripts) keeps working:
         # no prefs means the built-in defaults, no notifier means no pings.
@@ -306,6 +307,7 @@ class Orchestrator:
         ssh_key_name: str | None = None,
         name: str = "",
         idle_timeout_seconds: float | None = None,
+        provider: str = 'lambda',
     ) -> dict:
         """Validate and admit a launch; returns the persisted launch row.
 
@@ -316,7 +318,8 @@ class Orchestrator:
         mode = connection_mode or self.settings.default_connection_mode
         self._validate_mode(mode)
 
-        types = await self.client.list_instance_types()
+        cloud_provider = self.providers.get_provider(provider)
+        types = {t.name: t for t in await cloud_provider.list_instance_types()}
         if instance_type not in types:
             raise LaunchRejected(
                 400,
@@ -367,7 +370,10 @@ class Orchestrator:
         # name must be registered with Lambda or the launch call would fail
         # minutes later — catch typos now.
         resolved_key = ssh_key_name or self.settings.ssh.key_name
-        registered = [k.name for k in await self.client.list_ssh_keys()]
+        if provider == 'lambda':
+            registered = [k.name for k in await self.client.list_ssh_keys()]
+        else:
+            registered = [resolved_key]
         if not resolved_key:
             raise LaunchRejected(
                 400,
@@ -386,7 +392,7 @@ class Orchestrator:
         # launched outside Manifold still count toward the limits. fresh=True
         # bypasses the list cache: a spend guard must never pass on a stale
         # snapshot (two quick launches both seeing "0 running").
-        running = [i for i in await self.client.list_instances(fresh=True)
+        running = [i for i in await cloud_provider.list_instances() # fresh=True not strictly supported on CloudProvider, but list_instances fetches fresh for GCP
                    if i.is_running]
         # The NUMBERS come from Settings when the user set them there
         # (preferences.guardrails; 0 = unset), falling back to config.yaml.
@@ -437,6 +443,7 @@ class Orchestrator:
             connection_mode=mode,
             hourly_rate_cents=price,
             idle_timeout_seconds=idle_timeout_seconds,
+            provider=provider,
         )
         plan = LaunchPlan(
             launch_id=launch_id,
@@ -626,7 +633,9 @@ class Orchestrator:
             # The IP may be recycled to a future instance with a new host
             # key; keeping the pin would wrongly reject that instance.
             self.host_keys.forget(conn.host)
-        await self.client.terminate_instance(instance_id)
+        launch = self.db.find_launch_by_instance(instance_id)
+        provider_name = launch['provider'] if launch else 'lambda'
+        await self.providers.get_provider(provider_name).terminate_instance(instance_id)
         launch = self.db.find_launch_by_instance(instance_id)
         if launch:
             self.db.update_launch(
@@ -801,7 +810,9 @@ class Orchestrator:
         view, their SSH supervisors reaped, and their launch rows closed —
         otherwise a ghost card lingers and a supervisor reconnect-loops at
         a dead host forever."""
-        listed = await self.client.list_instances()
+        listed = []
+        for p in self.providers._providers.values():
+            listed.extend(await p.list_instances())
         gone_statuses = ("terminated", "terminating")
         live_ids = {i.id for i in listed if i.status not in gone_statuses}
 
@@ -922,7 +933,9 @@ class Orchestrator:
                 attempts += 1
                 self.db.update_launch(plan.launch_id, attempts=attempts)
                 try:
-                    instance_id = await self.client.launch_instance(
+                    launch_rec = self.db.get_launch(plan.launch_id)
+                    p_name = launch_rec['provider'] if launch_rec else 'lambda'
+                    instance_id = await self.providers.get_provider(p_name).launch_instance(
                         instance_type=candidate,
                         region=plan.region,
                         ssh_key_names=[plan.ssh_key_name],
@@ -986,7 +999,8 @@ class Orchestrator:
         now, so the failure is actionable instead of a dead end. Never masks
         the real failure — any catalog error just yields no hint."""
         try:
-            types = await self.client.list_instance_types()
+            cloud_provider = self.providers.get_provider(plan.provider)
+            types = {t.name: t for t in await cloud_provider.list_instance_types()}
         except Exception:
             return ""
         elsewhere: list[str] = []
@@ -1010,7 +1024,9 @@ class Orchestrator:
         policy = self.settings.launch
         waited = 0.0
         while True:
-            instance = await self.client.get_instance(instance_id)
+            launch_rec = self.db.get_launch(plan.launch_id)
+            p_name = launch_rec['provider'] if launch_rec else 'lambda'
+            instance = await self.providers.get_provider(p_name).get_instance(instance_id)
             if instance.status == "active" and instance.ip:
                 return instance
             if instance.status in ("terminated", "terminating", "preempted", "unhealthy"):
@@ -1063,7 +1079,9 @@ class Orchestrator:
         Returns the number of instances adopted.
         """
         try:
-            instances = await self.client.list_instances()
+            instances = []
+            for p in self.providers._providers.values():
+                instances.extend(await p.list_instances())
         except LambdaAPIError as exc:
             # info at startup, debug on the 30s sweep so an unconfigured
             # API key does not fill the log with the same line forever.

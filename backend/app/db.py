@@ -47,6 +47,7 @@ def live_launches(db_path: str) -> list[dict]:
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS launches (
     id                  TEXT PRIMARY KEY,
+    provider            TEXT NOT NULL DEFAULT 'lambda',
     created_at          TEXT NOT NULL,          -- ISO 8601 UTC
     requested_type      TEXT NOT NULL,          -- what the user asked for
     launched_type       TEXT,                   -- what actually launched (may be a fallback)
@@ -241,6 +242,7 @@ class Database:
         self._ensure_column("launches", "keep_alive",
                             "INTEGER NOT NULL DEFAULT 0")
         self._ensure_column("launches", "idle_timeout_seconds", "REAL")
+        self._ensure_column("launches", "provider", "TEXT NOT NULL DEFAULT 'lambda'")
         # Auto-manage columns (Phase 24) for databases created earlier.
         self._ensure_column("tasks", "auto_manage",
                             "INTEGER NOT NULL DEFAULT 0")
@@ -288,14 +290,15 @@ class Database:
         connection_mode: str,
         hourly_rate_cents: int,
         idle_timeout_seconds: float | None = None,
+        provider: str = "lambda",
     ) -> str:
         launch_id = uuid.uuid4().hex[:12]
         self._execute(
             """INSERT INTO launches
-               (id, created_at, requested_type, region, filesystem,
+               (id, provider, created_at, requested_type, region, filesystem,
                 connection_mode, hourly_rate_cents, status, idle_timeout_seconds)
-               VALUES (?, ?, ?, ?, ?, ?, ?, 'launching', ?)""",
-            (launch_id, utcnow(), requested_type, region, filesystem,
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'launching', ?)""",
+            (launch_id, provider, utcnow(), requested_type, region, filesystem,
              connection_mode, hourly_rate_cents, idle_timeout_seconds),
         )
         return launch_id

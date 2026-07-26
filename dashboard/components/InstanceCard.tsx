@@ -191,7 +191,12 @@ export function InstanceCard({
               </form>
             ) : (
               <>
-                <h3 className="font-medium">{instance.name || instance.id}</h3>
+                <div className="flex items-center gap-2">
+                  <span className="rounded bg-zinc-100 px-1.5 py-0.5 text-[10px] font-medium text-zinc-600 border border-zinc-200 tracking-wider">
+                    {instance.provider === "gcp" ? "Google Cloud" : "Lambda"}
+                  </span>
+                  <h3 className="font-medium">{instance.name || instance.id}</h3>
+                </div>
                 <button
                   onClick={() => {
                     setNewName(instance.name || "");
