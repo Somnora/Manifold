@@ -822,4 +822,59 @@ export const api = {
       `/storage/files/${encodeURI(key)}?filesystem=${encodeURIComponent(filesystem)}`,
       { method: "DELETE" },
     ),
+
+  clusters: () =>
+    request<{ clusters: Cluster[] }>("/clusters").then((r) => r.clusters),
+
+  cluster: (clusterId: string) =>
+    request<Cluster>(`/clusters/${clusterId}`),
+
+  launchCluster: (body: ClusterLaunchRequest) =>
+    request<Cluster>("/clusters/launch", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+
+  terminateCluster: (clusterId: string, force = false) =>
+    request<{ cluster_id: string; terminated: boolean }>(
+      `/clusters/${clusterId}/terminate?force=${force}`,
+      { method: "POST" },
+    ),
 };
+
+export type ClusterNode = {
+  id: string;
+  cluster_id: string;
+  instance_id: string;
+  role: "head" | "worker";
+  node_index: number;
+  ip?: string;
+  status: string;
+};
+
+export type Cluster = {
+  id: string;
+  name: string;
+  gpu_type: string;
+  region: string;
+  filesystem: string;
+  node_count: number;
+  head_instance_id?: string;
+  head_ip?: string;
+  status: string;
+  created_at: string;
+  cost_cents?: number;
+  nodes?: ClusterNode[];
+};
+
+export type ClusterLaunchRequest = {
+  instance_type: string;
+  region: string;
+  filesystem: string;
+  node_count: number;
+  connection_mode?: string;
+  ssh_key_name?: string;
+  name?: string;
+  provider?: string;
+};
+

@@ -198,5 +198,70 @@ command: "true"
 def test_templates_endpoint_serves_schemas(client):
     body = client.get("/templates").json()
     names = {t["name"] for t in body["templates"]}
-    assert {"vllm-serve", "whisper-batch", "axolotl-finetune"} <= names
+    assert {"vllm-serve", "whisper-batch", "axolotl-finetune", "sglang-serve"} <= names
     assert body["errors"] == {}
+
+
+def test_vllm_serve_multi_lora_and_speculative_rendering():
+    templates, errors = load_templates(REPO_TEMPLATES)
+    assert errors == {}
+    vllm = templates["vllm-serve"]
+
+    # Test parameter schemas
+    param_names = {p.name for p in vllm.parameters}
+    assert {"model_id", "enable_lora", "max_loras", "lora_modules", "speculative_model"} <= param_names
+
+    # Test volumes include /data/outputs for LoRA adapters
+    out_mount = next(v for v in vllm.volumes if v.container == "/data/outputs")
+    assert out_mount.host == "{persistent}/outputs" and out_mount.read_only
+
+    # Render template command
+    from app.dispatcher import render_docker_command
+    params = {
+        "model_id": "Qwen/Qwen2.5-7B-Instruct",
+        "max_context": 8192,
+        "port": 8080,
+        "tensor_parallel": 1,
+        "tool_call_parser": "hermes",
+        "enable_lora": True,
+        "max_loras": 4,
+        "max_cpu_loras": 8,
+        "lora_modules": "coder=/data/outputs/distill-v1",
+        "speculative_model": "Qwen/Qwen2.5-0.5B-Instruct",
+        "num_speculative_tokens": 5,
+    }
+    docker_cmd = render_docker_command(vllm, params, filesystem="testfs", task_id="t1")
+    assert "vllm-openai:latest" in docker_cmd
+    assert "enable_lora" in docker_cmd
+    assert "coder=/data/outputs/distill-v1" in docker_cmd
+    assert "speculative_model" in docker_cmd
+
+
+def test_sglang_serve_multi_lora_rendering():
+    templates, errors = load_templates(REPO_TEMPLATES)
+    assert errors == {}
+    sglang = templates["sglang-serve"]
+
+    # Test parameter schemas
+    param_names = {p.name for p in sglang.parameters}
+    assert {"model_id", "lora_paths", "mem_fraction_static"} <= param_names
+
+    # Test volumes include /data/outputs for LoRA adapters
+    out_mount = next(v for v in sglang.volumes if v.container == "/data/outputs")
+    assert out_mount.host == "{persistent}/outputs" and out_mount.read_only
+
+    # Render template command
+    from app.dispatcher import render_docker_command
+    params = {
+        "model_id": "Qwen/Qwen2.5-7B-Instruct",
+        "max_context": 8192,
+        "port": 8080,
+        "tensor_parallel": 1,
+        "lora_paths": "coder=/data/outputs/distill-v1",
+        "mem_fraction_static": 0.88,
+    }
+    docker_cmd = render_docker_command(sglang, params, filesystem="testfs", task_id="t2")
+    assert "sglang:latest" in docker_cmd
+    assert "lora_paths" in docker_cmd
+    assert "coder=/data/outputs/distill-v1" in docker_cmd
+

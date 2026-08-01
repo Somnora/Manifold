@@ -1,0 +1,69 @@
+# Multi-node vLLM distributed inference across an elastic GPU cluster.
+name: vllm-cluster
+description: Serve ultra-large models across multiple GPU cluster instances using vLLM + Ray distributed pipeline/tensor parallelism.
+image: vllm/vllm-openai:latest
+network: host
+
+command: >
+  python3 -c '
+  import os, sys, subprocess
+
+  (model_id, head_ip, ray_port, port, tensor_parallel, pipeline_parallel,
+   max_context, tool_call_parser) = sys.argv[1:9]
+
+  cmd = [
+      "vllm", "serve", model_id,
+      "--port", port,
+      "--max-model-len", max_context,
+      "--tensor-parallel-size", tensor_parallel,
+      "--pipeline-parallel-size", pipeline_parallel,
+      "--tool-call-parser", tool_call_parser,
+      "--enable-auto-tool-choice",
+  ]
+
+  if head_ip and head_ip.strip():
+      cmd.extend(["--ray-address", f"{head_ip}:{ray_port}"])
+
+  print(f"manifold: launching distributed vllm -> {\" \".join(cmd)}", flush=True)
+  os.execvp(cmd[0], cmd)
+  ' manifold {{model_id}} {{head_ip}} {{ray_port}} {{port}} {{tensor_parallel}} {{pipeline_parallel}} {{max_context}} {{tool_call_parser}}
+
+parameters:
+  - name: model_id
+    type: string
+    description: HuggingFace model ID or local path (e.g. deepseek-ai/DeepSeek-R1, meta-llama/Llama-3.3-70B-Instruct).
+  - name: head_ip
+    type: string
+    default: ""
+    description: Ray head node IP for multi-node distribution. Leave empty if running on single multi-GPU node.
+  - name: ray_port
+    type: integer
+    default: 6379
+    description: Ray GCS port on head node.
+  - name: port
+    type: integer
+    default: 8080
+    description: HTTP API server port.
+  - name: tensor_parallel
+    type: integer
+    default: 8
+    description: Tensor parallel degree (GPUs per node).
+  - name: pipeline_parallel
+    type: integer
+    default: 2
+    description: Pipeline parallel degree (number of nodes).
+  - name: max_context
+    type: integer
+    default: 16384
+    description: Maximum context length in tokens.
+  - name: tool_call_parser
+    type: string
+    default: hermes
+    description: Parser for tool calls (hermes, mistral, llama3_json).
+
+volumes:
+  - host: "{persistent}/cache/huggingface"
+    container: /root/.cache/huggingface
+  - host: "{persistent}/models"
+    container: /data/models
+    read_only: true

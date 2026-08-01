@@ -121,6 +121,35 @@ CREATE INDEX IF NOT EXISTS idx_task_events_task_id
     ON task_events(task_id);
 
 
+CREATE TABLE IF NOT EXISTS clusters (
+    id                  TEXT PRIMARY KEY,
+    name                TEXT NOT NULL,
+    created_at          TEXT NOT NULL,
+    status              TEXT NOT NULL,   -- provisioning|active|degraded|terminated
+    gpu_type            TEXT NOT NULL,
+    region              TEXT NOT NULL,
+    filesystem          TEXT NOT NULL,
+    node_count          INTEGER NOT NULL,
+    head_instance_id    TEXT,
+    head_ip             TEXT,
+    cost_cents          INTEGER NOT NULL DEFAULT 0,
+    terminated_at       TEXT
+);
+
+CREATE TABLE IF NOT EXISTS cluster_nodes (
+    cluster_id          TEXT NOT NULL,
+    instance_id         TEXT NOT NULL,
+    role                TEXT NOT NULL,   -- head|worker
+    node_index          INTEGER NOT NULL,
+    ip                  TEXT,
+    status              TEXT NOT NULL,   -- provisioning|running|failed|terminated
+    created_at          TEXT NOT NULL,
+    PRIMARY KEY (cluster_id, instance_id)
+);
+CREATE INDEX IF NOT EXISTS idx_cluster_nodes_cluster_id
+    ON cluster_nodes(cluster_id);
+
+
 CREATE TABLE IF NOT EXISTS agent_runs (
     id                  TEXT PRIMARY KEY,
     created_at          TEXT NOT NULL,
@@ -699,6 +728,13 @@ class Database:
             ).fetchall()
         return [dict(r) for r in rows]
 
+    def get_task_logs_after(self, task_id: str, after_seq: int = -1) -> list[dict]:
+        rows = self._execute(
+            "SELECT * FROM task_logs WHERE task_id = ? AND seq > ? ORDER BY seq",
+            (task_id, after_seq),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
     # -- task events (Phase 71) --------------------------------------------------
 
     def record_task_event(self, task_id: str, kind: str, detail: dict | str | None = None,
@@ -715,6 +751,13 @@ class Database:
         rows = self._execute(
             "SELECT * FROM task_events WHERE task_id = ? ORDER BY id",
             (task_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_task_events_after(self, task_id: str, after_id: int = 0) -> list[dict]:
+        rows = self._execute(
+            "SELECT * FROM task_events WHERE task_id = ? AND id > ? ORDER BY id",
+            (task_id, after_id),
         ).fetchall()
         return [dict(r) for r in rows]
 
@@ -995,5 +1038,87 @@ class Database:
     def active_watches(self) -> list[dict]:
         rows = self._execute(
             "SELECT * FROM watches WHERE status = 'watching'"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    # -- cluster orchestration -----------------------------------------------------
+
+    def create_cluster(self, *, cluster_id: str, name: str, gpu_type: str,
+                       region: str, filesystem: str, node_count: int,
+                       head_instance_id: str | None = None,
+                       head_ip: str | None = None) -> None:
+        self._execute(
+            """INSERT INTO clusters (id, name, created_at, status, gpu_type, region,
+               filesystem, node_count, head_instance_id, head_ip)
+               VALUES (?, ?, ?, 'provisioning', ?, ?, ?, ?, ?, ?)""",
+            (cluster_id, name, utcnow(), gpu_type, region, filesystem, node_count,
+             head_instance_id, head_ip),
+        )
+
+    def add_cluster_node(self, *, cluster_id: str, instance_id: str, role: str,
+                         node_index: int, ip: str | None = None,
+                         status: str = "provisioning") -> None:
+        self._execute(
+            """INSERT INTO cluster_nodes (cluster_id, instance_id, role, node_index, ip, status, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (cluster_id, instance_id, role, node_index, ip, status, utcnow()),
+        )
+
+    def update_cluster_status(self, cluster_id: str, status: str,
+                              head_instance_id: str | None = None,
+                              head_ip: str | None = None,
+                              cost_cents: int | None = None) -> None:
+        updates = ["status = ?"]
+        params: list[Any] = [status]
+        if head_instance_id is not None:
+            updates.append("head_instance_id = ?")
+            params.append(head_instance_id)
+        if head_ip is not None:
+            updates.append("head_ip = ?")
+            params.append(head_ip)
+        if cost_cents is not None:
+            updates.append("cost_cents = ?")
+            params.append(cost_cents)
+        if status == "terminated":
+            updates.append("terminated_at = ?")
+            params.append(utcnow())
+        params.append(cluster_id)
+        sql = f"UPDATE clusters SET {', '.join(updates)} WHERE id = ?"
+        self._execute(sql, tuple(params))
+
+    def update_cluster_node_status(self, cluster_id: str, instance_id: str,
+                                   status: str, ip: str | None = None) -> None:
+        if ip is not None:
+            self._execute(
+                "UPDATE cluster_nodes SET status = ?, ip = ? WHERE cluster_id = ? AND instance_id = ?",
+                (status, ip, cluster_id, instance_id),
+            )
+        else:
+            self._execute(
+                "UPDATE cluster_nodes SET status = ? WHERE cluster_id = ? AND instance_id = ?",
+                (status, cluster_id, instance_id),
+            )
+
+    def get_cluster(self, cluster_id: str) -> dict | None:
+        row = self._execute("SELECT * FROM clusters WHERE id = ?", (cluster_id,)).fetchone()
+        if not row:
+            return None
+        res = dict(row)
+        res["nodes"] = self.get_cluster_nodes(cluster_id)
+        return res
+
+    def list_clusters(self) -> list[dict]:
+        rows = self._execute("SELECT * FROM clusters ORDER BY created_at DESC").fetchall()
+        clusters = []
+        for r in rows:
+            c = dict(r)
+            c["nodes"] = self.get_cluster_nodes(c["id"])
+            clusters.append(c)
+        return clusters
+
+    def get_cluster_nodes(self, cluster_id: str) -> list[dict]:
+        rows = self._execute(
+            "SELECT * FROM cluster_nodes WHERE cluster_id = ? ORDER BY node_index",
+            (cluster_id,),
         ).fetchall()
         return [dict(r) for r in rows]

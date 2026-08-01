@@ -8,6 +8,9 @@ import { LaunchForm } from "@/components/LaunchForm";
 import { InstanceCard } from "@/components/InstanceCard";
 import { StatusBadge } from "@/components/Badge";
 import { WatchPanel } from "@/components/WatchPanel";
+import { ClusterPanel } from "@/components/ClusterPanel";
+import { VisualTaskGraph } from "@/components/VisualTaskGraph";
+import { MultiGpuTelemetry } from "@/components/MultiGpuTelemetry";
 import { formatMoney, launchCost } from "@/lib/format";
 
 const IN_FLIGHT = ["launching", "retrying", "booting"];
@@ -147,6 +150,17 @@ export default function InstancesPage() {
           </div>
         )}
       </section>
+
+      {/* Elastic GPU Clusters */}
+      <section>
+        <ClusterPanel />
+      </section>
+
+      {/* Visual Task Graph & Multi-GPU Telemetry */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        <VisualTaskGraph />
+        <MultiGpuTelemetry />
+      </div>
 
       <section>
         <h2 className="mb-3 text-sm font-semibold uppercase tracking-wide text-zinc-500">

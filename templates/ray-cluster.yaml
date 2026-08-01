@@ -1,0 +1,64 @@
+# Spawns a Ray cluster node (Head or Worker) for multi-node distributed compute.
+name: ray-cluster
+description: Spawn a Ray cluster node for distributed GPU compute swarms (Ray head or Ray worker).
+image: rayproject/ray:latest-gpu
+network: host
+
+command: >
+  python3 -c '
+  import os, sys, subprocess
+
+  role, head_ip, ray_port, dashboard_port, num_gpus = sys.argv[1:6]
+
+  if role.lower() == "head":
+      cmd = [
+          "ray", "start", "--head",
+          f"--port={ray_port}",
+          "--dashboard-host=0.0.0.0",
+          f"--dashboard-port={dashboard_port}",
+          "--block",
+      ]
+  else:
+      if not head_ip or head_ip.strip() in ("", "127.0.0.1", "localhost"):
+          print("manifold error: worker role requires a valid head_ip parameter", file=sys.stderr)
+          sys.exit(1)
+      cmd = [
+          "ray", "start",
+          f"--address={head_ip}:{ray_port}",
+          "--block",
+      ]
+
+  if num_gpus and str(num_gpus).isdigit() and int(num_gpus) > 0:
+      cmd.append(f"--num-gpus={num_gpus}")
+
+  print(f"manifold: launching ray {role} node -> {\" \".join(cmd)}", flush=True)
+  os.execvp(cmd[0], cmd)
+  ' manifold {{role}} {{head_ip}} {{ray_port}} {{dashboard_port}} {{num_gpus}}
+
+parameters:
+  - name: role
+    type: string
+    default: head
+    description: Role of this Ray node - 'head' for the master coordinator or 'worker' to join an existing cluster.
+  - name: head_ip
+    type: string
+    default: ""
+    description: IP address of the Ray head node (required when role is 'worker').
+  - name: ray_port
+    type: integer
+    default: 6379
+    description: Primary GCS port for the Ray cluster head node.
+  - name: dashboard_port
+    type: integer
+    default: 8265
+    description: Ray dashboard Web UI port.
+  - name: num_gpus
+    type: integer
+    default: 8
+    description: Number of GPUs on this node to expose to Ray.
+
+volumes:
+  - host: "{persistent}/cache/huggingface"
+    container: /root/.cache/huggingface
+  - host: "{persistent}/ray_data"
+    container: /tmp/ray

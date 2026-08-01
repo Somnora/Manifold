@@ -3,24 +3,53 @@
 # proxy integration). SGLang's RadixAttention reuses shared prompt prefixes
 # across requests automatically, which makes it the faster engine for
 # agent/RAG-style workloads that resend long system prompts; vLLM remains
-# the default for one-off prompts. Image + entrypoint verified against the
-# registry 2026-07-12 (nvidia passthrough entrypoint, command supplied here).
+# the default for one-off prompts.
 name: sglang-serve
-description: Serve a model with SGLang (OpenAI-compatible API on a loopback port). Faster than vLLM when requests share long prompt prefixes (agents, RAG). Standard HF Transformers repos only.
+description: Serve a model with SGLang (OpenAI-compatible API on a loopback port). Features RadixAttention prefix caching and multi-LoRA support for agent swarms. Standard HF Transformers repos or local paths only.
 image: lmsysorg/sglang:latest
 
 command: >
-  python3 -m sglang.launch_server
-  --model-path {{model_id}}
-  --context-length {{max_context}}
-  --port {{port}}
-  --host 0.0.0.0
-  --tp {{tensor_parallel}}
+  python3 -c '
+  import os, sys
+
+  (model_id, max_context, port, tensor_parallel,
+   lora_paths, mem_fraction_static, enable_lora, max_loras, max_lora_rank) = sys.argv[1:10]
+
+  cmd = [
+      "python3", "-m", "sglang.launch_server",
+      "--model-path", model_id,
+      "--context-length", max_context,
+      "--port", port,
+      "--host", "0.0.0.0",
+      "--tp", tensor_parallel,
+  ]
+
+  if mem_fraction_static and str(mem_fraction_static).strip():
+      cmd.extend(["--mem-fraction-static", str(mem_fraction_static).strip()])
+
+  if str(enable_lora).lower() in ("true", "1", "yes"):
+      # Some versions of SGLang use --enable-lora, but it's safe to pass if explicitly asked
+      # We also pass max_loras and max_lora_rank for dynamic loading
+      cmd.append("--enable-lora")
+      if max_loras and str(max_loras).isdigit() and int(max_loras) > 0:
+          cmd.extend(["--max-loras", str(max_loras)])
+      if max_lora_rank and str(max_lora_rank).isdigit() and int(max_lora_rank) > 0:
+          cmd.extend(["--max-lora-rank", str(max_lora_rank)])
+
+  if lora_paths and str(lora_paths).strip():
+      cmd.append("--lora-paths")
+      for path in str(lora_paths).replace(",", " ").split():
+          if path.strip():
+              cmd.append(path.strip())
+
+  print(f"manifold: launching sglang -> {\" \".join(cmd)}", flush=True)
+  os.execvp(cmd[0], cmd)
+  ' manifold {{model_id}} {{max_context}} {{port}} {{tensor_parallel}} {{lora_paths}} {{mem_fraction_static}} {{enable_lora}} {{max_loras}} {{max_lora_rank}}
 
 parameters:
   - name: model_id
     type: string
-    description: HuggingFace model id to serve (e.g. Qwen/Qwen3-8B), or a local path like /data/models/merged for a model produced by lora-merge
+    description: HuggingFace model id to serve (e.g. Qwen/Qwen2.5-7B-Instruct), or a local path like /data/models/merged for a model produced by lora-merge
   - name: max_context
     type: integer
     default: 8192
@@ -33,6 +62,26 @@ parameters:
     type: integer
     default: 1
     description: Shard the model across this many GPUs (set to 8 on an 8x cluster for big MoE models)
+  - name: lora_paths
+    type: string
+    default: ""
+    description: Optional LoRA adapter paths for multi-LoRA serving (space or comma-separated name=path pairs, e.g. coder=/data/outputs/distill-v1).
+  - name: mem_fraction_static
+    type: number
+    default: 0.88
+    description: GPU memory fraction reserved for static model weights and KV cache / RadixAttention prefix caching.
+  - name: enable_lora
+    type: boolean
+    default: false
+    description: Enable dynamic multi-LoRA serving.
+  - name: max_loras
+    type: integer
+    default: 4
+    description: Maximum number of LoRA adapters to serve concurrently.
+  - name: max_lora_rank
+    type: integer
+    default: 64
+    description: Maximum rank for LoRA adapters.
 
 volumes:
   # HuggingFace cache on persistent storage: models survive the instance.
@@ -42,6 +91,10 @@ volumes:
   # path with model_id=/data/models/<name>. Read-only: serving never writes.
   - host: "{persistent}/models"
     container: /data/models
+    read_only: true
+  # Finetuned LoRA adapters (e.g. from axolotl-finetune) live here. Read-only.
+  - host: "{persistent}/outputs"
+    container: /data/outputs
     read_only: true
 
 ports:
@@ -57,3 +110,4 @@ gpu:
     - gpu_1x_a10
     - gpu_1x_h100_pcie
     - gpu_1x_h100_sxm5
+

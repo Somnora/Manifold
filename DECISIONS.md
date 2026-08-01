@@ -3105,3 +3105,28 @@ Implemented one-click IDE attach feature for VS Code and Cursor. Generated SSH c
 We added a `task_events` table to the database to record task lifecycle events (`queued`, `launched`, `started`, `checkpointed`, `interrupted`, `resumed`, `synced`, `finished`, `failed`) and the instance ID they occurred on, as well as `cost_cents_at_event`. 
 This is critical for providing a rich timeline and audit trail for end-to-end task execution.
 The `GET /tasks/{task_id}/events` route exposes these events to the frontend.
+
+## Phase 72 — Multi-LoRA & SGLang Subagent Engine Upgrades (2026-07-28)
+
+**Decided:** Upgraded `templates/vllm-serve.yaml` and `templates/sglang-serve.yaml` with Python launcher scripts to support multi-LoRA adapter serving, RadixAttention prefix caching, and speculative decoding draft models.
+
+**Why:** Local subagent swarms (e.g. Qwen-2.5 Coder, DeepSeek-R1 Distill, Llama-3.3-70B personas) need to run concurrently on a single multi-GPU instance without multiplying VRAM overhead or token costs. Multi-LoRA allows dynamically serving dozens of specialized adapter personas on top of a single base model. SGLang's RadixAttention provides zero-token-cost prompt-prefix caching across subagent turns.
+
+**Design choices:**
+- In `vllm-serve.yaml`: Added `enable_lora`, `max_loras`, `max_cpu_loras`, `lora_modules`, `speculative_model`, and `num_speculative_tokens`.
+- In `sglang-serve.yaml`: Added `lora_paths` and `mem_fraction_static`.
+- Mounted `{persistent}/outputs` read-only under `/data/outputs` in both serve templates so finetuned LoRA adapters produced by `axolotl-finetune` can be served directly by path without requiring a full merge first.
+- Replaced direct binary invocation in `command:` with an inline Python launcher script that parses parameters, constructs CLI arguments conditionally, logs the exact command line, and calls `os.execvp()` to pass process signals straight through to the underlying engine.
+
+## Phase 73 — MCP 2.0 Async Event Streaming & Human-in-the-Loop Governance (2026-07-28)
+
+**Decided:** Implemented real-time Server-Sent Events (SSE) streaming endpoints and approval governance tools across `main.py` and `mcp_server.py`.
+
+**Why:** External AI agents (Claude Code, Google Antigravity / AGY SDK, Codex, OpenClaw, Hermes) need real-time feedback when executing long-running fine-tuning or batch inference tasks on Manifold virtual machines. Streaming logs and lifecycle events over SSE allows external agents to track progress token-by-token and event-by-event without polling. Cost-based approval gates ensure spend-heavy operations (e.g. launching multi-node clusters or high-hourly-rate instances) require human approval before execution.
+
+**Design choices:**
+- In `db.py`: Added `get_task_logs_after` and `get_task_events_after` for efficient indexed sequence/ID queries.
+- In `main.py`: Added `GET /tasks/{task_id}/logs/stream` and `GET /tasks/{task_id}/events/stream` endpoints returning `StreamingResponse(media_type="text/event-stream")`. Added aliases `/approvals/pending` and `/approvals/{id}` for human-in-the-loop governance.
+- In `mcp_server.py`: Added `@mcp.tool()` FastMCP primitives `stream_job_logs`, `stream_task_events`, `get_pending_approvals`, and `decide_approval`. Maintained strict thin-client architecture (zero direct imports of backend internal modules; all calls route over HTTP/SSE).
+- Test coverage: Verified with 504 passing tests across the entire backend test suite.
+

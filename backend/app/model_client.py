@@ -22,6 +22,7 @@ from typing import AsyncIterator
 
 import httpx
 
+from .subagent_engine import engine as subagent_engine
 
 class ModelClientError(Exception):
     pass
@@ -198,3 +199,30 @@ class MockModelClient(ModelClient):
             "usage": {"prompt_tokens": 0, "completion_tokens": tokens,
                       "total_tokens": tokens},
         }
+
+
+class SubagentModelClient(ModelClient):
+    """Reaches a local subagent model via the LocalSubagentEngine.
+    """
+
+    def __init__(self, model_id: str):
+        self.model_id = model_id
+
+    async def model_info(self, port: int) -> dict:
+        url = await subagent_engine.get_healthy_endpoint(self.model_id)
+        if not url:
+            raise ModelClientError(f"No healthy subagent endpoint for {self.model_id}")
+        return {"object": "list", "data": [{"id": self.model_id, "object": "model"}]}
+
+    async def chat_stream(self, port: int, payload: dict) -> AsyncIterator[str]:
+        try:
+            async for line in subagent_engine.dispatch_stream(self.model_id, payload):
+                yield line
+        except Exception as exc:
+            raise ModelClientError(f"subagent chat stream failed: {exc}") from exc
+
+    async def chat_completion(self, port: int, payload: dict) -> dict:
+        try:
+            return await subagent_engine.dispatch(self.model_id, payload)
+        except Exception as exc:
+            raise ModelClientError(f"subagent chat completion failed: {exc}") from exc

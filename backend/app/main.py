@@ -70,6 +70,7 @@ from .templates import load_templates
 from .ide_attach import write_ssh_config_block, get_ide_urls
 from .terminal_sessions import TerminalSession, TerminalSessionManager
 from .providers import ProviderRegistry, LambdaProvider, GCPProvider, MockGCPProvider, RealGCPProvider
+from .subagent_engine import engine
 
 logger = logging.getLogger("manifold.main")
 
@@ -159,6 +160,12 @@ def _end_shell_group(pid: int, *, grace_seconds: float = 5.0,
     return task
 
 
+class DispatchRequest(BaseModel):
+    model: str
+    prompt: str
+    tools: list[dict] | None = None
+
+
 class LaunchRequest(BaseModel):
     instance_type: str
     region: str
@@ -168,6 +175,17 @@ class LaunchRequest(BaseModel):
     name: str = Field(default="", max_length=64)
     idle_timeout_seconds: float | None = None
     provider: str = 'lambda'
+
+
+class ClusterLaunchRequest(BaseModel):
+    instance_type: str
+    region: str
+    filesystem: str
+    node_count: int
+    connection_mode: str | None = None
+    ssh_key_name: str | None = None
+    name: str = ""
+    provider: str = "lambda"
 
 
 class IdleTimeoutRequest(BaseModel):
@@ -293,6 +311,18 @@ class KeepAliveRequest(BaseModel):
 
 class ProjectBriefRequest(BaseModel):
     content: str = Field(max_length=20000)
+
+
+class AgentHandshakeRequest(BaseModel):
+    session_id: str
+    protocol: str = "manifold-v1"
+
+
+class AgentContextUpdateRequest(BaseModel):
+    workspace_environment: dict | None = None
+    session_tokens: dict | None = None
+    active_gpu_connections: dict | None = None
+    task_graphs: dict | None = None
 
 
 def create_app(
@@ -768,6 +798,31 @@ def create_app(
     @app.delete("/notifications")
     async def clear_notifications():
         return {"cleared": notifier.clear()}
+
+    # -- agent context -------------------------------------------------------------
+
+    from .agent_context import agent_contexts
+
+    @app.post("/agent/handshake")
+    async def agent_handshake(req: AgentHandshakeRequest):
+        context = agent_contexts.create_context(req.session_id)
+        # Handle protocol if needed
+        return {"status": "ok", "context": context.to_dict()}
+
+    @app.get("/agent/context/{session_id}")
+    async def get_agent_context_route(session_id: str):
+        context = agent_contexts.get_context(session_id)
+        if not context:
+            raise HTTPException(404, "Context not found")
+        return context.to_dict()
+
+    @app.post("/agent/context/{session_id}/update")
+    async def update_agent_context_route(session_id: str, req: AgentContextUpdateRequest):
+        updates = req.model_dump(exclude_none=True)
+        context = agent_contexts.update_context(session_id, updates)
+        if not context:
+            raise HTTPException(404, "Context not found")
+        return {"status": "ok", "context": context.to_dict()}
 
     # -- instances ----------------------------------------------------------------
 
@@ -2049,11 +2104,101 @@ def create_app(
             raise HTTPException(404, f"task {task_id} not found")
         return {"task_id": task_id, "lines": queue.get_logs(task_id, tail)}
 
+    @app.get("/tasks/{task_id}/logs/stream")
+    async def stream_task_logs(task_id: str, poll_interval: float = 0.2):
+        """Stream task log lines as Server-Sent Events (SSE) as they arrive until completion."""
+        import json
+        from fastapi.responses import StreamingResponse
+        if queue.get(task_id) is None:
+            raise HTTPException(404, f"task {task_id} not found")
+
+        async def event_generator():
+            sent_seq = -1
+            while True:
+                lines = queue.get_logs(task_id)
+                for line in lines:
+                    seq = line.get("seq", 0)
+                    if seq > sent_seq:
+                        sent_seq = seq
+                        yield f"data: {json.dumps(line)}\n\n"
+                t = queue.get(task_id)
+                if t and t.get("status") in ("succeeded", "failed", "canceled"):
+                    lines = queue.get_logs(task_id)
+                    for line in lines:
+                        seq = line.get("seq", 0)
+                        if seq > sent_seq:
+                            sent_seq = seq
+                            yield f"data: {json.dumps(line)}\n\n"
+                    break
+                await asyncio.sleep(poll_interval)
+
+        return StreamingResponse(event_generator(), media_type="text/event-stream")
+
     @app.get("/tasks/{task_id}/events")
     async def get_task_events(task_id: str):
         if queue.get(task_id) is None:
             raise HTTPException(404, f"task {task_id} not found")
         return {"task_id": task_id, "events": db.get_task_events(task_id)}
+
+    @app.get("/tasks/{task_id}/events/stream")
+    async def stream_task_events(task_id: str, poll_interval: float = 0.2):
+        """Stream task lifecycle events as Server-Sent Events (SSE) until completion."""
+        import json
+        from fastapi.responses import StreamingResponse
+        if queue.get(task_id) is None:
+            raise HTTPException(404, f"task {task_id} not found")
+
+        async def event_generator():
+            seen = set()
+            while True:
+                events = db.get_task_events(task_id)
+                for ev in events:
+                    ev_key = f"{ev.get('event')}_{ev.get('at', ev.get('timestamp'))}"
+                    if ev_key not in seen:
+                        seen.add(ev_key)
+                        yield f"data: {json.dumps(ev)}\n\n"
+                t = queue.get(task_id)
+                if t and t.get("status") in ("succeeded", "failed", "canceled"):
+                    events = db.get_task_events(task_id)
+                    for ev in events:
+                        ev_key = f"{ev.get('event')}_{ev.get('at', ev.get('timestamp'))}"
+                        if ev_key not in seen:
+                            seen.add(ev_key)
+                            yield f"data: {json.dumps(ev)}\n\n"
+                    break
+                await asyncio.sleep(poll_interval)
+
+        return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+    @app.post("/subagents/dispatch")
+    async def dispatch_local_subagent_route(req: DispatchRequest):
+        payload = engine.format_tool_call(req.prompt, req.tools)
+        return await engine.dispatch(req.model, payload)
+
+    @app.get("/subagents/models")
+    async def get_subagent_models():
+        models_info = []
+        for model, urls in engine.endpoints.items():
+            healthy = []
+            for url in urls:
+                if await engine.check_health(url):
+                    healthy.append(url)
+            models_info.append({"model": model, "active_endpoints": healthy})
+        return {"models": models_info}
+
+    @app.get("/subagents/swarm/status")
+    async def get_swarm_status():
+        active = 0
+        for urls in engine.endpoints.values():
+            for url in urls:
+                if await engine.check_health(url):
+                    active += 1
+        return {
+            "health": "ok" if active > 0 else "degraded",
+            "queue_depth": engine.queue.qsize(),
+            "active_subagents": active
+        }
+
 
     # Literal path declared BEFORE /tasks/{task_id} so "finished" is not
     # captured as a task id.
@@ -2222,6 +2367,7 @@ def create_app(
         return {"brains": [asdict(b) for b in await brains.list_brains()]}
 
     @app.get("/autopilot/approvals")
+    @app.get("/approvals/pending")
     async def list_pending_approvals():
         """Actions waiting on a human Approve/Deny (approval-gated runs).
 
@@ -2234,6 +2380,7 @@ def create_app(
         }
 
     @app.post("/autopilot/approvals/{approval_id}")
+    @app.post("/approvals/{approval_id}")
     async def decide_approval(approval_id: str, req: ApprovalDecision):
         status = "approved" if req.approve else "denied"
         if not db.decide_approval(approval_id, status):
@@ -2418,6 +2565,52 @@ def create_app(
             sample_count=summary["sample_count"],
         )
         return {"available": summary["sample_count"] > 0, **util.to_dict()}
+
+    # -- cluster management --------------------------------------------------------
+
+    class ClusterLaunchRequest(BaseModel):
+        instance_type: str
+        region: str
+        filesystem: str
+        node_count: int
+        connection_mode: str | None = None
+        ssh_key_name: str | None = None
+        name: str = ""
+        provider: str = "lambda"
+
+    @app.post("/clusters/launch")
+    async def launch_cluster_route(req: ClusterLaunchRequest):
+        try:
+            return await orchestrator.launch_cluster(
+                instance_type=req.instance_type,
+                region=req.region,
+                filesystem=req.filesystem,
+                node_count=req.node_count,
+                connection_mode=req.connection_mode,
+                ssh_key_name=req.ssh_key_name,
+                name=req.name,
+                provider=req.provider,
+            )
+        except LaunchRejected as e:
+            raise HTTPException(e.status_code, str(e))
+
+    @app.get("/clusters")
+    async def list_clusters_route():
+        return {"clusters": db.list_clusters()}
+
+    @app.get("/clusters/{cluster_id}")
+    async def get_cluster_route(cluster_id: str):
+        cluster = db.get_cluster(cluster_id)
+        if not cluster:
+            raise HTTPException(404, f"Cluster {cluster_id} not found")
+        return cluster
+
+    @app.post("/clusters/{cluster_id}/terminate")
+    async def terminate_cluster_route(cluster_id: str, force: bool = False):
+        try:
+            return await orchestrator.terminate_cluster(cluster_id, force=force)
+        except LaunchRejected as e:
+            raise HTTPException(e.status_code, str(e))
 
     # -- filesystems & storage ------------------------------------------------------
 

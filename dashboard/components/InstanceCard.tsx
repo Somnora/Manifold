@@ -12,6 +12,8 @@ import { StatusBadge } from "@/components/Badge";
 import { TelemetryChart } from "@/components/TelemetryChart";
 import { useTerminalDock } from "@/components/TerminalDock";
 import { formatBytes, formatMoney } from "@/lib/format";
+import { motion } from "framer-motion";
+import { Terminal, MessageSquare, FolderOpen, Globe, Power, Edit2, Play, Pause, Save, X, Settings2, CheckCircle2 } from "lucide-react";
 
 export function InstanceCard({
   instance,
@@ -147,7 +149,11 @@ export function InstanceCard({
   }
 
   return (
-    <div className="rounded-lg border border-zinc-200 bg-white p-4">
+    <motion.div 
+      initial={{ opacity: 0, y: 10 }}
+      animate={{ opacity: 1, y: 0 }}
+      className="rounded-xl border border-zinc-200/80 bg-white/80 backdrop-blur-md p-5 shadow-sm transition-all hover:shadow-md hover:border-zinc-300"
+    >
       <div className="flex items-start justify-between gap-4">
         <div>
           <div className="flex items-center gap-2">
@@ -223,20 +229,21 @@ export function InstanceCard({
           {everConnected &&
             (() => {
               const dockActions = [
-                ["Terminal", () => dockInstance(instance.id, instance.name || instance.id)],
-                ["Chat", () => dockPanel("chat", instance.id, instance.name || instance.id)],
-                ["Files", () => dockPanel("files", instance.id, instance.name || instance.id)],
-                ["Browse", () => dockPanel("browse", instance.id, instance.name || instance.id)],
-              ] as [string, () => void][];
+                [{ label: "Terminal", icon: <Terminal className="w-3.5 h-3.5" /> }, () => dockInstance(instance.id, instance.name || instance.id)],
+                [{ label: "Chat", icon: <MessageSquare className="w-3.5 h-3.5" /> }, () => dockPanel("chat", instance.id, instance.name || instance.id)],
+                [{ label: "Files", icon: <FolderOpen className="w-3.5 h-3.5" /> }, () => dockPanel("files", instance.id, instance.name || instance.id)],
+                [{ label: "Browse", icon: <Globe className="w-3.5 h-3.5" /> }, () => dockPanel("browse", instance.id, instance.name || instance.id)],
+              ] as [{ label: string; icon: React.ReactNode }, () => void][];
               if (!collapsed) {
-                return dockActions.map(([label, action]) => (
+                return dockActions.map(([info, action]) => (
                   <button
-                    key={label}
+                    key={info.label}
                     onClick={action}
-                    title={`Open ${label.toLowerCase()} in the dock (snap it bottom or right)`}
-                    className="rounded border border-zinc-300 px-3 py-1 text-xs font-medium text-zinc-700 hover:bg-zinc-50"
+                    title={`Open ${info.label.toLowerCase()} in the dock (snap it bottom or right)`}
+                    className="flex items-center gap-1.5 rounded border border-zinc-300 px-3 py-1 text-xs font-medium text-zinc-700 hover:bg-zinc-50 hover:border-zinc-400 transition-colors"
                   >
-                    {label}
+                    {info.icon}
+                    {info.label}
                   </button>
                 ));
               }
@@ -253,16 +260,17 @@ export function InstanceCard({
                   </button>
                   {menuOpen && (
                     <div className="absolute right-0 z-30 mt-1 w-32 rounded border border-zinc-200 bg-white py-1 shadow-lg">
-                      {dockActions.map(([label, action]) => (
+                      {dockActions.map(([info, action]) => (
                         <button
-                          key={label}
+                          key={info.label}
                           onClick={() => {
                             setMenuOpen(false);
                             action();
                           }}
-                          className="block w-full px-3 py-1.5 text-left text-xs text-zinc-700 hover:bg-zinc-50"
+                          className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs text-zinc-700 hover:bg-zinc-50 transition-colors"
                         >
-                          {label}
+                          {info.icon}
+                          {info.label}
                         </button>
                       ))}
                     </div>
@@ -552,6 +560,6 @@ export function InstanceCard({
         </p>
       )}
       {error && <p className="mt-2 text-xs text-red-700">{error}</p>}
-    </div>
+    </motion.div>
   );
 }

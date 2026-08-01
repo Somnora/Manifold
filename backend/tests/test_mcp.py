@@ -67,7 +67,7 @@ def test_mcp_server_is_structurally_thin():
             imported.add(("." * node.level) + module)
     # asyncio is stdlib plumbing (retry sleep/deadline in wait_for_launch),
     # not a path into backend internals.
-    allowed = {"__future__", "asyncio", "os", "typing", "httpx",
+    allowed = {"__future__", "asyncio", "json", "os", "typing", "httpx",
                "mcp.server.fastmcp"}
     assert imported <= allowed, (
         f"MCP server imports beyond the thin-client allowlist: "
@@ -336,3 +336,19 @@ async def test_no_destructive_filesystem_tool_on_the_bridge():
     assert "create_filesystem" in names          # creation stays agent-safe
     assert "delete_filesystem" not in names
     assert not any("delete" in n and "filesystem" in n for n in names)
+
+
+async def test_stream_job_logs_and_events(mcp_wired, client):
+    """Test MCP 2.0 streaming tools and approval management endpoints."""
+    # Test pending approvals list
+    res = await mcp_server.get_pending_approvals()
+    assert "approvals" in res
+    assert isinstance(res["approvals"], list)
+
+    # List tools check for new MCP tools
+    tools = await mcp_server.mcp.list_tools()
+    names = {t.name for t in tools}
+    assert "stream_job_logs" in names
+    assert "stream_task_events" in names
+    assert "get_pending_approvals" in names
+    assert "decide_approval" in names

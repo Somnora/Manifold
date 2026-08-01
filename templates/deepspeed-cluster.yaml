@@ -1,0 +1,57 @@
+# Multi-node DeepSpeed ZeRO-3 / FSDP distributed model fine-tuning across GPU cluster nodes.
+name: deepspeed-cluster
+description: Multi-node distributed training and fine-tuning across GPU cluster instances using torchrun / DeepSpeed.
+image: winglian/axolotl:main-py3.11-cu124-20241010
+network: host
+
+command: >
+  python3 -c '
+  import os, sys, subprocess
+
+  (nnodes, node_rank, master_addr, master_port, nproc_per_node, config_path) = sys.argv[1:7]
+
+  cmd = [
+      "torchrun",
+      f"--nnodes={nnodes}",
+      f"--node_rank={node_rank}",
+      f"--master_addr={master_addr}",
+      f"--master_port={master_port}",
+      f"--nproc_per_node={nproc_per_node}",
+      "-m", "axolotl.cli.train",
+      config_path,
+  ]
+
+  print(f"manifold: launching deepspeed cluster rank {node_rank}/{nnodes} -> {\" \".join(cmd)}", flush=True)
+  os.execvp(cmd[0], cmd)
+  ' manifold {{nnodes}} {{node_rank}} {{master_addr}} {{master_port}} {{nproc_per_node}} {{config_path}}
+
+parameters:
+  - name: nnodes
+    type: integer
+    default: 2
+    description: Total number of cluster nodes participating in training.
+  - name: node_rank
+    type: integer
+    default: 0
+    description: Rank of this node (0 for master/head node, 1..N-1 for worker nodes).
+  - name: master_addr
+    type: string
+    description: IP address or hostname of node_rank 0 master head node.
+  - name: master_port
+    type: integer
+    default: 29500
+    description: PyTorch distributed rendezvous port.
+  - name: nproc_per_node
+    type: integer
+    default: 8
+    description: Number of GPUs per node.
+  - name: config_path
+    type: string
+    default: /data/config.yaml
+    description: Path to Axolotl / DeepSpeed training YAML configuration file.
+
+volumes:
+  - host: "{persistent}/cache/huggingface"
+    container: /root/.cache/huggingface
+  - host: "{persistent}/data"
+    container: /data

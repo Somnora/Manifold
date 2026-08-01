@@ -1,30 +1,54 @@
 # Serve a model with vLLM's OpenAI-compatible server.
+# Supports single model serving, multi-LoRA subagent swarms, and speculative decoding.
 # The port is bound to 127.0.0.1 on the instance by the dispatcher; reach it
 # from your machine through the backend's SSH port forward.
 name: vllm-serve
-description: Serve a model with vLLM (OpenAI-compatible API on a loopback port). Use a standard HF Transformers repo (e.g. Qwen/Qwen2.5-7B-Instruct); GGUF quant repos will not load.
+description: Serve a model with vLLM (OpenAI-compatible API on a loopback port). Supports multi-LoRA subagent personas and speculative decoding draft models. Standard HF Transformers repos or local paths only.
 image: vllm/vllm-openai:latest
 
-# The image ENTRYPOINT is `vllm serve` (verified from the image config), so
-# the model is a POSITIONAL argument here, not `--model`. Passing `--model`
-# is what made this exit immediately after a successful pull.
-# Tool calling is on by default: agent frameworks (pydantic-ai, OpenAI SDK
-# tool use) get structured output via tool calls, and without these flags
-# vLLM answers those requests with 400s. The parser must match the model's
-# tool-call format: hermes fits Qwen/Hermes-style models (our presets);
-# use mistral or llama3_json for those families.
 command: >
-  {{model_id}}
-  --max-model-len {{max_context}}
-  --port {{port}}
-  --tensor-parallel-size {{tensor_parallel}}
-  --enable-auto-tool-choice
-  --tool-call-parser {{tool_call_parser}}
+  python3 -c '
+  import os, sys, subprocess
+
+  (model_id, max_context, port, tensor_parallel, tool_call_parser,
+   enable_lora, max_loras, max_cpu_loras, lora_modules, max_lora_rank,
+   speculative_model, num_speculative_tokens) = sys.argv[1:13]
+
+  cmd = [
+      "vllm", "serve", model_id,
+      "--max-model-len", max_context,
+      "--port", port,
+      "--tensor-parallel-size", tensor_parallel,
+      "--enable-auto-tool-choice",
+      "--tool-call-parser", tool_call_parser,
+  ]
+
+  if str(enable_lora).lower() in ("true", "1", "yes"):
+      cmd.append("--enable-lora")
+      if max_loras and str(max_loras).isdigit() and int(max_loras) > 0:
+          cmd.extend(["--max-loras", str(max_loras)])
+      if max_cpu_loras and str(max_cpu_loras).isdigit() and int(max_cpu_loras) > 0:
+          cmd.extend(["--max-cpu-loras", str(max_cpu_loras)])
+      if max_lora_rank and str(max_lora_rank).isdigit() and int(max_lora_rank) > 0:
+          cmd.extend(["--max-lora-rank", str(max_lora_rank)])
+      if lora_modules and str(lora_modules).strip():
+          for module in str(lora_modules).replace(",", " ").split():
+              if module.strip():
+                  cmd.extend(["--lora-modules", module.strip()])
+
+  if speculative_model and str(speculative_model).strip():
+      cmd.extend(["--speculative-model", str(speculative_model).strip()])
+      if num_speculative_tokens and str(num_speculative_tokens).isdigit():
+          cmd.extend(["--num-speculative-tokens", str(num_speculative_tokens)])
+
+  print(f"manifold: launching vllm -> {\" \".join(cmd)}", flush=True)
+  os.execvp(cmd[0], cmd)
+  ' manifold {{model_id}} {{max_context}} {{port}} {{tensor_parallel}} {{tool_call_parser}} {{enable_lora}} {{max_loras}} {{max_cpu_loras}} {{lora_modules}} {{max_lora_rank}} {{speculative_model}} {{num_speculative_tokens}}
 
 parameters:
   - name: model_id
     type: string
-    description: HuggingFace model id to serve (e.g. Qwen/Qwen3-8B), or a local path like /data/models/merged for a model produced by lora-merge
+    description: HuggingFace model id to serve (e.g. Qwen/Qwen2.5-7B-Instruct), or a local path like /data/models/merged for a model produced by lora-merge
   - name: max_context
     type: integer
     default: 8192
@@ -41,6 +65,34 @@ parameters:
     type: string
     default: hermes
     description: Tool-call format parser, needed for structured output / agent frameworks. hermes fits Qwen and Hermes models; use mistral or llama3_json for those families.
+  - name: enable_lora
+    type: boolean
+    default: false
+    description: Enable multi-LoRA serving to dynamically serve multiple subagent adapter personas on top of a single base model.
+  - name: max_loras
+    type: integer
+    default: 4
+    description: Maximum number of LoRA adapters to serve concurrently when enable_lora is true.
+  - name: max_cpu_loras
+    type: integer
+    default: 8
+    description: Maximum number of LoRA adapters to cache in CPU memory when enable_lora is true.
+  - name: lora_modules
+    type: string
+    default: ""
+    description: Optional pre-loaded LoRA adapters (space or comma-separated name=path pairs, e.g. coder=/data/outputs/distill-v1).
+  - name: max_lora_rank
+    type: integer
+    default: 64
+    description: Maximum rank for LoRA adapters.
+  - name: speculative_model
+    type: string
+    default: ""
+    description: Optional draft model ID or local path for speculative decoding to accelerate token generation.
+  - name: num_speculative_tokens
+    type: integer
+    default: 5
+    description: Number of speculative tokens to sample per draft step when speculative_model is set.
 
 volumes:
   # HuggingFace cache on persistent storage: models survive the instance.
@@ -50,6 +102,11 @@ volumes:
   # path with model_id=/data/models/<name>. Read-only: serving never writes.
   - host: "{persistent}/models"
     container: /data/models
+    read_only: true
+  # Finetuned LoRA adapters (e.g. from axolotl-finetune) live here; serve adapters
+  # by path e.g. lora_modules="coder=/data/outputs/distill-v1". Read-only.
+  - host: "{persistent}/outputs"
+    container: /data/outputs
     read_only: true
 
 ports:
@@ -65,3 +122,4 @@ gpu:
     - gpu_1x_a10
     - gpu_1x_h100_pcie
     - gpu_1x_h100_sxm5
+

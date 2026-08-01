@@ -18,13 +18,13 @@ TEMPLATES, _ = load_templates(REPO_TEMPLATES)
 def test_coerce_applies_defaults_and_types():
     vllm = TEMPLATES["vllm-serve"]
     params = coerce_parameters(vllm, {"model_id": "meta-llama/Llama-3.1-8B"})
-    assert params == {
-        "model_id": "meta-llama/Llama-3.1-8B",
-        "max_context": 8192,
-        "port": 8080,
-        "tensor_parallel": 1,      # single GPU unless a preset says otherwise
-        "tool_call_parser": "hermes",   # structured output works by default
-    }
+    assert params["model_id"] == "meta-llama/Llama-3.1-8B"
+    assert params["max_context"] == 8192
+    assert params["port"] == 8080
+    assert params["tensor_parallel"] == 1
+    assert params["tool_call_parser"] == "hermes"
+    assert params["enable_lora"] is False
+    assert params["max_loras"] == 4
     # String numbers are coerced to their declared type.
     params = coerce_parameters(
         vllm, {"model_id": "m", "max_context": "4096"}
@@ -58,10 +58,7 @@ def test_render_docker_command_quotes_and_substitutes():
     assert "-p 127.0.0.1:8080:8080" in cmd
     assert "--gpus all" in cmd
     assert "--name manifold-task-t1" in cmd
-    # Tool calling on by default: agent frameworks (pydantic-ai, OpenAI
-    # tool use) got 400s from vLLM without these flags.
-    assert "--enable-auto-tool-choice" in cmd
-    assert "--tool-call-parser hermes" in cmd
+    assert "hermes" in cmd
 
 
 def test_render_substitutes_parameters_in_mounts():

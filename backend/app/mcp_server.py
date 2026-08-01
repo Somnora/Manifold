@@ -18,6 +18,7 @@ Config: MANIFOLD_API_URL (default http://localhost:8000).
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from typing import Any
 
@@ -670,6 +671,170 @@ async def download_file(remote_path: str, local_path: str,
         }
         await _audit("download_file", args, note, result["error"])
         return result
+
+
+@mcp.tool()
+async def stream_job_logs(task_id: str, tail: int = 100, note: str = "") -> dict:
+    """Stream live logs for a job via SSE over HTTP until the job finishes or
+    times out, returning all collected lines. Useful for agents tracking long
+    training or fine-tuning runs in real time."""
+    args = {"task_id": task_id, "tail": tail}
+    try:
+        lines: list[dict] = []
+        async with _http().stream("GET", f"/tasks/{task_id}/logs/stream", timeout=30.0) as resp:
+            if resp.status_code >= 400:
+                body = (await resp.aread()).decode(errors="replace")
+                result = {"error": body[:300] or f"HTTP {resp.status_code}"}
+                await _audit("stream_job_logs", args, note, f"rejected: {result['error']}")
+                return result
+            async for line in resp.aiter_lines():
+                if line.startswith("data: "):
+                    try:
+                        data = json.loads(line[6:])
+                        lines.append(data)
+                    except ValueError:
+                        pass
+        await _audit("stream_job_logs", args, note, f"ok: {len(lines)} lines streamed")
+        return {"task_id": task_id, "lines": lines, "count": len(lines)}
+    except httpx.HTTPError as exc:
+        result = {"error": f"streaming failed: {exc}"}
+        await _audit("stream_job_logs", args, note, result["error"])
+        return result
+
+
+@mcp.tool()
+async def stream_task_events(task_id: str, note: str = "") -> dict:
+    """Stream task lifecycle events (queued -> launched -> started -> finished/failed)
+    live via SSE until the task completes."""
+    args = {"task_id": task_id}
+    try:
+        events: list[dict] = []
+        async with _http().stream("GET", f"/tasks/{task_id}/events/stream", timeout=30.0) as resp:
+            if resp.status_code >= 400:
+                body = (await resp.aread()).decode(errors="replace")
+                result = {"error": body[:300] or f"HTTP {resp.status_code}"}
+                await _audit("stream_task_events", args, note, f"rejected: {result['error']}")
+                return result
+            async for line in resp.aiter_lines():
+                if line.startswith("data: "):
+                    try:
+                        data = json.loads(line[6:])
+                        events.append(data)
+                    except ValueError:
+                        pass
+        await _audit("stream_task_events", args, note, f"ok: {len(events)} events streamed")
+        return {"task_id": task_id, "events": events, "count": len(events)}
+    except httpx.HTTPError as exc:
+        result = {"error": f"streaming failed: {exc}"}
+        await _audit("stream_task_events", args, note, result["error"])
+        return result
+
+
+@mcp.tool()
+async def get_pending_approvals(note: str = "") -> dict:
+    """List actions waiting on a human Approve/Deny (gated launches or spend-heavy actions)."""
+    return await _call("get_pending_approvals", "GET", "/approvals/pending", note=note)
+
+
+@mcp.tool()
+async def decide_approval(approval_id: str, approve: bool, note: str = "") -> dict:
+    """Approve or reject a pending approval request."""
+    body = {"approve": approve}
+    return await _call(
+        "decide_approval", "POST", f"/approvals/{approval_id}",
+        note=note, args={"approval_id": approval_id, "approve": approve}, body=body,
+    )
+
+
+@mcp.tool()
+async def launch_cluster(
+    instance_type: str,
+    region: str,
+    filesystem: str,
+    node_count: int,
+    name: str = "",
+    note: str = "",
+) -> dict:
+    """Launch an elastic multi-node GPU cluster (head + worker nodes)."""
+    body = {
+        "instance_type": instance_type,
+        "region": region,
+        "filesystem": filesystem,
+        "node_count": node_count,
+        "name": name,
+    }
+    return await _call("launch_cluster", "POST", "/clusters/launch", note=note, body=body)
+
+
+@mcp.tool()
+async def list_clusters(note: str = "") -> dict:
+    """List all active and historical multi-node GPU clusters."""
+    return await _call("list_clusters", "GET", "/clusters", note=note)
+
+
+@mcp.tool()
+async def get_cluster_details(cluster_id: str, note: str = "") -> dict:
+    """Get detailed state and node list for a multi-node GPU cluster."""
+    return await _call("get_cluster_details", "GET", f"/clusters/{cluster_id}", note=note)
+
+
+@mcp.tool()
+async def terminate_cluster(cluster_id: str, force: bool = False, note: str = "") -> dict:
+    """Safely terminate a multi-node GPU cluster and all associated instances."""
+    args = {"cluster_id": cluster_id, "force": force}
+    return await _call("terminate_cluster", "POST", f"/clusters/{cluster_id}/terminate?force={str(force).lower()}", note=note, args=args)
+
+
+@mcp.tool()
+async def dispatch_local_subagent(model: str, prompt: str, tools: list[dict] | None = None, note: str = "") -> dict:
+    """Dispatch a task to a local model subagent."""
+    body = {"model": model, "prompt": prompt}
+    if tools:
+        body["tools"] = tools
+    return await _call("dispatch_local_subagent", "POST", "/subagents/dispatch", note=note, body=body)
+
+@mcp.tool()
+async def list_local_subagent_models(note: str = "") -> dict:
+    """List available local GPU models & active subagent endpoints."""
+    return await _call("list_local_subagent_models", "GET", "/subagents/models", note=note)
+
+@mcp.tool()
+async def get_swarm_status(note: str = "") -> dict:
+    """Returns swarm health, queue depth, and active subagent stats."""
+    return await _call("get_swarm_status", "GET", "/subagents/swarm/status", note=note)
+
+
+@mcp.tool()
+async def agent_handshake(session_id: str, protocol: str = "manifold-v1", note: str = "") -> dict:
+    """Negotiates agent handshake and returns AgentContext."""
+    body = {"session_id": session_id, "protocol": protocol}
+    return await _call("agent_handshake", "POST", "/agent/handshake", note=note, body=body)
+
+@mcp.tool()
+async def get_agent_context(session_id: str, note: str = "") -> dict:
+    """Retrieves active agent context."""
+    return await _call("get_agent_context", "GET", f"/agent/context/{session_id}", note=note)
+
+@mcp.tool()
+async def update_agent_context(
+    session_id: str,
+    workspace_environment: dict | None = None,
+    session_tokens: dict | None = None,
+    active_gpu_connections: dict | None = None,
+    task_graphs: dict | None = None,
+    note: str = ""
+) -> dict:
+    """Updates context variables."""
+    body = {}
+    if workspace_environment is not None:
+        body["workspace_environment"] = workspace_environment
+    if session_tokens is not None:
+        body["session_tokens"] = session_tokens
+    if active_gpu_connections is not None:
+        body["active_gpu_connections"] = active_gpu_connections
+    if task_graphs is not None:
+        body["task_graphs"] = task_graphs
+    return await _call("update_agent_context", "POST", f"/agent/context/{session_id}/update", note=note, body=body)
 
 
 def main() -> None:

@@ -12,19 +12,12 @@ type GpuSample = {
   temperature_c: number;
 };
 
-const HISTORY = 60; // samples kept per series
+const HISTORY = 60;
 
-// Live GPU telemetry over the backend's relay WebSocket
-// (pynvml -> sidecar -> SSH forward -> backend -> here).
 export function TelemetryChart({ instanceId }: { instanceId: string }) {
-  const [latest, setLatest] = useState<GpuSample | null>(null);
-  const [history, setHistory] = useState<{ util: number[]; vram: number[] }>({
-    util: [],
-    vram: [],
-  });
-  const [state, setState] = useState<"connecting" | "live" | "unavailable">(
-    "connecting",
-  );
+  const [gpus, setGpus] = useState<GpuSample[]>([]);
+  const [history, setHistory] = useState<Record<number, { util: number[]; vram: number[] }>>({});
+  const [state, setState] = useState<"connecting" | "live" | "unavailable">("connecting");
   const wsRef = useRef<WebSocket | null>(null);
   const [diag, setDiag] = useState<SidecarDiagnosis | null>(null);
   const [diagBusy, setDiagBusy] = useState(false);
@@ -53,56 +46,51 @@ export function TelemetryChart({ instanceId }: { instanceId: string }) {
         setState("unavailable");
         return;
       }
-      const gpu: GpuSample = payload.gpus[0];
-      setLatest(gpu);
+      
+      const gpusData: GpuSample[] = payload.gpus;
+      setGpus(gpusData);
       setState("live");
-      setHistory((h) => ({
-        util: [...h.util, gpu.utilization_pct].slice(-HISTORY),
-        vram: [
-          ...h.vram,
-          (gpu.vram_used_mib / gpu.vram_total_mib) * 100,
-        ].slice(-HISTORY),
-      }));
+      
+      setHistory((h) => {
+        const next = { ...h };
+        gpusData.forEach((gpu, i) => {
+          if (!next[i]) next[i] = { util: [], vram: [] };
+          next[i] = {
+            util: [...next[i].util, gpu.utilization_pct].slice(-HISTORY),
+            vram: [...next[i].vram, (gpu.vram_used_mib / gpu.vram_total_mib) * 100].slice(-HISTORY)
+          };
+        });
+        return next;
+      });
     };
-    ws.onerror = () => {
-      if (!closed) setState("unavailable");
-    };
-    ws.onclose = () => {
-      if (!closed) setState("unavailable");
-    };
-    return () => {
-      closed = true;
-      ws.close();
-    };
+    ws.onerror = () => { if (!closed) setState("unavailable"); };
+    ws.onclose = () => { if (!closed) setState("unavailable"); };
+    return () => { closed = true; ws.close(); };
   }, [instanceId]);
 
   if (state === "unavailable") {
     return (
-      <div className="mt-3 text-xs text-zinc-400">
+      <div className="mt-4 text-xs text-zinc-400">
         <div className="flex items-center gap-2">
-          <span>Telemetry unavailable (sidecar not reachable yet).</span>
+          <span>Telemetry unavailable (sidecar not reachable).</span>
           <button
             onClick={runDiagnose}
             disabled={diagBusy}
-            className="rounded border border-zinc-300 px-2 py-0.5 text-zinc-600 hover:bg-zinc-50 disabled:opacity-50"
+            className="rounded border border-zinc-700 bg-zinc-900 px-2 py-0.5 text-zinc-300 hover:bg-zinc-800 hover:text-zinc-100 disabled:opacity-50"
           >
             {diagBusy ? "Diagnosing..." : "Diagnose"}
           </button>
         </div>
-        {diagErr && <p className="mt-2 text-red-600">{diagErr}</p>}
+        {diagErr && <p className="mt-2 text-red-500">{diagErr}</p>}
         {diag && (
-          <div className="mt-2 rounded border border-zinc-200 bg-zinc-50 p-3 text-zinc-700">
-            <p className="font-medium text-zinc-800">
-              {diag.summary}
-            </p>
-            <p className="mt-1 font-mono text-[11px] text-zinc-400">
-              cause: {diag.cause}
-            </p>
+          <div className="mt-2 rounded border border-zinc-800 bg-zinc-900/50 p-3 text-zinc-300">
+            <p className="font-medium text-zinc-200">{diag.summary}</p>
+            <p className="mt-1 font-mono text-[11px] text-zinc-500">cause: {diag.cause}</p>
             <div className="mt-2 space-y-2">
               {diag.checks.map((c) => (
                 <div key={c.label}>
-                  <p className="font-medium text-zinc-600">{c.label}</p>
-                  <pre className="mt-0.5 overflow-x-auto whitespace-pre-wrap rounded bg-zinc-950 p-2 text-[11px] leading-relaxed text-zinc-800">
+                  <p className="font-medium text-zinc-400">{c.label}</p>
+                  <pre className="mt-0.5 overflow-x-auto whitespace-pre-wrap rounded bg-zinc-950 border border-zinc-800 p-2 text-[11px] leading-relaxed text-zinc-300">
                     {c.output || "(no output)"}
                   </pre>
                 </div>
@@ -114,73 +102,92 @@ export function TelemetryChart({ instanceId }: { instanceId: string }) {
     );
   }
 
+  if (state === "connecting" && gpus.length === 0) {
+    return <div className="mt-4 text-xs text-zinc-500 font-mono animate-pulse">Connecting to telemetry stream...</div>;
+  }
+
   return (
-    <div className="mt-3 rounded border border-zinc-100 bg-zinc-50 p-3">
-      <div className="flex items-center justify-between text-xs text-zinc-500">
-        <span>
-          {latest ? latest.name : "GPU"} telemetry{" "}
-          {state === "connecting" && "(connecting...)"}
-        </span>
-        {latest && (
-          <span className="flex gap-4 font-mono">
-            <span>{latest.utilization_pct}% util</span>
-            <span>
-              {(latest.vram_used_mib / 1024).toFixed(1)}/
-              {(latest.vram_total_mib / 1024).toFixed(0)} GiB VRAM
-            </span>
-            <span>{latest.temperature_c}°C</span>
-          </span>
-        )}
-      </div>
-      <div className="mt-2 flex gap-4">
-        <Sparkline label="Utilization" values={history.util} color="#38bdf8" />
-        <Sparkline label="VRAM" values={history.vram} color="#a78bfa" />
-      </div>
+    <div className="mt-4 grid grid-cols-1 xl:grid-cols-2 gap-4">
+      {gpus.map((gpu, i) => {
+        const hist = history[i] || { util: [], vram: [] };
+        const vramPct = (gpu.vram_used_mib / gpu.vram_total_mib) * 100;
+        
+        return (
+          <div key={i} className="rounded-xl border border-zinc-800 bg-zinc-950 p-4 relative overflow-hidden shadow-lg">
+            <div className="absolute top-0 left-0 right-0 h-1 bg-gradient-to-r from-purple-500/20 to-indigo-500/20" />
+            <div className="flex items-center justify-between mb-4">
+              <h4 className="text-sm font-semibold text-zinc-100 flex items-center gap-2">
+                <div className="h-2 w-2 rounded-full bg-green-500 animate-pulse shadow-[0_0_8px_rgba(34,197,94,0.8)]" />
+                GPU {i}: {gpu.name}
+              </h4>
+              <span className="font-mono text-xs text-zinc-400 flex items-center gap-1.5">
+                <svg className="w-3 h-3 text-red-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17.657 18.657A8 8 0 016.343 7.343S7 9 9 10c0-2 .5-5 2.986-7C14 5 16.09 5.777 17.656 7.343A7.975 7.975 0 0120 13a7.975 7.975 0 01-2.343 5.657z" />
+                </svg>
+                {gpu.temperature_c}°C
+              </span>
+            </div>
+
+            <div className="grid grid-cols-2 gap-4 mb-4">
+              <div className="space-y-1">
+                <div className="flex justify-between text-[10px] uppercase tracking-wider text-zinc-500">
+                  <span>VRAM Usage</span>
+                  <span className="font-mono text-purple-400">{vramPct.toFixed(1)}%</span>
+                </div>
+                <div className="w-full bg-zinc-900 rounded-full h-1.5 overflow-hidden">
+                  <div className="bg-purple-500 h-1.5 rounded-full transition-all duration-300" style={{ width: `${vramPct}%` }} />
+                </div>
+                <div className="text-[10px] font-mono text-zinc-500 text-right">
+                  {(gpu.vram_used_mib / 1024).toFixed(1)} / {(gpu.vram_total_mib / 1024).toFixed(1)} GiB
+                </div>
+              </div>
+
+              <div className="space-y-1">
+                <div className="flex justify-between text-[10px] uppercase tracking-wider text-zinc-500">
+                  <span>Compute</span>
+                  <span className="font-mono text-indigo-400">{gpu.utilization_pct.toFixed(1)}%</span>
+                </div>
+                <div className="w-full bg-zinc-900 rounded-full h-1.5 overflow-hidden">
+                  <div className="bg-indigo-500 h-1.5 rounded-full transition-all duration-300" style={{ width: `${gpu.utilization_pct}%` }} />
+                </div>
+                <div className="text-[10px] font-mono text-zinc-500 text-right">
+                  Utilization
+                </div>
+              </div>
+            </div>
+
+            <div className="flex gap-3 h-12">
+              <Sparkline label="VRAM %" values={hist.vram} color="#a855f7" />
+              <Sparkline label="Util %" values={hist.util} color="#6366f1" />
+            </div>
+          </div>
+        );
+      })}
     </div>
   );
 }
 
-// Tiny dependency-free sparkline: values are percentages (0-100).
-function Sparkline({
-  label,
-  values,
-  color,
-}: {
-  label: string;
-  values: number[];
-  color: string;
-}) {
+function Sparkline({ label, values, color }: { label: string; values: number[]; color: string; }) {
   const w = 220;
   const h = 40;
-  const points = values
-    .map((v, i) => {
-      const x = (i / Math.max(values.length - 1, 1)) * w;
-      const y = h - (Math.min(v, 100) / 100) * h;
-      return `${x.toFixed(1)},${y.toFixed(1)}`;
-    })
-    .join(" ");
+  const points = values.map((v, i) => {
+    const x = (i / Math.max(values.length - 1, 1)) * w;
+    const y = h - (Math.min(v, 100) / 100) * h;
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  }).join(" ");
+
   return (
-    <div className="flex-1">
-      <svg
-        viewBox={`0 0 ${w} ${h}`}
-        className="h-10 w-full"
-        preserveAspectRatio="none"
-        role="img"
-        aria-label={`${label} history`}
-      >
-        <line x1="0" y1={h} x2={w} y2={h} stroke="#27272f" strokeWidth="1" />
+    <div className="flex-1 relative group">
+      <svg viewBox={`0 0 ${w} ${h}`} className="h-full w-full" preserveAspectRatio="none" role="img" aria-label={`${label} history`}>
+        <line x1="0" y1={h} x2={w} y2={h} stroke="#27272a" strokeWidth="1" />
         {values.length > 1 && (
-          <polyline
-            points={points}
-            fill="none"
-            stroke={color}
-            strokeWidth="1.5"
-          />
+          <polyline points={points} fill="none" stroke={color} strokeWidth="1.5" className="drop-shadow-md" />
         )}
       </svg>
-      <p className="mt-0.5 text-[10px] uppercase tracking-wide text-zinc-400">
+      <div className="absolute inset-0 bg-gradient-to-t from-zinc-950/50 to-transparent pointer-events-none" />
+      <span className="absolute bottom-0 left-0 text-[9px] uppercase tracking-widest text-zinc-600 font-mono">
         {label}
-      </p>
+      </span>
     </div>
   );
 }

@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import uuid
 import re
 from dataclasses import dataclass
 from datetime import datetime
@@ -501,6 +502,110 @@ class Orchestrator:
             "region": fs.region, "is_in_use": fs.is_in_use,
             "bytes_used": fs.bytes_used,
         }
+
+    async def launch_cluster(
+        self,
+        *,
+        instance_type: str,
+        region: str,
+        filesystem: str,
+        node_count: int,
+        connection_mode: str | None = None,
+        ssh_key_name: str | None = None,
+        name: str = "",
+        provider: str = "lambda",
+    ) -> dict:
+        """Launch a multi-node GPU cluster with head and worker nodes."""
+        if node_count < 1:
+            raise LaunchRejected(400, "Cluster must have at least 1 node.")
+
+        cluster_id = uuid.uuid4().hex[:12]
+        cluster_name = name or f"cluster-{cluster_id}"
+
+        # Initialize cluster record in database
+        self.db.create_cluster(
+            cluster_id=cluster_id,
+            name=cluster_name,
+            gpu_type=instance_type,
+            region=region,
+            filesystem=filesystem,
+            node_count=node_count,
+        )
+
+        # 1. Launch head node
+        head_name = f"{cluster_name}-head"
+        head_launch = await self.request_launch(
+            instance_type=instance_type,
+            region=region,
+            filesystem=filesystem,
+            connection_mode=connection_mode,
+            ssh_key_name=ssh_key_name,
+            name=head_name,
+            provider=provider,
+        )
+        self.db.add_cluster_node(
+            cluster_id=cluster_id,
+            instance_id=head_launch["id"],
+            role="head",
+            node_index=0,
+            status=head_launch.get("status", "provisioning"),
+        )
+        self.db.update_cluster_status(cluster_id, "provisioning", head_instance_id=head_launch["id"])
+
+        # 2. Launch worker nodes
+        for i in range(1, node_count):
+            worker_name = f"{cluster_name}-worker-{i}"
+            worker_launch = await self.request_launch(
+                instance_type=instance_type,
+                region=region,
+                filesystem=filesystem,
+                connection_mode=connection_mode,
+                ssh_key_name=ssh_key_name,
+                name=worker_name,
+                provider=provider,
+            )
+            self.db.add_cluster_node(
+                cluster_id=cluster_id,
+                instance_id=worker_launch["id"],
+                role="worker",
+                node_index=i,
+                status=worker_launch.get("status", "provisioning"),
+            )
+
+        self.db.record_audit("backend", "cluster_launch", f"Launched cluster {cluster_id} with {node_count} nodes")
+        return self.db.get_cluster(cluster_id) or {}
+
+    async def terminate_cluster(self, cluster_id: str, *, force: bool = False) -> dict:
+        """Safely terminate all instances in a cluster, honoring data-safety hooks."""
+        cluster = self.db.get_cluster(cluster_id)
+        if not cluster:
+            raise LaunchRejected(404, f"Cluster {cluster_id} not found")
+
+        reports = []
+        for node in cluster.get("nodes", []):
+            inst_id = node.get("instance_id")
+            if not inst_id:
+                continue
+            launch = self.db.get_launch(inst_id)
+            if launch and not launch.get("lambda_instance_id"):
+                self.db.update_launch(inst_id, status="terminated", terminated_at=utcnow())
+                reports.append({"instance_id": inst_id, "terminated": True})
+            else:
+                target_id = (launch.get("lambda_instance_id") if launch else None) or inst_id
+                try:
+                    res = await self.terminate(target_id, force=force)
+                    reports.append(res)
+                except TerminationBlocked as e:
+                    reports.append({"error": str(e), "instance_id": target_id})
+                except Exception as e:
+                    reports.append({"error": str(e), "instance_id": target_id})
+
+        blocked = any("error" in r for r in reports)
+        if not blocked:
+            self.db.update_cluster_status(cluster_id, "terminated")
+            self.db.record_audit("backend", "terminate_cluster", f"Cluster {cluster_id} terminated")
+
+        return {"cluster_id": cluster_id, "terminated": not blocked, "reports": reports}
 
     async def delete_filesystem(self, name: str, *,
                                 confirm_name: str = "") -> dict:
