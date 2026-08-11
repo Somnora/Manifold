@@ -1,5 +1,6 @@
 """Test lifecycle events recording and API route."""
 
+import json
 import time
 import pytest
 from fastapi.testclient import TestClient
@@ -101,3 +102,32 @@ def test_lifecycle_events_recorded_and_api(fast_app, mock_client):
         for cost in costs:
             assert isinstance(cost, int)
             assert cost >= 0
+
+
+def test_events_stream_delivers_same_second_events(client, monkeypatch):
+    """Two events recorded in the SAME second must BOTH reach the SSE stream.
+
+    utcnow() is second-precision, and the old stream deduped on
+    f"None_{at}" (the 'event' field never existed), so a second event
+    sharing a second with an earlier one was silently dropped. The cursor
+    fix keys on the row id, so identical timestamps no longer collide."""
+    import app.db as db_module
+
+    # Pin every recorded event to the same wall-clock second, so the old
+    # timestamp-collision bug would fire deterministically.
+    monkeypatch.setattr(db_module, "utcnow",
+                        lambda: "2026-08-10T12:00:00+00:00")
+
+    queue = client.app.state.queue
+    dbh = queue._db
+    task_id = queue.enqueue(template="whisper-batch", parameters={})  # "queued"
+    dbh.record_task_event(task_id, "launched", instance_id="inst-1")
+    dbh.record_task_event(task_id, "started")
+    # Settle the task so the stream terminates promptly.
+    queue.mark_finished(task_id, exit_code=0, output_paths=[])
+
+    body = client.get(f"/tasks/{task_id}/events/stream").text
+    kinds = [json.loads(line[6:])["kind"]
+             for line in body.splitlines() if line.startswith("data: ")]
+    # All three same-second events are delivered (old code dropped 2 of 3).
+    assert kinds == ["queued", "launched", "started"]

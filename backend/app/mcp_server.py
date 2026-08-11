@@ -18,7 +18,6 @@ Config: MANIFOLD_API_URL (default http://localhost:8000).
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 from typing import Any
 
@@ -673,61 +672,100 @@ async def download_file(remote_path: str, local_path: str,
         return result
 
 
-@mcp.tool()
-async def stream_job_logs(task_id: str, tail: int = 100, note: str = "") -> dict:
-    """Stream live logs for a job via SSE over HTTP until the job finishes or
-    times out, returning all collected lines. Useful for agents tracking long
-    training or fine-tuning runs in real time."""
-    args = {"task_id": task_id, "tail": tail}
+async def _task_settled(task_id: str) -> bool:
+    """True once the task reached a terminal state. Best-effort: any error
+    (unreachable backend, bad status) reads as 'not settled', leaving the
+    follow loop's own deadline and error handling to decide what to do."""
     try:
-        lines: list[dict] = []
-        async with _http().stream("GET", f"/tasks/{task_id}/logs/stream", timeout=30.0) as resp:
+        resp = await _http().get(f"/tasks/{task_id}", timeout=15.0)
+        if resp.status_code >= 400:
+            return False
+        status = resp.json().get("status")
+    except (httpx.HTTPError, ValueError):
+        return False
+    return status in ("succeeded", "failed", "canceled", "cancelled")
+
+
+@mcp.tool()
+async def stream_job_logs(task_id: str, max_seconds: float = 1800.0,
+                          note: str = "") -> dict:
+    """Follow a job's logs until it finishes (or max_seconds elapses), then
+    return every collected line in order. Useful for agents tracking long
+    training or fine-tuning runs.
+
+    Poll-based on the log sequence cursor rather than a long-held SSE socket:
+    each HTTP call is short, so a run that goes quiet for minutes between log
+    lines never trips a request timeout (the old SSE version errored after
+    30s of quiet)."""
+    args = {"task_id": task_id, "max_seconds": max_seconds}
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + max_seconds
+    last_seq = -1
+    lines: list[dict] = []
+    try:
+        while True:
+            resp = await _http().get(f"/tasks/{task_id}/logs", timeout=15.0)
             if resp.status_code >= 400:
-                body = (await resp.aread()).decode(errors="replace")
+                body = (resp.text or "").strip()
                 result = {"error": body[:300] or f"HTTP {resp.status_code}"}
-                await _audit("stream_job_logs", args, note, f"rejected: {result['error']}")
+                await _audit("stream_job_logs", args, note,
+                             f"rejected: {result['error']}")
                 return result
-            async for line in resp.aiter_lines():
-                if line.startswith("data: "):
-                    try:
-                        data = json.loads(line[6:])
-                        lines.append(data)
-                    except ValueError:
-                        pass
-        await _audit("stream_job_logs", args, note, f"ok: {len(lines)} lines streamed")
-        return {"task_id": task_id, "lines": lines, "count": len(lines)}
+            for line in resp.json().get("lines", []):
+                if line.get("seq", 0) > last_seq:
+                    last_seq = line["seq"]
+                    lines.append(line)
+            if await _task_settled(task_id) or loop.time() >= deadline:
+                break
+            await asyncio.sleep(2.0)
     except httpx.HTTPError as exc:
         result = {"error": f"streaming failed: {exc}"}
         await _audit("stream_job_logs", args, note, result["error"])
         return result
+    await _audit("stream_job_logs", args, note,
+                 f"ok: {len(lines)} lines streamed")
+    return {"task_id": task_id, "lines": lines, "count": len(lines)}
 
 
 @mcp.tool()
-async def stream_task_events(task_id: str, note: str = "") -> dict:
-    """Stream task lifecycle events (queued -> launched -> started -> finished/failed)
-    live via SSE until the task completes."""
-    args = {"task_id": task_id}
+async def stream_task_events(task_id: str, max_seconds: float = 1800.0,
+                             note: str = "") -> dict:
+    """Follow a task's lifecycle events (queued -> launched -> started ->
+    finished/failed) until it settles (or max_seconds elapses), then return
+    every event once, in order.
+
+    Poll-based on the event-id cursor rather than a long-held SSE socket:
+    each HTTP call is short, so a training run's long quiet period never
+    trips a request timeout (the old SSE version errored after 30s of
+    quiet)."""
+    args = {"task_id": task_id, "max_seconds": max_seconds}
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + max_seconds
+    seen_ids: set = set()
+    events: list[dict] = []
     try:
-        events: list[dict] = []
-        async with _http().stream("GET", f"/tasks/{task_id}/events/stream", timeout=30.0) as resp:
+        while True:
+            resp = await _http().get(f"/tasks/{task_id}/events", timeout=15.0)
             if resp.status_code >= 400:
-                body = (await resp.aread()).decode(errors="replace")
+                body = (resp.text or "").strip()
                 result = {"error": body[:300] or f"HTTP {resp.status_code}"}
-                await _audit("stream_task_events", args, note, f"rejected: {result['error']}")
+                await _audit("stream_task_events", args, note,
+                             f"rejected: {result['error']}")
                 return result
-            async for line in resp.aiter_lines():
-                if line.startswith("data: "):
-                    try:
-                        data = json.loads(line[6:])
-                        events.append(data)
-                    except ValueError:
-                        pass
-        await _audit("stream_task_events", args, note, f"ok: {len(events)} events streamed")
-        return {"task_id": task_id, "events": events, "count": len(events)}
+            for ev in resp.json().get("events", []):
+                if ev.get("id") not in seen_ids:
+                    seen_ids.add(ev.get("id"))
+                    events.append(ev)
+            if await _task_settled(task_id) or loop.time() >= deadline:
+                break
+            await asyncio.sleep(2.0)
     except httpx.HTTPError as exc:
         result = {"error": f"streaming failed: {exc}"}
         await _audit("stream_task_events", args, note, result["error"])
         return result
+    await _audit("stream_task_events", args, note,
+                 f"ok: {len(events)} events streamed")
+    return {"task_id": task_id, "events": events, "count": len(events)}
 
 
 @mcp.tool()
@@ -819,17 +857,15 @@ async def get_agent_context(session_id: str, note: str = "") -> dict:
 async def update_agent_context(
     session_id: str,
     workspace_environment: dict | None = None,
-    session_tokens: dict | None = None,
     active_gpu_connections: dict | None = None,
     task_graphs: dict | None = None,
     note: str = ""
 ) -> dict:
-    """Updates context variables."""
+    """Updates context variables. There is no session_tokens field: secrets
+    stay in .env, never in the agent context."""
     body = {}
     if workspace_environment is not None:
         body["workspace_environment"] = workspace_environment
-    if session_tokens is not None:
-        body["session_tokens"] = session_tokens
     if active_gpu_connections is not None:
         body["active_gpu_connections"] = active_gpu_connections
     if task_graphs is not None:

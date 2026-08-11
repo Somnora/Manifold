@@ -35,6 +35,7 @@ from .image_checker import ImageChecker
 from .lambda_api import LambdaClient
 from .model_client import ModelClientError
 from .orchestrator import LaunchRejected, Orchestrator, TerminationBlocked
+from .subagent_engine import engine as subagent_engine
 from .task_queue import TaskQueue
 from .templates import JobTemplate, PERSISTENT_TOKEN
 
@@ -352,6 +353,18 @@ class Dispatcher:
         a job can never finish silently, which is the whole point when the
         job is running unattended on a GPU that costs money.
         """
+        # A settling server task's model is no longer being served (the task
+        # finished, or its instance was torn down and every path funnels here):
+        # drop it from the subagent registry so a dead model is not advertised.
+        settling = self.queue.get(task_id)
+        if settling is not None:
+            served = self._served_endpoint(settling)
+            if served is not None:
+                model_id, remote_port = served
+                iid = settling.get("instance_id") or ""
+                subagent_engine.deregister_endpoint(
+                    model_id, key=self._served_key(iid, remote_port))
+
         if task_id in self._cancel_requested:
             # The user asked for this stop: label it so the record says
             # "cancelled by user", not a baffling "container exited 137",
@@ -572,6 +585,31 @@ class Dispatcher:
         (vllm-serve, sglang-serve); batch templates run to completion."""
         template = self.templates.get(template_name)
         return bool(template is not None and template.ports)
+
+    def _served_endpoint(self, task: dict) -> tuple[str, int] | None:
+        """The subagent-registry (model_id, remote_port) a server task exposes,
+        or None for a batch task.
+
+        The model key is the task's model_id parameter (falling back to the
+        template name), matching how the chat/brains code names served models
+        (main.py _serving_endpoints). remote_port is the instance-side loopback
+        port the template publishes; the engine reaches it over the managed SSH
+        forward (never a socket off the backend host), so the port is handed to
+        the engine WITH the ManagedConnection, not baked into a URL string.
+        """
+        template = self.templates.get(task["template"])
+        if template is None or not template.ports:
+            return None
+        model_id = (task.get("parameters") or {}).get("model_id") \
+            or task["template"]
+        return model_id, template.ports[0].host
+
+    @staticmethod
+    def _served_key(instance_id: str, remote_port) -> str:
+        """Stable identity for a served endpoint, unique per instance+port so
+        two boxes serving the same model on the same port never collide (and
+        deregistering one never drops the other)."""
+        return f"{instance_id}:{remote_port}"
 
     def _busy_map(self) -> tuple[set[str], set[str]]:
         """Per-instance busy state from RUNNING tasks: (batch, server).
@@ -835,6 +873,19 @@ class Dispatcher:
         outputs = output_paths_for(template, parameters, filesystem)
 
         self.queue.mark_running(task_id, instance_id)
+        # A server task (vllm-serve/sglang-serve) now publishes its model on
+        # the instance; advertise it in the subagent registry so
+        # /subagents/models and the swarm status reflect it. Register WITH this
+        # instance's ManagedConnection + the instance-side port, so the engine
+        # reaches the model over the managed SSH forward (per the hard rule),
+        # not a bare loopback URL. Deregistered in the completion funnel
+        # (_finish_task) when the task settles or its instance is torn down.
+        served = self._served_endpoint(task)
+        if served is not None:
+            model_id, remote_port = served
+            subagent_engine.register_endpoint(
+                model_id, connection=conn, remote_port=remote_port,
+                key=self._served_key(instance_id, remote_port))
         if task.get("auto_manage"):
             # The lifecycle loop launched this box and will sync+terminate it
             # once the job settles; mark the running phase for the job card.

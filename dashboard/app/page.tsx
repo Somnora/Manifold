@@ -28,9 +28,20 @@ export default function InstancesPage() {
   }, 2000);
 
   const { data: setup } = usePolling(() => api.settingsStatus(), 10000);
+  // Cheap polls that only decide whether the view-only panels below are worth
+  // mounting (see the gating note near the render). The panels do their own
+  // finer-grained polling once they mount.
+  const { data: taskList } = usePolling(api.tasks, 8000);
 
   const instances = data?.instances ?? [];
   const launches = data?.launches ?? [];
+
+  // Gates for the pure-view panels: only render them when they have something
+  // to show, so the default (empty/mock) screen isn't three big empty boxes.
+  const hasTasks = (taskList?.length ?? 0) > 0;
+  const hasTelemetry = launches.some(
+    (l) => l.status === "active" && l.lambda_instance_id,
+  );
 
   // Launches still working their way toward an instance card.
   const inFlight = launches.filter((l) => IN_FLIGHT.includes(l.status));
@@ -151,15 +162,30 @@ export default function InstancesPage() {
         )}
       </section>
 
-      {/* Elastic GPU Clusters */}
+      {/* Elastic GPU Clusters — always shown: it carries the "Launch Swarm"
+          entry point, and its own empty state is a single compact line. */}
       <section>
         <ClusterPanel />
       </section>
 
-      {/* Visual Task Graph & Multi-GPU Telemetry */}
+      {/* The task graph and live telemetry are pure views. Mount each only
+          when it has data; otherwise show a compact single-line placeholder so
+          the empty/mock screen reads as intentional, not broken. */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-        <VisualTaskGraph />
-        <MultiGpuTelemetry />
+        {hasTasks ? (
+          <VisualTaskGraph />
+        ) : (
+          <p className="rounded-xl border border-dashed border-zinc-300 bg-zinc-50 px-4 py-3 text-xs text-zinc-500">
+            Agent task graph appears here when jobs or cluster tasks run.
+          </p>
+        )}
+        {hasTelemetry ? (
+          <MultiGpuTelemetry />
+        ) : (
+          <p className="rounded-xl border border-dashed border-zinc-300 bg-zinc-50 px-4 py-3 text-xs text-zinc-500">
+            Live GPU telemetry streams here once an instance is online.
+          </p>
+        )}
       </div>
 
       <section>

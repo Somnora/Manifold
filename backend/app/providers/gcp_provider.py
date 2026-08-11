@@ -1,7 +1,15 @@
+import logging
 import uuid
 from typing import List, Optional, Dict
 from datetime import datetime, timezone
-from app.providers.base import CloudProvider, CloudInstanceTypeSpec, CloudInstanceInfo
+from app.providers.base import (
+    CloudProvider,
+    CloudInstanceTypeSpec,
+    CloudInstanceInfo,
+    ProviderError,
+)
+
+logger = logging.getLogger("manifold.providers.gcp")
 
 class GCPProvider(CloudProvider):
     # This serves as the base for Real/Mock GCP providers
@@ -97,33 +105,61 @@ class MockGCPProvider(GCPProvider):
         return name
 
 class RealGCPProvider(GCPProvider):
+    """GCP provider whose live API is not wired up yet.
+
+    An operator can set GCP_PROJECT_ID before the integration lands. When
+    that happens the READ paths (list/get) must DEGRADE — return empty and
+    warn once — never raise, because they are swept by background code
+    (/instances, sync, adoption) that iterates every provider. A read that
+    raised here used to 500 the whole instances view and silently disable
+    adoption for Lambda too. The WRITE paths (launch/terminate) are explicit
+    user actions, so they raise a typed, catchable ProviderError instead.
+    """
+
+    _NOT_WIRED = "Real GCP API integration pending credentials"
+
     def __init__(self, project_id: str, default_zone: str, credentials_file: Optional[str] = None):
         self.project_id = project_id
         self.default_zone = default_zone
         self.credentials_file = credentials_file
+        self._warned = False
+
+    def _warn_once(self) -> None:
+        """Log the not-yet-implemented notice a single time per provider, so
+        a 30s adoption sweep can't fill the log with the same line forever."""
+        if not self._warned:
+            logger.warning(
+                "GCP project %r is set but the live API is not implemented "
+                "yet; treating GCP as empty. %s",
+                self.project_id, self._NOT_WIRED,
+            )
+            self._warned = True
 
     async def list_instance_types(self) -> List[CloudInstanceTypeSpec]:
         if not self.project_id:
             return []
-        raise NotImplementedError("Real GCP API integration pending credentials")
+        self._warn_once()
+        return []
 
     async def list_instances(self, *, fresh: bool = False) -> List[CloudInstanceInfo]:
         # GCP fetches live data on every call; fresh is accepted for the
         # CloudProvider contract and ignored.
         if not self.project_id:
             return []
-        raise NotImplementedError("Real GCP API integration pending credentials")
+        self._warn_once()
+        return []
 
     async def get_instance(self, instance_id: str) -> Optional[CloudInstanceInfo]:
         if not self.project_id:
             return None
-        raise NotImplementedError("Real GCP API integration pending credentials")
+        self._warn_once()
+        return None
 
     async def launch_instance(self, region: str, instance_type: str, ssh_key_names: List[str], filesystem_names: List[str], name: str = "", user_data: str = "") -> str:
-        raise NotImplementedError()
+        raise ProviderError("GCP launch not yet supported")
 
     async def terminate_instance(self, instance_id: str) -> bool:
-        raise NotImplementedError()
+        raise ProviderError("GCP terminate not yet supported")
 
     async def ensure_ssh_key(self, public_key: str, name: str) -> str:
-        raise NotImplementedError()
+        raise ProviderError("GCP SSH key management not yet supported")

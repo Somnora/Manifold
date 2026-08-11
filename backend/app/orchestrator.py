@@ -1043,47 +1043,56 @@ class Orchestrator:
         otherwise a ghost card lingers and a supervisor reconnect-loops at
         a dead host forever."""
         listed = []
-        for p in self.providers._providers.values():
-            listed.extend(await p.list_instances())
+        list_failed = False
+        for name, p in self.providers.items():
+            try:
+                listed.extend(await p.list_instances())
+            except Exception as exc:   # noqa: BLE001 - one bad provider must
+                # never blank the whole view. Skip it, keep the others.
+                list_failed = True
+                logger.warning(
+                    "instances view: skipping provider %r: %s", name, exc)
         gone_statuses = ("terminated", "terminating")
         live_ids = {i.id for i in listed if i.status not in gone_statuses}
 
-        # Reap connections to instances Lambda no longer runs. Only do this
-        # on a successful list (an API failure raises before we get here),
-        # so a transient outage can't reap healthy connections.
-        for instance_id in list(self.connections):
-            if instance_id in live_ids:
-                continue
-            conn = self.connections.pop(instance_id)
-            await conn.close()
-            self.host_keys.forget(conn.host)   # IP may be recycled
-            launch = self.db.find_launch_by_instance(instance_id)
-            if launch and launch["status"] not in ("terminated", "failed"):
-                self.db.update_launch(
-                    launch["id"], status="terminated", terminated_at=utcnow()
-                )
-            self.db.record_audit(
-                "backend", "external_termination_detected",
-                f"{instance_id} no longer running on Lambda; connection "
-                f"reaped and history closed",
-            )
-
-        # History rows still marked active whose instance is gone (e.g. it
-        # was terminated while the backend was down, so there was never a
-        # connection to reap). Close them so cost history stops ticking.
-        for launch in self.db.list_launches():
-            if (launch["status"] == "active"
-                    and launch["lambda_instance_id"]
-                    and launch["lambda_instance_id"] not in live_ids):
-                self.db.update_launch(
-                    launch["id"], status="terminated", terminated_at=utcnow()
-                )
+        # Reap connections to instances the cloud no longer runs. Only do this
+        # when EVERY provider listed successfully: an incomplete snapshot (a
+        # provider erroring, or a transient outage) must not reap a healthy
+        # connection just because its instance is missing from a partial list.
+        if not list_failed:
+            for instance_id in list(self.connections):
+                if instance_id in live_ids:
+                    continue
+                conn = self.connections.pop(instance_id)
+                await conn.close()
+                self.host_keys.forget(conn.host)   # IP may be recycled
+                launch = self.db.find_launch_by_instance(instance_id)
+                if launch and launch["status"] not in ("terminated", "failed"):
+                    self.db.update_launch(
+                        launch["id"], status="terminated", terminated_at=utcnow()
+                    )
                 self.db.record_audit(
                     "backend", "external_termination_detected",
-                    f"launch {launch['id']}: instance "
-                    f"{launch['lambda_instance_id']} gone from Lambda; "
-                    f"history closed",
+                    f"{instance_id} no longer running on Lambda; connection "
+                    f"reaped and history closed",
                 )
+
+            # History rows still marked active whose instance is gone (e.g. it
+            # was terminated while the backend was down, so there was never a
+            # connection to reap). Close them so cost history stops ticking.
+            for launch in self.db.list_launches():
+                if (launch["status"] == "active"
+                        and launch["lambda_instance_id"]
+                        and launch["lambda_instance_id"] not in live_ids):
+                    self.db.update_launch(
+                        launch["id"], status="terminated", terminated_at=utcnow()
+                    )
+                    self.db.record_audit(
+                        "backend", "external_termination_detected",
+                        f"launch {launch['id']}: instance "
+                        f"{launch['lambda_instance_id']} gone from Lambda; "
+                        f"history closed",
+                    )
 
         result = []
         # User display names overlay Lambda's launch-time names (which
@@ -1322,25 +1331,27 @@ class Orchestrator:
         instance we can't classify, must not stop the backend from starting.
         Returns the number of instances adopted.
         """
-        try:
-            instances = []
-            for p in self.providers._providers.values():
+        # Each provider is swept in its own try/except so one that is
+        # unconfigured, unreachable, or not-yet-implemented is skipped while
+        # the others (Lambda) still adopt. A broken provider must never
+        # silently disable adoption for the working ones.
+        instances = []
+        for name, p in self.providers.items():
+            try:
                 instances.extend(await p.list_instances())
-        except LambdaAPIError as exc:
-            # info at startup, debug on the 30s sweep so an unconfigured
-            # API key does not fill the log with the same line forever.
-            log = logger.info if startup else logger.debug
-            log("skip instance adoption: %s", exc.message)
-            return 0
-        except Exception:
-            if startup:
-                logger.exception(
-                    "skip instance adoption: could not list instances")
-            else:
-                logger.debug(
-                    "skip adoption sweep: could not list instances",
-                    exc_info=True)
-            return 0
+            except LambdaAPIError as exc:
+                # info at startup, debug on the 30s sweep so an unconfigured
+                # API key does not fill the log with the same line forever.
+                log = logger.info if startup else logger.debug
+                log("skip %s adoption: %s", name, exc.message)
+            except Exception:
+                if startup:
+                    logger.exception(
+                        "skip %s adoption: could not list instances", name)
+                else:
+                    logger.debug(
+                        "skip %s adoption sweep: could not list instances",
+                        name, exc_info=True)
 
         adopted = 0
         for inst in instances:

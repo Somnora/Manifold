@@ -268,6 +268,56 @@ async def test_terminate_provisioning_cluster_cancels_inflight_launches(
 
 
 @pytest.mark.asyncio
+async def test_cluster_nodes_expose_real_instance_id_and_live_status(tmp_path):
+    """The frontend contract: get_cluster / list_clusters enrich each node
+    with the REAL cloud instance id (`lambda_instance_id`, null until the node
+    boots) and a LIVE `status` resolved from the launch row — while keeping the
+    stored `instance_id` (the launch id) as the stable node key."""
+    client = StallingLambdaClient()      # launches hang, so the rows stay put
+    orch, db = make_orchestrator(        # and we drive them deterministically
+        tmp_path, client,
+        guardrails=Guardrails(max_concurrent_instances=8,
+                              max_hourly_spend_usd=50.0))
+    cluster = await orch.launch_cluster(
+        instance_type="gpu_1x_a10", region="us-east-1",
+        filesystem="manifold-data", node_count=2)
+    cluster_id = cluster["id"]
+
+    # Before booting: the launch has no real instance id yet, so the node
+    # exposes lambda_instance_id=None but still carries the launch-id key.
+    fresh = db.get_cluster(cluster_id)
+    for node in fresh["nodes"]:
+        assert node["lambda_instance_id"] is None
+        assert node["instance_id"]        # launch id present as the node key
+
+    # Drive each node's launch to 'booting' with a real cloud instance id,
+    # exactly as the launch pipeline does when Lambda accepts the launch.
+    expected = {}
+    for node in fresh["nodes"]:
+        launch_id = node["instance_id"]
+        real_id = f"i-real-{launch_id[:6]}"
+        expected[launch_id] = real_id
+        db.update_launch(launch_id, status="booting", lambda_instance_id=real_id)
+
+    booted = db.get_cluster(cluster_id)
+    for node in booted["nodes"]:
+        assert node["status"] == "booting"                 # live, not frozen
+        assert node["lambda_instance_id"] == expected[node["instance_id"]]
+        assert node["instance_id"] in expected             # key unchanged
+
+    # list_clusters carries the same enrichment.
+    lc = next(c for c in db.list_clusters() if c["id"] == cluster_id)
+    for node in lc["nodes"]:
+        assert node["lambda_instance_id"] == expected[node["instance_id"]]
+
+    # Reap the hung launch tasks so the test leaves nothing pending.
+    tasks = list(orch._launch_tasks.values())
+    for t in tasks:
+        t.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+
+@pytest.mark.asyncio
 async def test_launch_aborts_when_row_already_terminated(
         tmp_path, mock_client):
     """Defense-in-depth for the terminate-while-launching race: a launch

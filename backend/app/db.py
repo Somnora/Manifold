@@ -1120,6 +1120,10 @@ class Database:
 
     def update_cluster_node_status(self, cluster_id: str, instance_id: str,
                                    status: str, ip: str | None = None) -> None:
+        # Superseded: get_cluster_nodes now resolves each node's status and
+        # real instance id LIVE from its launch row, so nothing needs to
+        # write cluster_nodes.status. Kept for callers that want to freeze a
+        # status onto the node row directly; currently unused.
         if ip is not None:
             self._execute(
                 "UPDATE cluster_nodes SET status = ?, ip = ? WHERE cluster_id = ? AND instance_id = ?",
@@ -1153,4 +1157,22 @@ class Database:
             "SELECT * FROM cluster_nodes WHERE cluster_id = ? ORDER BY node_index",
             (cluster_id,),
         ).fetchall()
-        return [dict(r) for r in rows]
+        nodes = []
+        for r in rows:
+            node = dict(r)
+            # A node's stored `instance_id` is the LAUNCH id — the stable node
+            # key the dashboard uses. But telemetry, SSH, and node lookups need
+            # the REAL cloud instance id, which the launch pipeline records as
+            # `lambda_instance_id` when the node reaches 'booting' (null before
+            # then). We also want the node's LIVE status, not the value frozen
+            # at add_cluster_node time. Resolve both from the launch row here,
+            # so no separate write path has to keep cluster_nodes in sync (this
+            # is why update_cluster_node_status has no callers).
+            launch = self.get_launch(node["instance_id"])
+            if launch:
+                node["lambda_instance_id"] = launch.get("lambda_instance_id")
+                node["status"] = launch["status"]
+            else:
+                node["lambda_instance_id"] = None
+            nodes.append(node)
+        return nodes

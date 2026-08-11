@@ -99,8 +99,75 @@ def test_attach_on_non_active_instance():
     from app.main import create_default_app
     app = create_default_app()
     client = TestClient(app)
-    
+
     res = client.post("/instances/inst-unknown/ide-attach")
     assert res.status_code == 409
     assert "no connected instance" in res.text
+
+
+def test_attach_happy_path_writes_config(tmp_path):
+    """A connected instance -> 200 + a well-formed config block. The config is
+    written to a patched temp path (NEVER the developer's real ~/.ssh/config),
+    and the block must carry the real configured SSH key + host-keys paths."""
+    import os
+    import time
+    from fastapi.testclient import TestClient
+    from app.config import IdleSettings, TaskSettings, WatchSettings
+    from app.image_checker import MockImageChecker
+    from app.main import create_app
+    from tests.conftest import (make_settings, mock_connect_fn,
+                                wait_for_launch_status)
+
+    settings = make_settings(
+        tmp_path,
+        tasks=TaskSettings(poll_seconds=0.02),
+        idle=IdleSettings(timeout_seconds=60, poll_seconds=10),
+        watches=WatchSettings(poll_seconds=60),
+    )
+    from app.lambda_api import MockLambdaClient
+    from app.storage import MockStorage
+    from app.sidecar_client import MockSidecarClient
+    app = create_app(
+        settings,
+        lambda_client=MockLambdaClient(),
+        storage_factory=lambda fs: MockStorage(),
+        connect_fn=mock_connect_fn,
+        sidecar_factory=lambda conn: MockSidecarClient(),
+        image_checker=MockImageChecker(),
+    )
+
+    config_file = tmp_path / "ssh_config"
+    with patch("app.ide_attach.SSH_CONFIG_PATH", str(config_file)):
+        with TestClient(app) as client:
+            resp = client.post("/instances", json={
+                "instance_type": "gpu_1x_a10",
+                "region": "us-east-1",
+                "filesystem": "manifold-data",
+            })
+            assert resp.status_code == 202
+            launch = wait_for_launch_status(client, resp.json()["launch"]["id"])
+            instance_id = launch["lambda_instance_id"]
+
+            # Wait for the managed SSH connection to come up.
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline:
+                inst = next(i for i in client.get("/instances").json()["instances"]
+                            if i["id"] == instance_id)
+                if inst["connection_state"] == "connected":
+                    break
+                time.sleep(0.02)
+
+            res = client.post(f"/instances/{instance_id}/ide-attach")
+            assert res.status_code == 200, res.text
+            urls = res.json()
+            assert urls["ssh_alias"] == f"manifold-{instance_id}"
+
+    content = config_file.read_text()
+    assert f"Host manifold-{instance_id}" in content
+    assert "HostName " in content
+    # The block references the REAL configured key and the host-keys store,
+    # not the bogus settings.ssh_key_path/host_keys_path the route used before.
+    expected_key = os.path.expanduser(settings.ssh.private_key_path)
+    assert f"IdentityFile {expected_key}" in content
+    assert "host_keys.json" in content
 

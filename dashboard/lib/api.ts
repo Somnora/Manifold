@@ -847,9 +847,14 @@ export const api = {
 };
 
 export type ClusterNode = {
-  id: string;
   cluster_id: string;
+  // The stable key: a launch id, present from the moment the node is queued.
   instance_id: string;
+  // The REAL cloud instance id, resolved once the node boots (null until
+  // then). Everything that dials the node — telemetry stream, SSH, the dock
+  // terminal — needs THIS, never instance_id. Optional so the UI can code
+  // defensively while the backend enrichment rolls out.
+  lambda_instance_id?: string | null;
   role: "head" | "worker";
   node_index: number;
   ip?: string;

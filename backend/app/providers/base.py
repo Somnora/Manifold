@@ -3,6 +3,16 @@ from typing import List, Optional, Dict, Any
 from pydantic import BaseModel
 from datetime import datetime
 
+class ProviderError(Exception):
+    """A cloud provider could not satisfy a request.
+
+    Typed so callers (routes, orchestrator sweeps) can catch it cleanly
+    instead of letting a bare NotImplementedError escape and take down an
+    unrelated code path. Used for explicit, not-yet-supported user actions
+    like launching on a provider whose API isn't wired up yet.
+    """
+    pass
+
 class CloudInstanceTypeSpec(BaseModel):
     name: str
     description: str

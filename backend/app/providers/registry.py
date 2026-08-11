@@ -1,4 +1,4 @@
-from typing import Dict, Type
+from typing import Dict, List, Tuple, Type
 from app.providers.base import CloudProvider
 
 class ProviderRegistry:
@@ -13,6 +13,19 @@ class ProviderRegistry:
         if name not in self._providers:
             raise ValueError(f"Provider '{name}' not found")
         return self._providers[name]
+
+    def items(self) -> List[Tuple[str, CloudProvider]]:
+        """(name, provider) pairs for every registered provider.
+
+        The public way to sweep all providers. Callers must NOT reach into
+        the private `_providers` dict — this keeps the name available so a
+        failing provider can be named in a log line and skipped.
+        """
+        return list(self._providers.items())
+
+    def all_providers(self) -> List[CloudProvider]:
+        """Every registered provider, order unspecified."""
+        return list(self._providers.values())
 
     @property
     def active_provider(self) -> CloudProvider:

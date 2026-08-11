@@ -70,7 +70,7 @@ from .templates import load_templates
 from .ide_attach import write_ssh_config_block, get_ide_urls
 from .terminal_sessions import TerminalSession, TerminalSessionManager
 from .providers import ProviderRegistry, LambdaProvider, GCPProvider, MockGCPProvider, RealGCPProvider
-from .subagent_engine import engine
+from .subagent_engine import engine, NoHealthyEndpoint, SubagentDispatchError
 
 logger = logging.getLogger("manifold.main")
 
@@ -163,6 +163,7 @@ def _end_shell_group(pid: int, *, grace_seconds: float = 5.0,
 class DispatchRequest(BaseModel):
     model: str
     prompt: str
+    role: str = "coding"
     tools: list[dict] | None = None
 
 
@@ -320,9 +321,10 @@ class AgentHandshakeRequest(BaseModel):
 
 class AgentContextUpdateRequest(BaseModel):
     workspace_environment: dict | None = None
-    session_tokens: dict | None = None
     active_gpu_connections: dict | None = None
     task_graphs: dict | None = None
+    # No session_tokens: secrets belong in .env, never in a session-keyed
+    # in-memory store any caller could read back (project hard rules).
 
 
 def create_app(
@@ -973,14 +975,22 @@ def create_app(
         conn = orchestrator.connections.get(instance_id)
         if conn is None or conn.ssh_connection() is None:
             raise HTTPException(409, f"no connected instance {instance_id}")
-        
+
+        # The IdentityFile is the configured SSH private key (config.yaml
+        # ssh.private_key_path, default ~/.ssh/id_ed25519). The known-hosts
+        # file is the TOFU pin store the ConnectionManager writes next to the
+        # database (orchestrator builds HostKeyStore at the same path), so the
+        # IDE's ssh verifies the host against the key Manifold already pinned.
+        key_path = os.path.expanduser(settings.ssh.private_key_path)
+        host_keys_path = os.path.join(
+            os.path.dirname(settings.db_path), "host_keys.json")
         write_ssh_config_block(
             instance_id=instance_id,
             host_ip=conn.host,
-            ssh_key_path=str(settings.ssh_key_path.resolve()),
-            host_keys_file_path=str(settings.host_keys_path.resolve()),
+            ssh_key_path=key_path,
+            host_keys_file_path=host_keys_path,
         )
-        
+
         db.record_audit("api", "ide_attach", f"Generated SSH config block for instance {instance_id}")
         return get_ide_urls(instance_id)
 
@@ -2141,62 +2151,82 @@ def create_app(
         return {"task_id": task_id, "events": db.get_task_events(task_id)}
 
     @app.get("/tasks/{task_id}/events/stream")
-    async def stream_task_events(task_id: str, poll_interval: float = 0.2):
-        """Stream task lifecycle events as Server-Sent Events (SSE) until completion."""
+    async def stream_task_events(task_id: str, poll_interval: float = 0.2,
+                                 max_seconds: float = 3600.0):
+        """Stream task lifecycle events as Server-Sent Events (SSE) until the
+        task settles (or max_seconds elapses).
+
+        Cursor-based on the event row id, exactly like stream_task_logs on
+        seq. The old loop deduped on a non-existent 'event' field keyed by a
+        second-precision timestamp, so its key was always "None_<second>": it
+        silently dropped every event that shared a second with an earlier one
+        (queued/launched/started routinely coincide) and re-fetched the whole
+        history each tick. A heartbeat comment keeps a long-quiet training run
+        alive; max_seconds caps a stuck 'running' task."""
         import json
         from fastapi.responses import StreamingResponse
         if queue.get(task_id) is None:
             raise HTTPException(404, f"task {task_id} not found")
 
         async def event_generator():
-            seen = set()
+            last_id = 0
+            loop = asyncio.get_event_loop()
+            deadline = loop.time() + max_seconds
+            last_beat = loop.time()
+            heartbeat_interval = 15.0
             while True:
-                events = db.get_task_events(task_id)
-                for ev in events:
-                    ev_key = f"{ev.get('event')}_{ev.get('at', ev.get('timestamp'))}"
-                    if ev_key not in seen:
-                        seen.add(ev_key)
-                        yield f"data: {json.dumps(ev)}\n\n"
+                for ev in db.get_task_events_after(task_id, last_id):
+                    last_id = ev["id"]
+                    yield f"data: {json.dumps(ev)}\n\n"
                 t = queue.get(task_id)
                 if t and t.get("status") in ("succeeded", "failed", "canceled"):
-                    events = db.get_task_events(task_id)
-                    for ev in events:
-                        ev_key = f"{ev.get('event')}_{ev.get('at', ev.get('timestamp'))}"
-                        if ev_key not in seen:
-                            seen.add(ev_key)
-                            yield f"data: {json.dumps(ev)}\n\n"
+                    for ev in db.get_task_events_after(task_id, last_id):
+                        last_id = ev["id"]
+                        yield f"data: {json.dumps(ev)}\n\n"
                     break
+                now = loop.time()
+                if now >= deadline:
+                    yield ": stream timeout (task still running)\n\n"
+                    break
+                if now - last_beat >= heartbeat_interval:
+                    last_beat = now
+                    yield ": keep-alive\n\n"
                 await asyncio.sleep(poll_interval)
 
         return StreamingResponse(event_generator(), media_type="text/event-stream")
 
     @app.post("/subagents/dispatch")
     async def dispatch_local_subagent_route(req: DispatchRequest):
-        payload = engine.format_tool_call(req.prompt, req.tools)
-        return await engine.dispatch(req.model, payload)
+        # format_tool_call(prompt, role="coding", tools=None): pass tools and
+        # role by keyword so tools never lands in the role slot (which raised
+        # ValueError on every call before).
+        try:
+            payload = engine.format_tool_call(req.prompt, role=req.role,
+                                              tools=req.tools)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc))     # bad role, etc.
+        # Map engine failures to clean statuses instead of a raw 500: nothing
+        # serving the model -> 503; the model was reached but errored (bad
+        # status, transport, or a failed SSH forward) -> 502.
+        try:
+            return await engine.dispatch(req.model, payload)
+        except NoHealthyEndpoint as exc:
+            raise HTTPException(503, str(exc))
+        except SubagentDispatchError as exc:
+            raise HTTPException(502, str(exc))
 
     @app.get("/subagents/models")
     async def get_subagent_models():
-        models_info = []
-        for model, urls in engine.endpoints.items():
-            healthy = []
-            for url in urls:
-                if await engine.check_health(url):
-                    healthy.append(url)
-            models_info.append({"model": model, "active_endpoints": healthy})
-        return {"models": models_info}
+        return {"models": (await engine.status())["models"]}
 
     @app.get("/subagents/swarm/status")
     async def get_swarm_status():
-        active = 0
-        for urls in engine.endpoints.values():
-            for url in urls:
-                if await engine.check_health(url):
-                    active += 1
+        snapshot = await engine.status()
+        active = snapshot["healthy"]
         return {
             "health": "ok" if active > 0 else "degraded",
             "queue_depth": engine.queue.qsize(),
-            "active_subagents": active
+            "active_subagents": active,
         }
 
 
