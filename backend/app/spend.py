@@ -657,7 +657,8 @@ def _cost_rows(rows: list[dict], *, now_iso: str,
 def summarize(rows: list[dict], *, now_iso: str, tz_offset_minutes: int = 0,
               live_ids: set[str] | None = None,
               listed_providers: set[str] | None = None,
-              boot_timeout_seconds: float = 2400.0) -> dict:
+              boot_timeout_seconds: float = 2400.0,
+              monthly_budget_usd: float = 0.0) -> dict:
     """Headline spend: today, this week, month to date, all time.
 
     Windows are LOCAL to `tz_offset_minutes`, and a launch is attributed to
@@ -744,6 +745,78 @@ def summarize(rows: list[dict], *, now_iso: str, tz_offset_minutes: int = 0,
         "timezone_offset_minutes": tz_offset_minutes,
         "timezone_label": timezone_label(tz_offset_minutes),
         "disclaimer": DISCLAIMER,
+        "budget": budget_status(
+            month_to_date_usd=round(totals["month"], 2),
+            burn_usd_per_hour=round(burn_per_hour, 2),
+            monthly_budget_usd=monthly_budget_usd,
+            now_iso=now_iso, tz_offset_minutes=tz_offset_minutes,
+        ),
+    }
+
+
+# Thresholds a crossing is reported at, as a share of the monthly budget.
+BUDGET_THRESHOLDS = (0.5, 0.8, 1.0)
+
+
+def budget_status(*, month_to_date_usd: float, burn_usd_per_hour: float,
+                  monthly_budget_usd: float, now_iso: str,
+                  tz_offset_minutes: int = 0) -> dict:
+    """Burn-down against the monthly wallet, or an honest "unset".
+
+    ADVISORY. Nothing here refuses a launch, and the reason is in
+    GuardrailPrefs: month-to-date is reconstructed from the launches Manifold
+    started, so it is a lower bound, and refusing work on a number we know is
+    short would cost the user a launch without protecting the wallet.
+
+    `projected_month_end_usd` and `exhausted_on` both read "at the CURRENT
+    burn rate", which is the question a user actually asks ("if I leave this
+    running, when do I hit the cap?"). They are not a forecast of what you
+    will choose to launch next, and with nothing running the projection is
+    just month-to-date - correctly, because at a burn of zero nothing more
+    is spent.
+    """
+    if monthly_budget_usd <= 0:
+        return {"state": "unset", "monthly_budget_usd": 0.0,
+                "month_to_date_usd": round(month_to_date_usd, 2),
+                "remaining_usd": None, "used_pct": None,
+                "projected_month_end_usd": None, "exhausted_on": None,
+                "hours_left_in_month": None}
+
+    now = _now(now_iso)
+    local_today = _local_date(now, tz_offset_minutes)
+    # First local midnight of next month, back in UTC terms: the wallet
+    # resets there, so nothing is projected past it.
+    if local_today.month == 12:
+        next_month = local_today.replace(year=local_today.year + 1, month=1, day=1)
+    else:
+        next_month = local_today.replace(month=local_today.month + 1, day=1)
+    offset = timedelta(minutes=tz_offset_minutes)
+    month_end_utc = datetime.combine(
+        next_month, datetime.min.time(), tzinfo=timezone.utc) - offset
+    hours_left = max(0.0, (month_end_utc - now).total_seconds() / 3600.0)
+
+    remaining = monthly_budget_usd - month_to_date_usd
+    projected = month_to_date_usd + burn_usd_per_hour * hours_left
+
+    exhausted_on = None
+    if burn_usd_per_hour > 0 and remaining > 0:
+        hours_to_go = remaining / burn_usd_per_hour
+        if hours_to_go <= hours_left:      # only if it happens THIS month
+            exhausted_on = (now + timedelta(hours=hours_to_go)).isoformat(
+                timespec="seconds")
+
+    used_pct = month_to_date_usd / monthly_budget_usd * 100.0
+    state = "over" if remaining <= 0 else ("warn" if used_pct >= 80.0 else "ok")
+
+    return {
+        "state": state,
+        "monthly_budget_usd": round(monthly_budget_usd, 2),
+        "month_to_date_usd": round(month_to_date_usd, 2),
+        "remaining_usd": round(remaining, 2),
+        "used_pct": round(used_pct, 1),
+        "projected_month_end_usd": round(projected, 2),
+        "exhausted_on": exhausted_on,
+        "hours_left_in_month": round(hours_left, 1),
     }
 
 

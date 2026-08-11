@@ -323,6 +323,39 @@ export type SpendSummary = {
   timezone_label: string;
   disclaimer: string;
   mock: boolean;
+  budget: BudgetStatus;
+};
+
+// The monthly wallet. Advisory: it never blocks a launch, because
+// month_to_date only counts launches Manifold started and refusing work on
+// a number we know is short would cost you a launch without saving money.
+export type BudgetStatus = {
+  state: "unset" | "ok" | "warn" | "over";
+  monthly_budget_usd: number;
+  month_to_date_usd: number;
+  // All null when state is "unset".
+  remaining_usd: number | null;
+  used_pct: number | null;
+  // Both read "at the CURRENT burn rate", not a forecast of what you might
+  // launch next. exhausted_on is null when the cap is not reached this month.
+  projected_month_end_usd: number | null;
+  exhausted_on: string | null;
+  hours_left_in_month: number | null;
+};
+
+export type SpendBucket = {
+  bucket: string;        // "2026-08-11" | "2026-W32" | "2026-08"
+  start_iso: string;
+  usd: number;
+  seconds: number;
+  launches: number;
+};
+
+export type SpendBreakdownRow = {
+  key: string;
+  usd: number;
+  seconds: number;
+  count: number;
 };
 
 export type Brain = {
@@ -388,10 +421,18 @@ export type Preferences = {
   guardrails: {
     max_concurrent_instances: number;
     max_hourly_spend_usd: number;
+    // A cumulative monthly wallet. Reported, never enforced. 0 = unset.
+    monthly_budget_usd: number;
   };
   // Mirror every worklog entry into this folder (Obsidian vault, repo).
   worklog: {
     mirror_dir: string;
+  };
+  // First-run walkthrough state. Server-side rather than localStorage, so
+  // the desktop shell and a browser on the same backend agree.
+  onboarding: {
+    completed: boolean;
+    dismissed_at: string;
   };
 };
 
@@ -401,6 +442,7 @@ export type PreferencesPatch = {
   data_safety?: Partial<Preferences["data_safety"]>;
   guardrails?: Partial<Preferences["guardrails"]>;
   worklog?: Partial<Preferences["worklog"]>;
+  onboarding?: Partial<Preferences["onboarding"]>;
 };
 
 export type Notification = {
@@ -604,6 +646,18 @@ export const api = {
   spendSummary: (tzOffsetMinutes: number) =>
     request<SpendSummary>(
       `/spend/summary?tz_offset_minutes=${Math.round(tzOffsetMinutes)}`,
+    ),
+
+  spendSeries: (tzOffsetMinutes: number, bucket = "day", days = 30) =>
+    request<{ series: SpendBucket[]; mock: boolean }>(
+      `/spend/series?bucket=${bucket}&days=${days}` +
+        `&tz_offset_minutes=${Math.round(tzOffsetMinutes)}`,
+    ),
+
+  spendBreakdown: (tzOffsetMinutes: number, by = "instance_type", days = 30) =>
+    request<{ breakdown: SpendBreakdownRow[]; mock: boolean }>(
+      `/spend/breakdown?by=${by}&days=${days}` +
+        `&tz_offset_minutes=${Math.round(tzOffsetMinutes)}`,
     ),
 
   settingsStatus: () =>

@@ -44,6 +44,10 @@ export function PolicySettings() {
       data_safety: { ...prefs.data_safety, ...patch.data_safety },
       guardrails: { ...prefs.guardrails, ...patch.guardrails },
       worklog: { ...prefs.worklog, ...patch.worklog },
+      // Every section of Preferences must be spread here. TypeScript enforces
+      // it, which is the frontend half of the guard that stops a new section
+      // being silently unsaveable (see PreferencesPatch in main.py).
+      onboarding: { ...prefs.onboarding, ...patch.onboarding },
     };
     setPrefs(optimistic);
     setError("");
@@ -128,7 +132,36 @@ export function PolicySettings() {
               className="mt-1 block w-28 rounded border border-zinc-300 bg-white px-2.5 py-1.5 text-sm"
             />
           </label>
+          <label className="block text-xs font-medium text-zinc-600">
+            Monthly budget (USD)
+            <input
+              type="number"
+              min={0}
+              step={25}
+              value={prefs.guardrails.monthly_budget_usd || ""}
+              placeholder="none"
+              onChange={(e) =>
+                save({
+                  guardrails: {
+                    monthly_budget_usd: Math.max(
+                      0,
+                      Number(e.target.value) || 0,
+                    ),
+                  },
+                })
+              }
+              className="mt-1 block w-28 rounded border border-zinc-300 bg-white px-2.5 py-1.5 text-sm"
+            />
+          </label>
         </div>
+        <p className="mt-2 text-[11px] leading-relaxed text-zinc-400">
+          The first two are enforced: a launch that would breach either is
+          refused before any API call. The monthly budget is different in kind:
+          a cumulative wallet that Manifold reports and warns on but never
+          enforces, because it can only count instances Manifold itself started
+          and refusing work on a number we know is short would cost you a
+          launch without saving any money.
+        </p>
         {prefs.guardrails.max_concurrent_instances > 4 && (
           <p className="mt-2 rounded border border-amber-300/40 bg-amber-50 px-2 py-1 text-[11px] text-amber-700">
             {prefs.guardrails.max_concurrent_instances} simultaneous instances

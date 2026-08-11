@@ -249,6 +249,7 @@ class Dispatcher:
         image_checker: ImageChecker | None = None,
         notifier=None,
         worklog=None,
+        prefs=None,
         clock=time.monotonic,
     ):
         self.settings = settings
@@ -266,6 +267,14 @@ class Dispatcher:
         # Worklog (optional): every settled job becomes one markdown entry
         # other agents can read (see worklog.py).
         self.worklog = worklog
+        # PreferenceStore (optional): only the monthly budget is read here,
+        # and only to decide whether a threshold ping is due. The guards
+        # themselves stay in the orchestrator (hard rule) - this loop never
+        # refuses anything, it only tells you where you are.
+        self.prefs = prefs
+        # Highest budget threshold already announced this local month, keyed
+        # "YYYY-MM" so a new month starts quiet without any reset job.
+        self._budget_announced: tuple[str, float] | None = None
         self._clock = clock
         self._loops: list[asyncio.Task] = []
         # In-flight dispatched jobs: task id -> the asyncio task running it.
@@ -1805,6 +1814,57 @@ class Dispatcher:
                 raise
             except Exception:
                 logger.exception("telemetry loop iteration failed")
+            try:
+                self._check_budget_once()
+            except Exception:
+                logger.exception("budget check failed")
+
+    def _check_budget_once(self) -> None:
+        """Ping when month-to-date crosses a share of the monthly budget.
+
+        Rides the telemetry cadence rather than a loop of its own: a budget
+        is a slow number and this is a whole-table read. It runs here, not
+        lazily inside GET /spend/summary, because a user with no dashboard
+        open is exactly the one who needs telling.
+
+        Advisory only. This never refuses a launch - see GuardrailPrefs for
+        why a lower-bound number must not gate spend.
+        """
+        if self.prefs is None or self.notifier is None:
+            return
+        budget = self.prefs.get().guardrails.monthly_budget_usd
+        if budget <= 0:
+            return                              # no wallet set: nothing to cross
+
+        from . import spend
+        summary = spend.summarize(
+            self.db.list_launches(), now_iso=utcnow(),
+            monthly_budget_usd=budget,
+        )
+        status = summary["budget"]
+        used = (status["used_pct"] or 0.0) / 100.0
+        crossed = [t for t in spend.BUDGET_THRESHOLDS if used >= t]
+        if not crossed:
+            return
+        highest = max(crossed)
+
+        month = utcnow()[:7]                 # "YYYY-MM"
+        if self._budget_announced == (month, highest):
+            return                              # already said this, this month
+        self._budget_announced = (month, highest)
+
+        spent = status["month_to_date_usd"]
+        if highest >= 1.0:
+            title = f"Monthly budget spent: ${spent:.2f} of ${budget:.2f}"
+        else:
+            title = (f"{int(highest * 100)}% of the monthly budget: "
+                     f"${spent:.2f} of ${budget:.2f}")
+        body = ("Manifold does not block launches on this figure, and it "
+                "only counts instances Manifold started.")
+        if status["exhausted_on"]:
+            body = (f"At the current burn it runs out on "
+                    f"{status['exhausted_on'][:10]}. " + body)
+        self.notifier.notify("budget_threshold", title, body, ref=month)
 
     @staticmethod
     def _reported(gpus: list[dict], key: str) -> list[float]:

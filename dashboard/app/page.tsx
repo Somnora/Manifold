@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import Link from "next/link";
 import { api, type Launch } from "@/lib/api";
 import { usePolling } from "@/lib/usePolling";
@@ -11,6 +11,7 @@ import { WatchPanel } from "@/components/WatchPanel";
 import { ClusterPanel } from "@/components/ClusterPanel";
 import { VisualTaskGraph } from "@/components/VisualTaskGraph";
 import { MultiGpuTelemetry } from "@/components/MultiGpuTelemetry";
+import { Onboarding } from "@/components/Onboarding";
 import {
   useSpendSummary,
   OrphanedSpendAlert,
@@ -43,6 +44,26 @@ export default function InstancesPage() {
   const instances = data?.instances ?? [];
   const launches = data?.launches ?? [];
 
+  // First run: no key, nothing ever launched, and the walkthrough not yet
+  // finished or skipped. All three matter. Checking only the key would greet
+  // someone who deliberately removed it; checking only the launch history
+  // would greet a real install that is currently in demo mode, which reads
+  // from a different database. `onboardingDone` starts null (unknown) so the
+  // wizard cannot flash on screen before the answer arrives.
+  const [onboardingDone, setOnboardingDone] = useState<boolean | null>(null);
+  useEffect(() => {
+    api
+      .preferences()
+      .then((p) => setOnboardingDone(p.preferences.onboarding.completed))
+      .catch(() => setOnboardingDone(true)); // unreachable backend: stay quiet
+  }, []);
+  const firstRun =
+    onboardingDone === false &&
+    setup !== null &&
+    !setup.mock &&
+    !setup.lambda_configured &&
+    launches.length === 0;
+
   // Gates for the pure-view panels: only render them when they have something
   // to show, so the default (empty/mock) screen isn't three big empty boxes.
   const hasTasks = (taskList?.length ?? 0) > 0;
@@ -67,6 +88,12 @@ export default function InstancesPage() {
 
   return (
     <div className="space-y-6">
+      {firstRun && setup && (
+        <Onboarding
+          envPath={setup.env_path}
+          onFinished={() => setOnboardingDone(true)}
+        />
+      )}
       {setup && !setup.mock && !setup.lambda_configured && (
         <div className="rounded-lg border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900">
           <span className="font-medium">Almost there:</span> no Lambda API

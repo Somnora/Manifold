@@ -38,6 +38,7 @@ NOTIFICATION_KINDS = (
     "capacity_available",   # a capacity watch found its GPU
     "instance_idle",        # a running instance is billing while barely used
     "instance_ceiling",     # an instance is near, or past, its max lifetime
+    "budget_threshold",     # month-to-date spend crossed a share of the budget
 )
 
 
@@ -87,6 +88,11 @@ class NotificationPrefs:
     # instance_idle because switching off idle-spend chatter must not also
     # switch off the warning that a box is about to be terminated.
     instance_ceiling: bool = True
+    # Month-to-date spend crossing a share of the monthly budget. Advisory
+    # only: the budget never blocks a launch (see GuardrailPrefs), so this
+    # notification IS the feature - a cap you are not told about is a cap
+    # that does nothing.
+    budget_threshold: bool = True
     # Also raise an OS notification (macOS Notification Center, libnotify on
     # Linux). In-app notifications are always recorded regardless; this only
     # controls the ping outside the window.
@@ -147,6 +153,18 @@ class GuardrailPrefs:
     """
     max_concurrent_instances: int = 0
     max_hourly_spend_usd: float = 0.0
+    # A CUMULATIVE wallet for the calendar month, and a different kind of
+    # number from the two above: those are RATE ceilings the orchestrator
+    # enforces before a launch, this one is only ever reported.
+    #
+    # It is deliberately advisory. Month-to-date is reconstructed from the
+    # launches Manifold started, so it is a LOWER BOUND by construction -
+    # an instance launched from the provider's own console has no launch row
+    # and is invisible to it. Blocking a launch on a number we know is short
+    # would refuse work without protecting the wallet, and it would decide
+    # from our own database, which is exactly the evidence _guard_capacity
+    # deliberately refuses to trust. So: warn loudly, never refuse.
+    monthly_budget_usd: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -158,12 +176,25 @@ class WorklogPrefs:
 
 
 @dataclass(frozen=True)
+class OnboardingPrefs:
+    """Whether the first-run walkthrough has been finished or dismissed.
+
+    Server-side on purpose. localStorage would answer this differently in the
+    desktop shell and in a browser pointed at the same backend, so the same
+    install would greet you twice or not at all.
+    """
+    completed: bool = False
+    dismissed_at: str = ""      # ISO 8601 UTC, or "" if never dismissed
+
+
+@dataclass(frozen=True)
 class Preferences:
     approvals: ApprovalPrefs = ApprovalPrefs()
     notifications: NotificationPrefs = NotificationPrefs()
     data_safety: DataSafetyPrefs = DataSafetyPrefs()
     guardrails: GuardrailPrefs = GuardrailPrefs()
     worklog: WorklogPrefs = WorklogPrefs()
+    onboarding: OnboardingPrefs = OnboardingPrefs()
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -212,6 +243,8 @@ def _validate(section):
             fixes["max_concurrent_instances"] = 0
         if section.max_hourly_spend_usd < 0:
             fixes["max_hourly_spend_usd"] = 0.0
+        if section.monthly_budget_usd < 0:
+            fixes["monthly_budget_usd"] = 0.0
         if fixes:
             section = replace(section, **fixes)
     return section
@@ -226,6 +259,7 @@ def preferences_from_dict(base: Preferences, raw: dict) -> Preferences:
         data_safety=_coerce(base.data_safety, raw.get("data_safety", {})),
         guardrails=_coerce(base.guardrails, raw.get("guardrails", {})),
         worklog=_coerce(base.worklog, raw.get("worklog", {})),
+        onboarding=_coerce(base.onboarding, raw.get("onboarding", {})),
     )
 
 

@@ -132,6 +132,14 @@ preferences:
     data_transferred: true   # files were rescued off an instance
     capacity_available: true # a capacity watch found its GPU
     instance_idle: true      # a running instance is billing while barely used
+    # A heads-up before the max-lifetime ceiling fires, and the cases where
+    # it fired but Manifold deliberately did NOT destroy the box. Separate
+    # from instance_idle so silencing idle chatter cannot also silence the
+    # warning that a box is about to be terminated.
+    instance_ceiling: true
+    # Month-to-date spend crossing a share of the monthly budget. The budget
+    # never blocks a launch, so this notification IS the feature.
+    budget_threshold: true
     # Also raise a real OS notification (macOS Notification Center,
     # notify-send on Linux) so it reaches you outside the window. In-app
     # notifications are recorded either way.
@@ -165,6 +173,21 @@ preferences:
     #   terminate  stop the billing and let those files die. Recorded in the
     #              audit log and the notification, never silent.
     if_unsaveable: block
+
+  guardrails:
+    # User-editable overrides for the hard limits at the top of this file.
+    # 0 means "not set here, use the value above", so the Settings page can
+    # raise the instance limit without a YAML edit and a restart.
+    max_concurrent_instances: 0
+    max_hourly_spend_usd: 0.0
+    # A CUMULATIVE wallet for the calendar month. Different in kind from the
+    # two above: those are RATE ceilings the orchestrator enforces before a
+    # launch, this one is only ever REPORTED. Month-to-date is reconstructed
+    # from the launches Manifold started, so it is a lower bound (an instance
+    # launched from the provider's console is invisible to it), and refusing
+    # work on a number we know is short would cost you a launch without
+    # protecting the wallet. 0 = no budget set.
+    monthly_budget_usd: 0.0
 
 hub:
   # The local half of Manifold: brains on this machine and frontier APIs.

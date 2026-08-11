@@ -3284,3 +3284,91 @@ Two of the three range corrections above were caught only by probing a seeded ba
 - **A new notification kind, `instance_ceiling`, separate from `instance_idle`.** Switching off idle-spend chatter must not also switch off the warning that a box is about to be terminated. The warning fires once per instance on a **fixed** 600s lead (90% of 30 days is three days of nagging; 90% of 70 minutes is seven minutes of notice) and is suppressed entirely when the ceiling is under 2x the lead, where it would land at launch and mean nothing.
 
 **Test coverage:** `tests/test_idle_matrix.py` is a golden fence — the pre-76b decision matrix (auto-managed, auto-managed-in-`terminating`, pinned server, pinned batch, disconnected, keep-alive, under/over timeout, no launch row, blocked termination), written and made green against the *unmodified* `_check_idle` and passing unedited afterwards; any change to it is an unintended behaviour change. `tests/test_ceiling.py` covers the ceiling: not firing when unset (the default, and the most important test in the file), firing from `launched_at` rather than activity, surviving a restart, firing through `vllm-serve` while that same task still blocks idle termination, deferring to `whisper-batch`, notifying-but-not-destroying an auto-managed job stuck in `terminating`, overriding keep-alive, honouring `TerminationBlocked` and backing off, the unreachable case, NULL/garbage/naive `launched_at`, an orphan-repaired row firing within one poll, a `ProviderError` on one box not abandoning the next, the rejection at both write paths, the card fields, mock fixtures carrying no ceiling — and one test that drives every branch that can destroy and asserts on the **kwarg** that all four calls were `force=False`.
+
+## Phase 76c — The money on screen, and a first run that says what this is (2026-08-11)
+
+**Context:** 76a made the spend numbers true and 76b bounded what a running
+instance can cost. Neither put the number anywhere a person meets it. This
+phase is the surface: a burn-down against a monthly wallet, a chart, and the
+walkthrough a brand-new install gets before it is offered a GPU.
+
+**Decided & why:**
+
+- **The monthly budget is advisory, and that is a deliberate refusal to
+  enforce.** `max_concurrent_instances` and `max_hourly_spend_usd` are RATE
+  ceilings the orchestrator checks before any provider call. `monthly_budget_usd`
+  is a different kind of number: a cumulative wallet, reconstructed from the
+  launches Manifold started, and therefore a **lower bound by construction**
+  (an instance started from the provider's own console has no launch row and
+  is invisible to it). **Alternatives:** enforce it in `_guard_capacity` beside
+  the rate guards, or enforce it behind an opt-in "hard stop" flag. **Why not:**
+  blocking a launch on a number we know is short refuses work without
+  protecting the wallet, and it would decide from our own database — exactly
+  the class of evidence `_guard_capacity` deliberately distrusts when it
+  fetches `list_instances(fresh=True)`. A third guard that fires late and
+  non-deterministically is spend theatre. So the budget warns loudly, in the
+  burn-down, in a notification at 50/80/100%, and in copy on both the Settings
+  field and the panel that says outright it does not block a launch.
+  `test_a_monthly_budget_never_refuses_a_launch` pins it: 12x over the wallet,
+  the launch is still admitted on the rate guards alone.
+
+- **The projection answers "if I leave this running", not "what will I spend".**
+  `projected_month_end_usd` and `exhausted_on` extrapolate the CURRENT burn to
+  the month boundary. **Alternative:** extrapolate past spend linearly
+  (month-to-date / days elapsed x days in month). **Why:** the linear version
+  answers a question nobody asks and is wrong in both directions — it
+  under-reports on the day you start a big run and over-reports for a week
+  afterwards. The burn version answers the actionable one ("at this rate the
+  budget runs out on the 13th"), and with nothing running it reports
+  month-to-date unchanged, which is correct rather than pessimistic. Nothing
+  is projected past the month boundary, because the wallet resets there.
+
+- **The chart is hand-rolled SVG, and it is bars.** No charting library: the
+  bundle ships inside a Tauri desktop app, everything else here (telemetry
+  sparklines, progress bars) is drawn the same way, and the two dependencies
+  already installed and unused are argument enough against adding a third.
+  What it needed that `Sparkline` could not give is a real domain — that helper
+  hardcodes 0-100 because it draws percentages, and money has no ceiling — so
+  this one computes a "nice" axis maximum and labels it. **Bars rather than a
+  line:** a line implies a continuous quantity sampled over time, but spend is
+  a sum per bucket and an empty bucket is a true zero, not a gap to interpolate
+  through. Hit areas are full bucket height, because a $0.02 bar is one pixel
+  and otherwise unhoverable.
+
+- **Onboarding cannot offer a demo BUTTON, so it offers a command.** Mock mode
+  is decided when the backend process starts: it swaps every client, uses a
+  different database file, and deliberately refuses to boot when the real
+  database still has a live launch. A "Try the demo" button would therefore
+  restart the backend and could leave the user with no backend at all, in the
+  exact situation the mock-isolation guard exists to protect. The walkthrough
+  shows the command instead and explains why it is a command. **Alternative:**
+  a frontend fixture layer that fakes demo data client-side — rejected, because
+  a dashboard that renders invented dollar figures is precisely what 76a spent
+  its whole budget removing.
+
+- **The walkthrough sets a spending cap before it offers a GPU.** Step three is
+  the guardrails, not an afterthought in Settings. Every user then has a real
+  hourly ceiling and a budget from minute one, and meets the product's actual
+  premise during setup rather than after their first surprise.
+
+- **Onboarding state lives in `Preferences`, not `localStorage`.** localStorage
+  answers differently in the desktop shell and in a browser pointed at the same
+  backend, so the same install would greet you twice or never. Adding the
+  section surfaced the older bug and fixed it: `PreferencesPatch` in `main.py`
+  omitted `worklog`, and `model_dump(exclude_none=True)` dropped the field
+  before the handler saw it, so `PUT /preferences {"worklog": ...}` returned
+  **200 with the value unchanged** — a silent success on a failed write.
+  `worklog` and `onboarding` are both listed now, and
+  `test_preferences_round_trip_every_section` is parametrised over every
+  section so the NEXT one fails in the suite instead of in production. The
+  frontend has the same guard for free: `Preferences` is a total type, so
+  TypeScript refuses to compile `PolicySettings`' optimistic merge until a new
+  section is spread there too.
+
+**Test coverage:** `tests/test_budget.py` — the burn-down states (unset is not
+$0, 80% warns, over reports how far over rather than clamping), the projection
+with and without a live burn, an exhaustion date only when it lands inside the
+month, December rolling into January, the budget never refusing a launch while
+genuinely 12x over, `/spend/summary` reporting it, the negative-value clamp,
+the notification toggle existing, and the every-section preferences round trip.
+Full suite 723 passing; dashboard builds clean.

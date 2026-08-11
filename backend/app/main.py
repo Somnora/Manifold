@@ -271,6 +271,13 @@ class PreferencesPatch(BaseModel):
     notifications: dict | None = None
     data_safety: dict | None = None
     guardrails: dict | None = None
+    # Every section of Preferences must be listed here. A section that is
+    # missing is dropped by model_dump(exclude_none=True) before the handler
+    # ever sees it, so PUT returns 200 with the value unchanged - a silent
+    # success on a failed write. worklog was in exactly that state until
+    # Phase 76c; test_preferences_round_trip_every_section guards it now.
+    worklog: dict | None = None
+    onboarding: dict | None = None
 
 
 class NotificationsReadRequest(BaseModel):
@@ -566,6 +573,7 @@ def create_app(
     dispatcher = Dispatcher(
         settings, orchestrator, queue, templates, db, lambda_client,
         image_checker=image_checker, notifier=notifier, worklog=worklog,
+        prefs=prefs,
     )
     autopilot = Autopilot(settings, orchestrator, queue, templates, db,
                           notifier=notifier, worklog=worklog,
@@ -2749,6 +2757,7 @@ def create_app(
             tz_offset_minutes=clamp_tz(tz_offset_minutes),
             live_ids=live_ids, listed_providers=listed_providers,
             boot_timeout_seconds=settings.launch.boot_timeout_seconds,
+            monthly_budget_usd=prefs.get().guardrails.monthly_budget_usd,
         )
         # Fixture spend has to be self-identifying wherever it is shown: a
         # dollar figure in a screenshot with no demo marker is the worst
