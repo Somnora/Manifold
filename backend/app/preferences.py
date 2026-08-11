@@ -36,6 +36,8 @@ NOTIFICATION_KINDS = (
     "run_finished",         # an autopilot run ended (any outcome)
     "data_transferred",     # files were rescued off an instance
     "capacity_available",   # a capacity watch found its GPU
+    "instance_idle",        # a running instance is billing while barely used
+    "instance_ceiling",     # an instance is near, or past, its max lifetime
 )
 
 
@@ -74,6 +76,17 @@ class NotificationPrefs:
     # A watch without auto-launch is ONLY a notification: if this is off,
     # capacity comes and goes silently and the watch was pointless.
     capacity_available: bool = True
+    # An instance billing at full rate while its GPUs sit idle. This one is
+    # the whole feature: idle spend you have not noticed is the money this
+    # tool exists to save, and the notification never terminates anything -
+    # it tells you, and you decide.
+    instance_idle: bool = True
+    # The max-lifetime ceiling: a heads-up before it fires, and the two cases
+    # where it fired and Manifold deliberately did NOT destroy the box (it
+    # was unreachable, or a job's own teardown is stuck). Separate from
+    # instance_idle because switching off idle-spend chatter must not also
+    # switch off the warning that a box is about to be terminated.
+    instance_ceiling: bool = True
     # Also raise an OS notification (macOS Notification Center, libnotify on
     # Linux). In-app notifications are always recorded regardless; this only
     # controls the ping outside the window.

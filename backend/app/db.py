@@ -252,8 +252,17 @@ CREATE TABLE IF NOT EXISTS watches (
 );
 
 -- Periodic GPU telemetry, sampled by the dispatcher while an instance is
--- connected. Backs the post-run utilization verdict and the right-size hint.
--- Purely advisory; nothing on the launch path reads or writes this.
+-- connected. Backs the post-run utilization verdict, the right-size hint,
+-- and idle-spend accounting. Purely advisory; nothing on the launch path
+-- reads or writes this, and nothing destructive may be gated on it.
+--
+-- One row is one sample of the WHOLE BOX, not of one card:
+--   vram_used_mib / util_pct  the MAX across the box's GPUs
+--   util_pct_mean             the MEAN across the box's GPUs
+--   gpu_count                 how many GPUs that sample covered
+-- Every metric column is nullable on purpose. A sidecar frozen into an
+-- already-running instance can omit a field, and NULL ("this sample did not
+-- say") must never be stored as 0 ("the GPUs were doing nothing").
 CREATE TABLE IF NOT EXISTS telemetry_samples (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     instance_id     TEXT NOT NULL,
@@ -261,7 +270,9 @@ CREATE TABLE IF NOT EXISTS telemetry_samples (
     gpu_name        TEXT,
     vram_used_mib   INTEGER,
     vram_total_mib  INTEGER,
-    util_pct        INTEGER
+    util_pct        INTEGER,
+    util_pct_mean   REAL,
+    gpu_count       INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_telemetry_instance
     ON telemetry_samples(instance_id);
@@ -307,6 +318,18 @@ class Database:
         # caps at the boot timeout rather than letting a cost grow forever.
         self._ensure_column("launches", "last_seen_at", "TEXT")
         self._ensure_column("launches", "resolved_at", "TEXT")
+        # Phase 76b: the opt-in maximum total lifetime, anchored on
+        # launched_at. NULL (every historical row, and every launch that does
+        # not ask for one) means no ceiling — nothing about the idle loop
+        # changes for them.
+        self._ensure_column("launches", "max_lifetime_seconds", "REAL")
+        # Phase 76b: a telemetry sample describes the whole box, not GPU 0.
+        # Rows written before this exist and have both columns NULL, which
+        # spend.idle_spend reads as "that span was never measured" rather
+        # than as an idle span - the whole point of the columns being
+        # nullable (see the schema comment above).
+        self._ensure_column("telemetry_samples", "util_pct_mean", "REAL")
+        self._ensure_column("telemetry_samples", "gpu_count", "INTEGER")
         # Auto-manage columns (Phase 24) for databases created earlier.
         self._ensure_column("tasks", "auto_manage",
                             "INTEGER NOT NULL DEFAULT 0")
@@ -368,6 +391,7 @@ class Database:
         connection_mode: str,
         hourly_rate_cents: int,
         idle_timeout_seconds: float | None = None,
+        max_lifetime_seconds: float | None = None,
         provider: str = "lambda",
         launch_id: str | None = None,
         created_at: str | None = None,
@@ -387,11 +411,12 @@ class Database:
         self._execute(
             """INSERT INTO launches
                (id, provider, created_at, requested_type, region, filesystem,
-                connection_mode, hourly_rate_cents, status, idle_timeout_seconds)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'launching', ?)""",
+                connection_mode, hourly_rate_cents, status,
+                idle_timeout_seconds, max_lifetime_seconds)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'launching', ?, ?)""",
             (launch_id, provider, created_at or utcnow(), requested_type,
              region, filesystem, connection_mode, hourly_rate_cents,
-             idle_timeout_seconds),
+             idle_timeout_seconds, max_lifetime_seconds),
         )
         return launch_id
 
@@ -401,6 +426,7 @@ class Database:
             "launched_type", "hourly_rate_cents",
             "launched_at", "active_at", "terminated_at", "keep_alive",
             "idle_timeout_seconds", "last_seen_at", "resolved_at",
+            "max_lifetime_seconds",
         }
         unknown = set(fields) - allowed
         if unknown:
@@ -539,27 +565,56 @@ class Database:
         return out
 
     def record_telemetry_sample(self, instance_id: str, *, gpu_name: str,
-                                vram_used_mib: int, vram_total_mib: int,
-                                util_pct: int) -> None:
+                                vram_used_mib: int | None,
+                                vram_total_mib: int | None,
+                                util_pct: int | None,
+                                util_pct_mean: float | None = None,
+                                gpu_count: int | None = None,
+                                at: str | None = None) -> None:
+        """Store one whole-box sample. Every metric is nullable: pass None for
+        anything the instance did not report, never 0 (see the schema).
+
+        `at` defaults to now and exists so a test can lay samples out along a
+        timeline; same shape, and same reason, as create_launch's optional
+        `created_at`. No production caller passes it.
+        """
         self._execute(
             """INSERT INTO telemetry_samples
                    (instance_id, at, gpu_name, vram_used_mib,
-                    vram_total_mib, util_pct)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (instance_id, utcnow(), gpu_name, vram_used_mib,
-             vram_total_mib, util_pct),
+                    vram_total_mib, util_pct, util_pct_mean, gpu_count)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (instance_id, at or utcnow(), gpu_name, vram_used_mib,
+             vram_total_mib, util_pct, util_pct_mean, gpu_count),
         )
 
     def telemetry_summary(self, instance_id: str) -> dict:
         """Aggregate an instance's samples: sample count, PEAK vram used, the
         card's total vram, and average utilization. Peak (not average) vram is
-        the OOM-relevant figure the right-size hint keys on."""
+        the OOM-relevant figure the right-size hint keys on.
+
+        NOTE what the two per-sample columns mean on a multi-GPU box, because
+        it decides what these aggregates mean:
+          MAX(vram_used_mib)  the peak of the per-sample MAXIMA, i.e. the
+                              busiest card at its busiest moment. That is the
+                              OOM-relevant figure; a mean would hide the card
+                              that actually filled up.
+          AVG(util_pct)       the mean of the per-sample MAXIMA, so it reads
+                              "how busy was the busiest card, on average".
+                              Deliberately NOT the mean across cards: the
+                              right-size hint keys on it, and a hint that
+                              downsizes a box because seven of its eight GPUs
+                              were quiet is exactly the OOM this refuses to
+                              risk. Idle-spend accounting wants the opposite
+                              and reads util_pct_mean instead - see
+                              spend.idle_spend. The two never cross.
+        """
         row = self._execute(
             """SELECT COUNT(*) AS n,
                       MAX(vram_used_mib) AS peak_used,
                       MAX(vram_total_mib) AS total,
                       AVG(util_pct) AS avg_util,
-                      MAX(gpu_name) AS gpu_name
+                      MAX(gpu_name) AS gpu_name,
+                      MAX(gpu_count) AS gpus
                  FROM telemetry_samples WHERE instance_id = ?""",
             (instance_id,),
         ).fetchone()
@@ -569,7 +624,28 @@ class Database:
             "vram_total_mib": row["total"] or 0,
             "avg_util_pct": float(row["avg_util"] or 0.0),
             "gpu_name": row["gpu_name"] or "",
+            # None (not 0) when no sample ever said - every row predates the
+            # column, or every sample came from a source that omits it.
+            "gpu_count": row["gpus"],
         }
+
+    def telemetry_samples_between(self, instance_id: str, start_iso: str,
+                                  end_iso: str) -> list[dict]:
+        """Every sample for one instance inside one window, oldest first.
+
+        Windowed rather than "all of it" because idle-spend accounting only
+        ever asks about a launch's own lifetime, and telemetry_samples grows
+        without bound. The (instance_id, at) composite index serves exactly
+        this shape.
+        """
+        rows = self._execute(
+            """SELECT at, util_pct, util_pct_mean, gpu_count
+                 FROM telemetry_samples
+                WHERE instance_id = ? AND at >= ? AND at <= ?
+                ORDER BY at""",
+            (instance_id, start_iso, end_iso),
+        ).fetchall()
+        return [dict(r) for r in rows]
 
     def find_launch_by_instance(self, lambda_instance_id: str) -> dict | None:
         row = self._execute(
@@ -1011,6 +1087,21 @@ class Database:
             (limit,),
         ).fetchall()
         return [{**dict(r), "read": bool(r["read"])} for r in rows]
+
+    def notification_exists(self, kind: str, ref: str) -> bool:
+        """Has this exact (kind, ref) already been recorded?
+
+        The dedupe key for notifications that describe an ongoing CONDITION
+        rather than an event - "this instance is idle" is true on every
+        telemetry tick, and a ping per tick is how a bell becomes noise a
+        user learns to ignore. Stored in the table rather than in memory so
+        a backend restart does not re-ping what you already dismissed.
+        """
+        row = self._execute(
+            "SELECT 1 FROM notifications WHERE kind = ? AND ref = ? LIMIT 1",
+            (kind, ref),
+        ).fetchone()
+        return row is not None
 
     def unread_notification_count(self) -> int:
         row = self._execute(

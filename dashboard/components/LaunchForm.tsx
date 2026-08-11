@@ -38,6 +38,7 @@ export function LaunchForm({ onLaunched }: { onLaunched: () => void }) {
   const [sshKey, setSshKey] = useState("");
   const [mode, setMode] = useState("direct-ssh");
   const [idleTimeout, setIdleTimeout] = useState("");
+  const [maxLifetime, setMaxLifetime] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState("");
   const [provider, setProvider] = useState("lambda");
@@ -151,6 +152,7 @@ export function LaunchForm({ onLaunched }: { onLaunched: () => void }) {
         connection_mode: mode,
         ssh_key_name: sshKey || undefined,
         idle_timeout_seconds: idleTimeout ? parseFloat(idleTimeout) : undefined,
+        max_lifetime_seconds: maxLifetime ? parseFloat(maxLifetime) : undefined,
       });
       onLaunched();
     } catch (err) {
@@ -301,7 +303,32 @@ export function LaunchForm({ onLaunched }: { onLaunched: () => void }) {
             <option value="28800">8 hours</option>
           </select>
         </label>
+        <label className="block text-xs font-medium text-zinc-600">
+          Max lifetime
+          <select
+            className={`${field} mt-1`}
+            value={maxLifetime}
+            onChange={(e) => setMaxLifetime(e.target.value)}
+          >
+            <option value="">None</option>
+            <option value="7200">2 hours</option>
+            <option value="14400">4 hours</option>
+            <option value="28800">8 hours</option>
+            <option value="86400">24 hours</option>
+            <option value="259200">3 days</option>
+          </select>
+        </label>
       </div>
+
+      {maxLifetime ? (
+        <p className="mt-2 text-xs text-zinc-500">
+          Maximum total lifetime, from launch acceptance - includes boot (5-40
+          min). Unlike the idle timeout, nothing on the instance can push this
+          out: it applies while a model is being served and it survives a
+          backend restart. Manifold terminates the instance at that point if it
+          can reach it and save its files first.
+        </p>
+      ) : null}
 
       <div className="mt-3 flex items-center justify-between gap-4">
         <p className="text-xs text-zinc-500">

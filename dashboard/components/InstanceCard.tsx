@@ -56,6 +56,8 @@ export function InstanceCard({
   const [newName, setNewName] = useState("");
   const [editingTimeout, setEditingTimeout] = useState(false);
   const [newTimeout, setNewTimeout] = useState("");
+  const [editingCeiling, setEditingCeiling] = useState(false);
+  const [newCeiling, setNewCeiling] = useState("");
   const [busy, setBusy] = useState<"" | "terminating" | "rescuing">("");
   // Set when termination was REFUSED: the rescue ran and some file still
   // could not be saved. `blockedRescue` says what it did manage to save.
@@ -342,7 +344,11 @@ export function InstanceCard({
           {instance.idle.keep_alive ? (
             <span className="text-emerald-700">
               Idle auto-termination is off; this instance runs until you
-              terminate it.
+              terminate it
+              {instance.max_lifetime_seconds
+                ? " or it reaches its max lifetime below (keep-alive does not lift that)"
+                : ""}
+              .
             </span>
           ) : (
             <span
@@ -417,6 +423,90 @@ export function InstanceCard({
           </button>
         </div>
       )}
+
+      {/* The ceiling sits OUTSIDE the connected/idle block on purpose: a box
+          that has dropped off SSH past its ceiling is the one whose limit the
+          user most needs to see, and `idle` is null for exactly that box. */}
+      <div className="mt-2 flex flex-wrap items-center gap-2 text-xs">
+        {instance.max_lifetime_seconds ? (
+          <span
+            className={
+              instance.ceiling_seconds_remaining !== null &&
+              instance.ceiling_seconds_remaining < 900
+                ? "font-medium text-amber-700"
+                : "text-zinc-500"
+            }
+          >
+            Max lifetime {Math.round(instance.max_lifetime_seconds / 3600)}h
+            {instance.ceiling_seconds_remaining === null
+              ? " (start time unknown, so no countdown)"
+              : instance.ceiling_seconds_remaining > 0
+                ? ` (${Math.ceil(instance.ceiling_seconds_remaining / 60)}m left)`
+                : " (reached)"}
+            . Manifold terminates it then, if it can reach it and save its
+            files first.
+            {instance.ceiling_deferred_by
+              ? ` Holding off: ${instance.ceiling_deferred_by}.`
+              : ""}
+          </span>
+        ) : (
+          <span className="text-zinc-400">
+            No max lifetime; this instance bills until it is idle or you stop
+            it.
+          </span>
+        )}
+        {editingCeiling ? (
+          <form
+            onSubmit={async (e) => {
+              e.preventDefault();
+              try {
+                await api.setMaxLifetime(
+                  instance.id,
+                  newCeiling ? parseInt(newCeiling, 10) : null,
+                );
+                setEditingCeiling(false);
+                onChanged();
+              } catch (err) {
+                // The backend REJECTS a value under its minimum rather than
+                // clamping it, and the message explains the boot budget.
+                setError(err instanceof ApiError ? err.message : String(err));
+              }
+            }}
+            className="flex items-center gap-1.5"
+          >
+            <select
+              autoFocus
+              value={newCeiling}
+              onChange={(e) => setNewCeiling(e.target.value)}
+              className="rounded border border-zinc-300 bg-white px-2 py-0.5 text-xs"
+            >
+              <option value="">None</option>
+              <option value="7200">2 hours</option>
+              <option value="14400">4 hours</option>
+              <option value="28800">8 hours</option>
+              <option value="86400">24 hours</option>
+              <option value="259200">3 days</option>
+            </select>
+            <button type="submit" className="rounded bg-zinc-900 px-2 py-0.5 text-xs text-white">Save</button>
+            <button type="button" onClick={() => setEditingCeiling(false)} className="text-zinc-500">Cancel</button>
+          </form>
+        ) : (
+          <button
+            onClick={() => {
+              setNewCeiling(
+                instance.max_lifetime_seconds
+                  ? String(Math.round(instance.max_lifetime_seconds))
+                  : "",
+              );
+              setEditingCeiling(true);
+            }}
+            className="text-zinc-400 hover:text-zinc-700"
+            title="Total lifetime from launch acceptance, boot included"
+          >
+            (edit)
+          </button>
+        )}
+      </div>
 
       {everConnected && <TelemetryChart instanceId={instance.id} />}
 

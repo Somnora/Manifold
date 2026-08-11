@@ -119,6 +119,18 @@ class IdleSettings:
     timeout_max_seconds: float = 14400.0
     timeout_min_seconds: float = 300.0
     poll_seconds: float = 15.0
+    # Phase 76b, the max-lifetime ceiling (opt-in, NULL = off).
+    # The floor is None by default, meaning "the boot budget plus one idle
+    # timeout" — see max_lifetime_bounds(). It is NOT idle.timeout_min_seconds:
+    # the ceiling is anchored at launch ACCEPTANCE, before boot, and boot is
+    # 15-40 minutes on a multi-GPU box, so a 5-minute floor would let someone
+    # set a ceiling that destroys an 8xH100 the instant it first connects.
+    max_lifetime_min_seconds: float | None = None
+    max_lifetime_max_seconds: float = 2_592_000.0        # 30 days
+    # How long before the ceiling the user is warned. Fixed lead, not a
+    # percentage: 90% of 30 days is three days of nagging, and 90% of 70
+    # minutes is seven minutes of notice.
+    ceiling_warning_seconds: float = 600.0
 
 
 @dataclass(frozen=True)
@@ -197,6 +209,34 @@ class TelemetrySettings:
 
 
 @dataclass(frozen=True)
+class IdleSpendSettings:
+    """Idle-spend accounting: how much of a bill ran with the GPUs unused.
+
+    REPORT ONLY, and that is a hard rule rather than a current limitation.
+    Nothing here may gate a termination, a launch, or any other destructive
+    decision: low utilization is not proof that work is not happening (a
+    memory-bound job and a served model between requests both read as idle),
+    so this produces a number to look at, never a verdict to act on. Idle
+    auto-termination keys on jobs and terminal activity and is deliberately
+    unaware of these settings.
+    """
+    # At or below this MEAN utilization across the box's GPUs, a sample's
+    # span counts as idle. The mean, never the max: on an 8-GPU box the max
+    # lets one busy card hide seven idle ones, and idle spend would then be
+    # under-reported - the one direction a spend-safety number must not err.
+    util_pct: float = 5.0
+    # Under this much wall clock we decline to judge at all. A two-minute
+    # instance is boot plus noise, and an idle fraction of it means nothing.
+    min_window_seconds: float = 600.0
+    # The `instance_idle` notification needs BOTH of these: idle for at least
+    # this long, AND this much money in idle spend. Two gates because either
+    # alone misfires - 30 idle minutes on a cheap box is not worth an
+    # interruption, and $1 of idle spend on an 8xH100 happens in three.
+    notify_after_seconds: float = 1800.0
+    notify_usd: float = 1.0
+
+
+@dataclass(frozen=True)
 class AutoManageSettings:
     # How often the auto-manage lifecycle loop advances a job (launch -> run
     # -> sync -> terminate). Modest by default: the only API call it makes is
@@ -238,6 +278,7 @@ class Settings:
     autopilot: AutopilotSettings = field(default_factory=AutopilotSettings)
     hub: HubSettings = field(default_factory=HubSettings)
     telemetry: TelemetrySettings = field(default_factory=TelemetrySettings)
+    idle_spend: IdleSpendSettings = field(default_factory=IdleSpendSettings)
     auto_manage: AutoManageSettings = field(default_factory=AutoManageSettings)
     gcp: GCPSettings = field(default_factory=GCPSettings)
     preferences: "Preferences" = field(default_factory=lambda: Preferences())
@@ -343,6 +384,7 @@ def load_settings(
     autopilot = raw.get("autopilot", {})
     hub = raw.get("hub", {})
     telemetry = raw.get("telemetry", {})
+    idle_spend = raw.get("idle_spend", {})
     auto_manage = raw.get("auto_manage", {})
     gcp = raw.get("gcp", {})
     # Defaults for the Settings-page policies. A garbage value here can never
@@ -386,6 +428,13 @@ def load_settings(
             timeout_max_seconds=float(idle.get("timeout_max_seconds", 14400)),
             timeout_min_seconds=float(idle.get("timeout_min_seconds", 300)),
             poll_seconds=float(idle.get("poll_seconds", 15)),
+            max_lifetime_min_seconds=(
+                float(idle["max_lifetime_min_seconds"])
+                if idle.get("max_lifetime_min_seconds") is not None else None),
+            max_lifetime_max_seconds=float(
+                idle.get("max_lifetime_max_seconds", 2_592_000)),
+            ceiling_warning_seconds=float(
+                idle.get("ceiling_warning_seconds", 600)),
         ),
         watches=WatchSettings(
             poll_seconds=float(watches.get("poll_seconds", 60)),
@@ -420,6 +469,14 @@ def load_settings(
         ),
         telemetry=TelemetrySettings(
             sample_seconds=float(telemetry.get("sample_seconds", 30)),
+        ),
+        idle_spend=IdleSpendSettings(
+            util_pct=float(idle_spend.get("util_pct", 5)),
+            min_window_seconds=float(
+                idle_spend.get("min_window_seconds", 600)),
+            notify_after_seconds=float(
+                idle_spend.get("notify_after_seconds", 1800)),
+            notify_usd=float(idle_spend.get("notify_usd", 1.0)),
         ),
         auto_manage=AutoManageSettings(
             poll_seconds=float(auto_manage.get("poll_seconds", 5)),

@@ -35,6 +35,12 @@ The one honest exception to (1): an `unresolved` ceiling bounds what we can
 EVIDENCE, not what the account was charged, because a launch we stopped
 watching was never terminated by our giving up on it. launch_cost says
 exactly where that applies and why the gap is narrow.
+
+idle_spend() answers a second question — how much of a bill ran with the
+GPUs unused — under the same discipline, and is REPORT ONLY: nothing it
+returns may gate a termination or any other destructive decision. It is
+called "idle spend" and never "wasted spend", because low utilization is not
+a claim we can support about whether work was happening.
 """
 
 from __future__ import annotations
@@ -415,6 +421,218 @@ def launch_cost(row: dict, *, now_iso: str, live_ids: set[str] | None = None,
                   usd_high=_usd(billable_seconds(max_seconds), rate_cents),
                   capped=(bound_basis == "boot_timeout"),
                   bound_basis=bound_basis)
+
+
+# -- idle spend (report only) -------------------------------------------------
+
+# Where an idle-spend window can END. Never `active_at`, and never a bare
+# clock for a launch we know stopped.
+IDLE_WINDOW_BASES = ("terminated_at", "resolved_at", "now")
+
+# The sentence every idle-spend surface must carry. It says the two things a
+# reader would otherwise assume wrongly: that idle is not the same as wasted,
+# and that unmeasured time is not idle time.
+IDLE_SPEND_DISCLAIMER = (
+    "Idle spend is the share of this instance's bill during which its GPUs "
+    "reported near-zero average utilization. It is not proof that nothing "
+    "useful was happening: a memory-bound job and a served model between "
+    "requests both look idle. Time we could not sample is reported as "
+    "unmeasured, never as idle."
+)
+
+
+def idle_window(row: dict, *, now_iso: str) -> dict | None:
+    """The span an idle-spend judgement may cover, or None if there is none.
+
+    `[launched_at, COALESCE(terminated_at, resolved_at, now)]`, and each
+    endpoint is chosen the same way the cost model chooses one:
+
+      START is `launched_at` ONLY. Not `active_at`, which looks like the
+      better anchor (billing starts nearer to it) but is NULL on every row
+      the orphan repair touched — Phase 76a leaves it NULL deliberately
+      rather than fabricating a boot it never observed. Anchoring on it
+      would therefore drop exactly the abandoned instances this accounting
+      exists to find. Boot time lands in the window as UNMEASURED time,
+      which is what it is: no sidecar is answering yet.
+      END prefers an observed stop, then the sweep that concluded the
+      instance was gone, and only then the clock — a running instance is the
+      one case where "now" is the honest end.
+
+    Returned as the row's own timestamp STRINGS so a caller can hand them
+    straight to a windowed query without a format round trip.
+    """
+    launched = _parse(row.get("launched_at"))
+    if launched is None or not row.get("launched_at"):
+        return None
+    for basis in ("terminated_at", "resolved_at"):
+        end_iso = row.get(basis)
+        if end_iso and _parse(end_iso) is not None:
+            break
+    else:
+        basis, end_iso = "now", now_iso
+    return {
+        "start_iso": row["launched_at"],
+        "end_iso": end_iso,
+        "end_basis": basis,
+        "seconds": _span_seconds(launched, _parse(end_iso)) or 0.0,
+    }
+
+
+def _idle_result(*, available: bool, reason: str, threshold_pct: float,
+                 window: dict | None = None, measured: bool = False,
+                 idle_seconds: float | None = None,
+                 busy_seconds: float | None = None,
+                 unknown_seconds: float | None = None,
+                 rate_cents: int | None = None,
+                 sample_count: int = 0) -> dict:
+    """One idle-spend answer, with every key always present.
+
+    A None seconds/usd field means "not measured" and must never be rendered
+    as 0 or $0.00 — the same discipline `launch_cost` applies to `usd`.
+    """
+    window_seconds = None if window is None else window["seconds"]
+
+    def usd(seconds: float | None) -> float | None:
+        if seconds is None or rate_cents is None:
+            return None
+        return round(seconds / 3600.0 * rate_cents / 100.0, 2)
+    measured_seconds = None if not measured else (idle_seconds or 0.0) + \
+        (busy_seconds or 0.0)
+    return {
+        "available": available,
+        # False means "we have no utilization evidence for this window at
+        # all". The window and its cost are still reported, as unmeasured.
+        "measured": measured,
+        "reason": reason,
+        "threshold_pct": threshold_pct,
+        "window_seconds": None if window_seconds is None
+        else round(window_seconds),
+        "window_end_basis": None if window is None else window["end_basis"],
+        "idle_seconds": None if idle_seconds is None else round(idle_seconds),
+        "busy_seconds": None if busy_seconds is None else round(busy_seconds),
+        "unknown_seconds": None if unknown_seconds is None
+        else round(unknown_seconds),
+        # What fraction of the window we actually have utilization evidence
+        # for. Read `idle_usd` next to this: "$0.00 idle" over 2% coverage
+        # says almost nothing, and a UI that hides coverage would present it
+        # as if it did.
+        "coverage": None if not measured or not window_seconds
+        else round(measured_seconds / window_seconds, 4),
+        "idle_usd": usd(idle_seconds),
+        "unknown_usd": usd(unknown_seconds),
+        "rate_known": rate_cents is not None,
+        "sample_count": sample_count,
+        "disclaimer": IDLE_SPEND_DISCLAIMER,
+    }
+
+
+def idle_spend(row: dict, samples: list[dict], *, now_iso: str,
+               util_pct: float = 5.0,
+               sample_interval_seconds: float = 30.0,
+               min_window_seconds: float = 600.0) -> dict:
+    """How much of one launch's bill ran with its GPUs essentially unused.
+
+    Pure, like everything else here: `samples` are the telemetry rows the
+    caller already read (`db.telemetry_samples_between` over `idle_window`),
+    and `now_iso` is the caller's clock.
+
+    REPORT ONLY. Nothing this returns may gate a termination or any other
+    destructive decision. Low utilization is evidence about money, not proof
+    that no work is happening, and idle auto-termination stays keyed on jobs
+    and terminal activity precisely so a quiet-looking GPU can never be
+    destroyed on the strength of a number from here.
+
+    THREE RULES DECIDE EVERY NUMBER BELOW.
+
+    1. IDLE READS `util_pct_mean`, NEVER `util_pct`. The stored `util_pct` is
+       the MAX across the box's GPUs, and the right-size hint wants that (a
+       max tightens the hint, which is the safe direction for an OOM). Idle
+       accounting wants the opposite: with the max, one busy GPU out of eight
+       hides seven idle ones and idle spend is systematically UNDER-reported,
+       which is the single direction a spend-safety tool must never err in.
+       The two never cross.
+
+    2. A SAMPLING GAP IS UNKNOWN, NOT IDLE. Each sample speaks for at most
+       `sample_interval_seconds` from its own timestamp (and never past the
+       next sample, so spans cannot overlap when sampling runs early).
+       Everything else in the window — before the first sample, after the
+       last, and every gap in between — is `unknown_seconds`. An instance
+       that went unreachable therefore accrues no idle time at all, because
+       the alternative is a tool that penalises a box for being
+       unmonitorable and then reports the penalty as money.
+
+    3. NO EVIDENCE IS NOT ZERO IDLE. Zero rows is the NORMAL case for an
+       adopted instance whose sidecar never came up and whose ssh fallback
+       failed, and so is a window of samples that all predate `util_pct_mean`
+       (an old sidecar frozen into a running box reports no such field).
+       Both return `idle_seconds=None` with `unknown_seconds` covering the
+       whole window, so a UI can say "not measured" and can never say
+       "$0.00 idle" about an instance nothing was ever known about.
+
+    `min_window_seconds` declines the judgement entirely for a short-lived
+    instance: it is mostly boot, and an idle fraction of it means nothing.
+
+    Costs are a SHARE of the bill at the row's hourly rate, deliberately not
+    passed through `billable_seconds` — the minute round-up belongs to a
+    whole launch's invoice line, and applying it to each fragment of one
+    would inflate a share of a bill above the bill.
+    """
+    rate_cents = row.get("hourly_rate_cents")
+    window = idle_window(row, now_iso=now_iso)
+    if window is None:
+        return _idle_result(
+            available=False, threshold_pct=util_pct, rate_cents=rate_cents,
+            reason="this launch never reached a running instance")
+    if window["seconds"] < min_window_seconds:
+        return _idle_result(
+            available=False, threshold_pct=util_pct, window=window,
+            rate_cents=rate_cents,
+            reason=(f"ran for under {round(min_window_seconds / 60)} minutes, "
+                    "which is mostly boot; too short to judge"))
+
+    start, end = _parse(window["start_iso"]), _parse(window["end_iso"])
+    points: list[tuple[datetime, float | None]] = []
+    for sample in samples:
+        at = _parse(sample.get("at"))
+        if at is None or at < start or at > end:
+            continue
+        raw = sample.get("util_pct_mean")
+        try:
+            # None stays None: "this sample did not report utilization" is
+            # not "the GPUs were doing nothing". A float() of it would be
+            # the exact old-sidecar bug this whole column exists to avoid.
+            points.append((at, None if raw is None else float(raw)))
+        except (TypeError, ValueError):
+            points.append((at, None))
+    points.sort(key=lambda point: point[0])
+
+    idle = busy = 0.0
+    for index, (at, mean_util) in enumerate(points):
+        horizon = points[index + 1][0] if index + 1 < len(points) else end
+        span = min(sample_interval_seconds,
+                   max(0.0, (horizon - at).total_seconds()))
+        if mean_util is None:
+            continue                      # unreported: leave the span unknown
+        if mean_util <= util_pct:
+            idle += span
+        else:
+            busy += span
+
+    if idle + busy <= 0:
+        return _idle_result(
+            available=True, measured=False, threshold_pct=util_pct,
+            window=window, rate_cents=rate_cents, sample_count=len(points),
+            unknown_seconds=window["seconds"],
+            reason=("no GPU utilization was recorded for this instance, so "
+                    "its idle spend is not measured"))
+
+    return _idle_result(
+        available=True, measured=True, threshold_pct=util_pct, window=window,
+        rate_cents=rate_cents, sample_count=len(points),
+        idle_seconds=idle, busy_seconds=busy,
+        unknown_seconds=max(0.0, window["seconds"] - idle - busy),
+        reason=(f"at or below {util_pct:g}% mean GPU utilization, measured "
+                f"across {len(points)} samples"))
 
 
 def _cost_rows(rows: list[dict], *, now_iso: str,

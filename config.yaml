@@ -72,6 +72,23 @@ idle:
   timeout_seconds: 1800
   poll_seconds: 15
 
+  # The max-lifetime ceiling (opt-in, per launch; unset = no ceiling, and
+  # that is the default). Unlike the idle timeout it is measured from the
+  # moment the provider ACCEPTS the launch and nothing running on the box can
+  # push it out - not a served model, not a busy terminal, not a restart.
+  #
+  # The floor is not the idle floor: the clock starts BEFORE boot, and boot
+  # is 15-40 minutes on a multi-GPU instance, so a short ceiling would
+  # destroy an expensive box the moment it became usable. Left unset it is
+  # computed as launch.boot_timeout_seconds + idle.timeout_seconds (4200s).
+  # A request under the floor is REJECTED, never quietly raised.
+  # max_lifetime_min_seconds: 4200
+  max_lifetime_max_seconds: 2592000     # 30 days
+  # How long before the ceiling you get one heads-up. A fixed lead, not a
+  # percentage: 90% of 30 days is three days of nagging, 90% of 70 minutes is
+  # seven minutes of notice. Suppressed when the ceiling is under 2x this.
+  ceiling_warning_seconds: 600
+
 autopilot:
   # Agent runs: a model (GPU-served, local, or frontier API) drives
   # Manifold's guarded operations. Every launch/terminate still passes the
@@ -114,6 +131,7 @@ preferences:
     run_finished: true       # an autopilot run ended
     data_transferred: true   # files were rescued off an instance
     capacity_available: true # a capacity watch found its GPU
+    instance_idle: true      # a running instance is billing while barely used
     # Also raise a real OS notification (macOS Notification Center,
     # notify-send on Linux) so it reaches you outside the window. In-app
     # notifications are recorded either way.
@@ -186,6 +204,25 @@ telemetry:
   # and right-size hint on the History page. Advisory only; reads the
   # sidecar over the existing managed connection, never the launch path.
   sample_seconds: 30
+
+idle_spend:
+  # Report-only accounting: how much of an instance's bill ran with its GPUs
+  # essentially unused. It never terminates anything and never blocks
+  # anything. Low utilization is not proof that nothing is happening - a
+  # memory-bound job and a served model between requests both look idle - so
+  # this is a number to look at, not a verdict.
+  #
+  # A sample counts as idle when the MEAN utilization across the box's GPUs
+  # is at or below this. The mean, not the busiest card: on an 8-GPU box the
+  # max would let one busy GPU hide seven idle ones.
+  util_pct: 5
+  # Instances shorter than this are not judged at all (boot plus noise).
+  min_window_seconds: 600
+  # The "this instance is idle" notification fires once per instance, and
+  # only when BOTH are met: idle this long, and this much money in idle
+  # spend. Set notify_usd higher if you would rather hear about it later.
+  notify_after_seconds: 1800
+  notify_usd: 1.0
 
 auto_manage:
   # How often the auto-manage lifecycle loop advances a queued-then-launch job

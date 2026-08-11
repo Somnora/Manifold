@@ -100,6 +100,39 @@ def test_utilization_no_hint_when_card_well_used(client):
     assert "smaller" not in u["hint"].lower()
 
 
+def test_utilization_reports_idle_spend_beside_the_hint(client):
+    """Both numbers on one response, reading DIFFERENT columns on purpose:
+    the hint keys on the per-sample max, idle spend on the per-sample mean.
+    The 45-minute seeded launch was idle for 30 of them."""
+    db = client.app.state.orchestrator.db
+    lid = _seed_launch(db, "i-idle")
+    started = datetime(2026, 7, 11, 20, 0, tzinfo=timezone.utc)
+    for i in range(60):                       # 30 min of samples, 30s apart
+        db.record_telemetry_sample(
+            "i-idle", gpu_name="A10", vram_used_mib=6000,
+            vram_total_mib=24564, util_pct=99, util_pct_mean=1.0, gpu_count=8,
+            at=(started + timedelta(seconds=30 * i)).isoformat(
+                timespec="seconds"))
+
+    idle = client.get(f"/launches/{lid}/utilization").json()["idle_spend"]
+    assert idle["measured"] is True
+    assert idle["idle_seconds"] == 1800
+    assert idle["idle_usd"] == 0.65           # 30 min at $1.29/hr
+    # The 15 minutes nobody sampled stay unknown, never idle.
+    assert idle["unknown_seconds"] == 900
+    assert idle["window_end_basis"] == "terminated_at"
+
+
+def test_utilization_idle_spend_unmeasured_without_telemetry(client):
+    """No samples is "not measured", never "$0.00 of idle spend"."""
+    db = client.app.state.orchestrator.db
+    lid = _seed_launch(db, "i-nosamples")
+    idle = client.get(f"/launches/{lid}/utilization").json()["idle_spend"]
+    assert idle["measured"] is False
+    assert idle["idle_seconds"] is None and idle["idle_usd"] is None
+    assert idle["unknown_seconds"] == 2700
+
+
 def test_utilization_unavailable_without_telemetry(client):
     db = client.app.state.orchestrator.db
     lid = _seed_launch(db, "i-quiet")   # no samples recorded

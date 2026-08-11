@@ -100,6 +100,29 @@ class NotificationCenter:
             logger.exception("failed to record notification %s", kind)
             return None
 
+    def notify_once(self, kind: str, title: str, body: str = "",
+                    ref: str | None = None) -> str | None:
+        """notify(), but only the first time for this (kind, ref).
+
+        For notifications that describe a CONDITION rather than an event: an
+        idle instance is still idle on the next tick, and a caller that just
+        calls notify() every tick turns the bell into noise. Returns None
+        when the ping was already sent (or the kind is switched off).
+
+        `ref` is required - without one there is nothing to dedupe on, and
+        silently degrading to notify() would ship the every-tick bug the
+        method exists to prevent.
+        """
+        if not ref:
+            raise ValueError("notify_once needs a ref to dedupe on")
+        try:
+            if self._db.notification_exists(kind, ref):
+                return None
+        except Exception:   # noqa: BLE001 - a ping must never break the work
+            logger.exception("failed to check notification history for %s", kind)
+            return None
+        return self.notify(kind, title, body, ref=ref)
+
     def _ping(self, title: str, body: str) -> None:
         """Fire the OS notification off the calling path.
 

@@ -60,6 +60,8 @@ from .orchestrator import (
     TerminationBlocked,
     launch_options,
     launch_progress,
+    max_lifetime_bounds,
+    validate_max_lifetime,
 )
 from .preferences import GATEABLE_ACTIONS, PreferenceStore
 from . import spend
@@ -176,6 +178,10 @@ class LaunchRequest(BaseModel):
     ssh_key_name: str | None = None    # falls back to ssh.key_name in config.yaml
     name: str = Field(default="", max_length=64)
     idle_timeout_seconds: float | None = None
+    # Opt-in hard ceiling on total lifetime, measured from the moment the
+    # provider ACCEPTS the launch (so it includes boot). None = no ceiling,
+    # which is the default and the behaviour every existing client gets.
+    max_lifetime_seconds: float | None = None
     provider: str = 'lambda'
 
 
@@ -193,6 +199,10 @@ class ClusterLaunchRequest(BaseModel):
 class IdleTimeoutRequest(BaseModel):
     idle_timeout_seconds: float | None = None
     provider: str = 'lambda'
+
+
+class MaxLifetimeRequest(BaseModel):
+    max_lifetime_seconds: float | None = None
 
 
 class TaskRequest(BaseModel):
@@ -678,6 +688,13 @@ def create_app(
             "tailscale_available": bool(settings.tailscale_authkey),
             "proxy_protected": bool(settings.proxy_api_key),
             "env_path": str(env_file),
+            # The max-lifetime ceiling's bounds, so the launch form can state
+            # the real minimum instead of letting the user discover it as a
+            # 400. The floor is not arbitrary: the clock starts at launch
+            # acceptance, so it has to cover the boot budget.
+            "max_lifetime_min_seconds": max_lifetime_bounds(settings)[0],
+            "max_lifetime_max_seconds": max_lifetime_bounds(settings)[1],
+            "boot_timeout_seconds": settings.launch.boot_timeout_seconds,
         }
 
     @app.post("/settings/lambda-key")
@@ -922,6 +939,7 @@ def create_app(
             ssh_key_name=req.ssh_key_name,
             name=req.name,
             idle_timeout_seconds=req.idle_timeout_seconds,
+            max_lifetime_seconds=req.max_lifetime_seconds,
         provider=req.provider,
         )
         return {"launch": launch}
@@ -948,6 +966,26 @@ def create_app(
             
         return {"idle_timeout_seconds": value}
 
+    @app.post("/instances/{instance_id}/max-lifetime")
+    async def set_max_lifetime(instance_id: str, req: MaxLifetimeRequest):
+        """Set (or clear) this instance's maximum total lifetime.
+
+        The bound is REJECTED, never silently clamped, and it is the same
+        bound the launch path applies — one definition, in the orchestrator,
+        so the two write paths cannot drift apart and leave a hole.
+        """
+        launch = db.find_launch_by_instance(instance_id)
+        if not launch:
+            raise HTTPException(404, f"No launch found for instance {instance_id}")
+        value = validate_max_lifetime(settings, req.max_lifetime_seconds)
+        db.update_launch(launch["id"], max_lifetime_seconds=value)
+        db.record_audit(
+            "dashboard", "max_lifetime_update",
+            f"{instance_id} max lifetime "
+            + (f"set to {value:.0f}s (from launch acceptance, boot included)"
+               if value is not None else "removed; no ceiling"))
+        return {"max_lifetime_seconds": value}
+
     @app.get("/ssh-keys")
     async def list_ssh_keys():
         keys = await lambda_client.list_ssh_keys()
@@ -967,6 +1005,12 @@ def create_app(
                 dispatcher.idle_status(inst["id"])
                 if inst["connection_state"] == "connected" else None
             )
+            # The max-lifetime ceiling sits on the INSTANCE, deliberately not
+            # inside inst["idle"]: idle is None for a box that is not
+            # connected, and a box that has dropped off SSH while past its
+            # ceiling is precisely the one whose limit the user needs to see.
+            inst.update(dispatcher.ceiling_status(
+                inst["id"], db.find_launch_by_instance(inst["id"])))
         # Agents act on this data: fixture state must be self-identifying
         # (an agent once had to spot a TEST-NET IP to detect mock mode).
         return {"instances": instances, "mock": mock}
@@ -2593,8 +2637,16 @@ def create_app(
 
     @app.get("/launches/{launch_id}/utilization")
     async def launch_utilization(launch_id: str):
-        """Post-run utilization verdict + conservative right-size hint, from
-        telemetry sampled while the instance ran. Advisory only."""
+        """Post-run utilization verdict, conservative right-size hint, and
+        idle-spend accounting, from telemetry sampled while the instance ran.
+
+        Advisory only, in the strong sense: nothing here gates anything. The
+        two numbers deliberately read DIFFERENT columns — the hint keys on
+        peak VRAM and the per-sample utilization MAXIMUM (a max tightens the
+        hint, the safe direction for an OOM), while idle spend keys on the
+        per-sample MEAN across the box's GPUs (a max would let one busy GPU
+        hide seven idle ones). See spend.idle_spend.
+        """
         from datetime import datetime
         from .estimates import utilization_summary
         launch = db.get_launch(launch_id)
@@ -2626,7 +2678,19 @@ def create_app(
             avg_util_pct=summary["avg_util_pct"],
             sample_count=summary["sample_count"],
         )
-        return {"available": summary["sample_count"] > 0, **util.to_dict()}
+        now = utcnow()
+        window = spend.idle_window(launch, now_iso=now)
+        samples = [] if window is None else db.telemetry_samples_between(
+            instance_id, window["start_iso"], window["end_iso"])
+        idle = spend.idle_spend(
+            launch, samples, now_iso=now,
+            util_pct=settings.idle_spend.util_pct,
+            sample_interval_seconds=settings.telemetry.sample_seconds,
+            min_window_seconds=settings.idle_spend.min_window_seconds,
+        )
+        return {"available": summary["sample_count"] > 0,
+                "gpu_count": summary["gpu_count"],
+                "idle_spend": idle, **util.to_dict()}
 
     # -- spend (accounting: what the launches actually cost) -----------------------
     # Thin, like every route here: spend.py owns the whole cost formula, these
@@ -2661,6 +2725,19 @@ def create_app(
         """
         live_ids, listed_providers = orchestrator.last_cloud_snapshot()
         return db.list_launches(), live_ids, listed_providers
+
+    # NO FLEET-WIDE IDLE-SPEND TOTAL HERE, deliberately. Idle spend is
+    # per-launch (`GET /launches/{id}/utilization`) and stays there because
+    # this route is polled and reads exactly ONE query, `db.list_launches()`.
+    # An aggregate would need either (a) one windowed sample load per launch,
+    # turning one query into N, or (b) a GROUP BY over telemetry_samples,
+    # which cannot reproduce the same number: the exact math needs each
+    # sample's NEXT sample (to bound its span) and each launch's own window,
+    # and a count-based approximation would silently convert sampling gaps
+    # into measured time - the precise under-reporting that spend.idle_spend
+    # exists to prevent, in a second implementation of a number spend.py
+    # insists on owning once. A wrong fleet total is worse than no fleet
+    # total. Revisit with a rollup table, not with a clever query.
 
     @app.get("/spend/summary")
     async def spend_summary(tz_offset_minutes: int = 0):

@@ -12,8 +12,10 @@ import time
 import pytest
 
 from app.preferences import (
+    NOTIFICATION_KINDS,
     ApprovalPrefs,
     DataSafetyPrefs,
+    NotificationPrefs,
     Preferences,
     preferences_from_dict,
 )
@@ -37,6 +39,18 @@ def test_default_policy_gates_launches_only():
     assert ApprovalPrefs().gated_actions() == {"launch_gpu"}
     assert ApprovalPrefs().terminate_instance is False
     assert ApprovalPrefs().run_job is False
+
+
+def test_every_notification_kind_has_a_toggle():
+    """A kind listed in NOTIFICATION_KINDS but missing from NotificationPrefs
+    fails wants() and is dropped silently, with no error anywhere - the
+    feature ships dead and nothing says so. This is the test that catches
+    the next kind somebody adds to only one of the two lists."""
+    prefs = NotificationPrefs()
+    missing = [k for k in NOTIFICATION_KINDS if not hasattr(prefs, k)]
+    assert missing == []
+    assert all(prefs.wants(kind) for kind in NOTIFICATION_KINDS)
+    assert prefs.wants("no_such_kind") is False
 
 
 def test_partial_patch_leaves_other_fields_alone():

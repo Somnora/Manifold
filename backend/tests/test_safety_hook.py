@@ -75,6 +75,48 @@ def test_terminate_blocked_when_the_data_cannot_be_saved(
     assert any("left running to protect data" in title for title, _ in os_pings)
 
 
+def test_blocked_termination_notifies_once_until_the_files_change(
+        client, mock_client, mock_sidecar, os_pings):
+    """Phase 76b (F7): a blocked termination is retried forever by the idle
+    loop (~15s) and the auto-manage loop (faster), and every retry used to
+    fire a fresh in-app row AND an OS desktop ping — about four notifications
+    a minute, indefinitely, all saying the same thing.
+
+    One ping per blocked instance until the unsaved file set CHANGES. A
+    changed set is real news ("you saved one of the two"); an identical set
+    is the same block we already reported.
+    """
+    instance_id = launch_and_wait(client)
+    wait_connected(client, instance_id)
+    cannot_rescue(client)
+
+    def blocked_pings():
+        return [t for t, _ in os_pings if "left running to protect data" in t]
+
+    assert client.delete(f"/instances/{instance_id}").status_code == 409
+    assert len(blocked_pings()) == 1
+
+    # Same two files, three more retries: still exactly one ping, and no new
+    # in-app rows either (the row and the ping share one funnel).
+    for _ in range(3):
+        assert client.delete(f"/instances/{instance_id}").status_code == 409
+    assert len(blocked_pings()) == 1
+    rows = [n for n in client.get("/notifications").json()["notifications"]
+            if n["kind"] == "data_transferred" and n["ref"] == instance_id]
+    assert len(rows) == 1
+
+    # The user saves one of the two. The situation changed, so say so.
+    mock_sidecar.unpersisted = mock_sidecar.unpersisted[:1]
+    assert client.delete(f"/instances/{instance_id}").status_code == 409
+    assert len(blocked_pings()) == 2
+    assert "1 file(s) could not be saved" in os_pings[-1][1]
+
+    # ...and the new state then dedupes on its own terms.
+    assert client.delete(f"/instances/{instance_id}").status_code == 409
+    assert len(blocked_pings()) == 2
+    assert mock_client.instances[instance_id].status == "active"
+
+
 def test_if_unsaveable_terminate_chooses_the_wallet(client, mock_client):
     """The opposite policy: stop the billing, lose the files, say so."""
     instance_id = launch_and_wait(client)

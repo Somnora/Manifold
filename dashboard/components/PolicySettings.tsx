@@ -204,6 +204,8 @@ export function PolicySettings() {
               ["run_finished", "An Autopilot run ends", ""],
               ["data_transferred", "Files are saved off an instance", "Or could not be saved, which is the one you want to hear about."],
               ["capacity_available", "A capacity watch finds its GPU", "Without auto-launch, this notification IS the watch."],
+              ["instance_idle", "An instance is billing while idle", "Once per instance, with what the idle time has cost so far. It never terminates anything."],
+              ["instance_ceiling", "An instance is near, or past, its max lifetime", "The heads-up before Manifold terminates on a lifetime ceiling, and the cases where it hit the ceiling and deliberately did not destroy the box."],
             ] as [NotificationKind, string, string][]
           ).map(([kind, label, hint]) => (
             <Toggle

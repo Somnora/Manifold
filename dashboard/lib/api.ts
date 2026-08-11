@@ -120,6 +120,15 @@ export type Instance = {
     timeout_seconds: number;
     keep_alive: boolean;
   } | null;
+  // The max-lifetime ceiling. Deliberately NOT inside `idle`, which is null
+  // whenever the instance is not connected — a box that has dropped off SSH
+  // past its ceiling is exactly the one whose limit needs showing.
+  // All three are null when no ceiling is set (the default).
+  max_lifetime_seconds: number | null;
+  ceiling_seconds_remaining: number | null;
+  // Why the ceiling fired without terminating: a running batch job, an
+  // auto-managed teardown, or an unreachable instance.
+  ceiling_deferred_by: string | null;
 };
 
 export type Launch = {
@@ -163,6 +172,9 @@ export type LaunchRequest = {
   ssh_key_name?: string;
   name?: string;
   idle_timeout_seconds?: number;
+  // Hard ceiling on total lifetime, from launch acceptance (boot included).
+  // Omit for no ceiling, which is the default.
+  max_lifetime_seconds?: number;
 };
 
 export type TemplateParameter = {
@@ -357,7 +369,9 @@ export type NotificationKind =
   | "job_failed"
   | "run_finished"
   | "data_transferred"
-  | "capacity_available";
+  | "capacity_available"
+  | "instance_idle"
+  | "instance_ceiling";
 
 export type Preferences = {
   approvals: Record<GateableAction, boolean>;
@@ -512,6 +526,15 @@ export const api = {
       body: JSON.stringify({ idle_timeout_seconds: timeoutSeconds }),
     }),
 
+  // Null clears the ceiling. The backend REJECTS a value below its minimum
+  // rather than clamping it, so surface the error text rather than assuming
+  // the request took.
+  setMaxLifetime: (instanceId: string, maxLifetimeSeconds: number | null) =>
+    request<{ max_lifetime_seconds: number | null }>(`/instances/${instanceId}/max-lifetime`, {
+      method: "POST",
+      body: JSON.stringify({ max_lifetime_seconds: maxLifetimeSeconds }),
+    }),
+
   diagnoseSidecar: (instanceId: string) =>
     request<SidecarDiagnosis>(`/instances/${instanceId}/sidecar/diagnose`),
 
@@ -591,6 +614,11 @@ export const api = {
       gcp_configured: boolean;
       tailscale_available: boolean;
       env_path: string;
+      // Bounds for the max-lifetime ceiling, so the launch form can state
+      // the real minimum instead of letting the user discover it as a 400.
+      max_lifetime_min_seconds: number;
+      max_lifetime_max_seconds: number;
+      boot_timeout_seconds: number;
     }>("/settings/status"),
 
   setLambdaKey: (apiKey: string) =>

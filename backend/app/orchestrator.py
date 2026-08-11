@@ -196,6 +196,57 @@ def launch_progress(launch: dict, boot_timeout_seconds: float,
     return enriched
 
 
+def max_lifetime_bounds(settings) -> tuple[float, float]:
+    """The (minimum, maximum) a max_lifetime_seconds may take.
+
+    ONE definition, used by every write path (the launch request and the
+    per-instance route), because a bound that two call sites compute
+    separately is a bound with a hole in it.
+
+    The minimum defaults to the boot budget plus one idle timeout rather than
+    reusing idle.timeout_min_seconds. `launched_at` — the ceiling's anchor —
+    is stamped when the provider ACCEPTS the launch, before the box boots,
+    and a big multi-GPU instance takes 15-40 minutes to come up. A 30-minute
+    ceiling would therefore destroy an 8xH100 the moment it first connected,
+    after the user had already paid for the entire boot.
+    """
+    configured = settings.idle.max_lifetime_min_seconds
+    if configured is None:
+        configured = (settings.launch.boot_timeout_seconds
+                      + settings.idle.timeout_seconds)
+    return float(configured), float(settings.idle.max_lifetime_max_seconds)
+
+
+def validate_max_lifetime(settings, value: float | None) -> float | None:
+    """Check a requested ceiling, or raise LaunchRejected explaining why not.
+
+    REJECTS rather than clamps. Silently doubling a number the user typed
+    into a control that destroys instances is its own kind of lie: they would
+    believe the box dies at 30 minutes and find it alive at 70. The message
+    names the boot budget, because that is the part nobody expects.
+    """
+    if value is None:
+        return None
+    minimum, maximum = max_lifetime_bounds(settings)
+    if value < minimum:
+        raise LaunchRejected(
+            400,
+            f"max_lifetime_seconds must be at least {minimum:.0f}s "
+            f"({minimum / 3600:.1f}h). The clock starts when the provider "
+            f"ACCEPTS the launch, before the instance boots, and boot alone "
+            f"is budgeted at {settings.launch.boot_timeout_seconds:.0f}s "
+            f"(15-40 minutes on a multi-GPU box). A shorter ceiling would "
+            f"terminate the instance about as soon as it became usable.",
+        )
+    if value > maximum:
+        raise LaunchRejected(
+            400,
+            f"max_lifetime_seconds must be at most {maximum:.0f}s "
+            f"({maximum / 86400:.0f} days).",
+        )
+    return float(value)
+
+
 def launch_options(
     instance_types: dict[str, InstanceTypeInfo],
     filesystems: list[FilesystemInfo],
@@ -324,6 +375,14 @@ class Orchestrator:
         # cost model reads as "trust the row" rather than "it all stopped".
         self._live_ids: set[str] | None = None
         self._listed_providers: set[str] | None = None
+        # Blocked-termination notification dedupe (Phase 76b, F7).
+        # instance id -> the unsaved file set we last pinged about. A blocked
+        # termination is RETRIED forever by two loops (the idle loop every
+        # ~15s, the auto-manage loop faster), and each retry re-entered
+        # _notify_blocked: ~4 desktop pings a minute, indefinitely, saying the
+        # same thing. One ping per instance until the unsaved set CHANGES —
+        # a changed set is genuinely new information ("you saved 3 of 5").
+        self._blocked_notified: dict[str, frozenset[str]] = {}
         # TOFU host-key pins live next to the database (both are local state).
         self.host_keys = HostKeyStore(
             str(Path(settings.db_path).with_name("host_keys.json"))
@@ -341,6 +400,7 @@ class Orchestrator:
         ssh_key_name: str | None = None,
         name: str = "",
         idle_timeout_seconds: float | None = None,
+        max_lifetime_seconds: float | None = None,
         provider: str = 'lambda',
     ) -> dict:
         """Validate and admit a launch; returns the persisted launch row.
@@ -372,6 +432,12 @@ class Orchestrator:
                     f"requested {idle_timeout_seconds}s clamped to {clamped}s"
                 )
                 idle_timeout_seconds = clamped
+
+        # The ceiling REJECTS out-of-range values instead of clamping them:
+        # see validate_max_lifetime. Checked before anything is created, so a
+        # bad number costs nothing.
+        max_lifetime_seconds = validate_max_lifetime(
+            self.settings, max_lifetime_seconds)
 
         # Filesystem is OPTIONAL (Phase 39): "" launches a scratch-only
         # instance in any region, including ones where the user has no
@@ -446,6 +512,7 @@ class Orchestrator:
             connection_mode=mode,
             hourly_rate_cents=price,
             idle_timeout_seconds=idle_timeout_seconds,
+            max_lifetime_seconds=max_lifetime_seconds,
             provider=provider,
         )
         plan = LaunchPlan(
@@ -893,12 +960,30 @@ class Orchestrator:
                 launch["id"], status="terminated", terminated_at=utcnow()
             )
         remove_ssh_config_block(instance_id)
+        # The box is gone: forget its blocked-notification state so a future
+        # instance id collision (or a re-adopted box) can ping again.
+        self._blocked_notified.pop(instance_id, None)
         return {"instance_id": instance_id, "terminated": True,
                 "rescue": report}
+
+    @staticmethod
+    def _unsaved_key(report: dict) -> frozenset[str]:
+        """Identity of an unsaved file set, for notification dedupe.
+
+        Paths only: sizes and error strings jitter between rescue attempts
+        (a partial download, a different sidecar error) and would make an
+        unchanged situation look new on every retry.
+        """
+        return frozenset(
+            str(f.get("path", f)) for f in report.get("unsaved", []))
 
     def _notify_blocked(self, instance_id: str, report: dict) -> None:
         if self.notifier is None:
             return
+        key = self._unsaved_key(report)
+        if self._blocked_notified.get(instance_id) == key:
+            return              # same files, same block: already told them
+        self._blocked_notified[instance_id] = key
         unsaved = report.get("unsaved", [])
         self.notifier.notify(
             "data_transferred",

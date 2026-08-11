@@ -27,6 +27,7 @@ import asyncio
 import logging
 import shlex
 import time
+from datetime import datetime, timezone
 
 from .config import Settings
 from .connections import ConnectionState, ManagedConnection
@@ -304,6 +305,21 @@ class Dispatcher:
         # Task ids the user asked to stop: their completion is labeled
         # "cancelled by user" instead of a raw container exit code.
         self._cancel_requested: set[str] = set()
+        # F7b: blocked-termination retry backoff, instance id ->
+        # (next attempt at, last delay). See _terminate_for.
+        self._blocked_retry: dict[str, tuple[float, float]] = {}
+        # Max-lifetime ceiling bookkeeping (Phase 76b), all in memory on
+        # purpose. The idle loop runs every 15s, so an audit row or a
+        # notification per pass would be 5,760 rows a day per instance: a
+        # flood that buries the rows that matter. Losing this state on a
+        # restart costs at most one repeated note.
+        #   _ceiling_notes    instance id -> the audit note we last recorded
+        #   _ceiling_pings    instance id -> the notification we last sent
+        #   _ceiling_deferred instance id -> why the ceiling did NOT fire
+        #                     (read straight back out by ceiling_status)
+        self._ceiling_notes: dict[str, str] = {}
+        self._ceiling_pings: dict[str, str] = {}
+        self._ceiling_deferred: dict[str, str] = {}
 
     # -- lifecycle ---------------------------------------------------------------
 
@@ -468,10 +484,15 @@ class Dispatcher:
         launch = self.db.find_launch_by_instance(instance_id)
         if launch:
             self.db.update_launch(launch["id"], keep_alive=1 if enabled else 0)
-        self.db.record_audit(
-            "dashboard", "keep_alive",
-            f"{instance_id} idle auto-termination {'off' if enabled else 'on'}",
-        )
+        # Keep-alive stops the IDLE clock only. Saying "idle auto-termination
+        # off" was true until this instance could also carry a max-lifetime
+        # ceiling, which keep-alive does not touch — an audit line that
+        # over-promises about a destructive control is worse than none.
+        detail = f"{instance_id} idle auto-termination {'off' if enabled else 'on'}"
+        if enabled and launch and launch.get("max_lifetime_seconds") is not None:
+            detail += (f" (its {float(launch['max_lifetime_seconds']):.0f}s "
+                       f"max-lifetime ceiling still applies)")
+        self.db.record_audit("dashboard", "keep_alive", detail)
         return {"instance_id": instance_id, "keep_alive": enabled}
 
     def _protect_external_instances(self) -> None:
@@ -507,13 +528,45 @@ class Dispatcher:
 
     def idle_status(self, instance_id: str) -> dict:
         """Idle countdown info for the instance card. idle_seconds counts
-        from the last job/terminal activity (0 if none recorded yet)."""
+        from the last job/terminal activity (0 if none recorded yet).
+
+        Deliberately NOT where the ceiling countdown lives: the instances
+        route sets inst["idle"] to None for a box that is not connected, and
+        an unreachable box past its ceiling is exactly the one whose limit
+        the user most needs to see. See ceiling_status.
+        """
         last = self.last_activity.get(instance_id)
         idle = max(0.0, self._clock() - last) if last is not None else 0.0
         return {
             "idle_seconds": round(idle),
             "timeout_seconds": round(self._effective_timeout(instance_id)),
             "keep_alive": self.keep_alive_enabled(instance_id),
+        }
+
+    def ceiling_status(self, instance_id: str,
+                       launch: dict | None = None) -> dict:
+        """Max-lifetime fields for the instance card.
+
+        `launch` is passed in by callers that already loaded the row, so the
+        card costs no extra query at a 2s poll x N instances. All three
+        fields are None when no ceiling is set, which is the default.
+        """
+        if launch is None:
+            launch = self.db.find_launch_by_instance(instance_id)
+        limit = launch.get("max_lifetime_seconds") if launch else None
+        if limit is None:
+            return {"max_lifetime_seconds": None,
+                    "ceiling_seconds_remaining": None,
+                    "ceiling_deferred_by": None}
+        age = self._launch_age_seconds(launch)
+        return {
+            "max_lifetime_seconds": float(limit),
+            # None, not 0: an unparsable or missing launched_at means we do
+            # not know how old this box is, and a confident "0 seconds left"
+            # would be a fabricated countdown on a destructive control.
+            "ceiling_seconds_remaining": (
+                None if age is None else round(float(limit) - age)),
+            "ceiling_deferred_by": self._ceiling_deferred.get(instance_id),
         }
 
     # -- model readiness ---------------------------------------------------------------
@@ -1060,12 +1113,26 @@ class Dispatcher:
                 logger.exception("idle loop iteration failed")
 
     async def _check_idle(self) -> None:
-        """Terminate instances idle past the timeout, via the STANDARD flow.
+        """Terminate instances past a limit, via the STANDARD flow.
 
-        Idle = connected, no running task, and no activity (job or terminal)
-        for idle.timeout_seconds. The clock starts when the connection comes
-        up (we seed last_activity then), so a freshly booted instance gets a
-        full quiet period before it is eligible.
+        Two independent verdicts, in this order:
+
+        CEILING (opt-in, off by default). The launch's max_lifetime_seconds
+        measured from launched_at: a wall-clock bound that no session,
+        terminal, output stream, or backend restart can push out. It is the
+        backstop for "I forgot it was running", so it overrides keep-alive
+        and it fires THROUGH a served model — a vllm-serve task never leaves
+        'running', so a ceiling that deferred to it would be permanently
+        unreachable on the most expensive workload Manifold runs.
+
+        IDLE (on by default, unchanged). Connected, no running task of any
+        kind, no activity (job or terminal) for idle.timeout_seconds. The
+        clock starts when the connection comes up, so a freshly booted
+        instance gets a full quiet period before it is eligible.
+
+        The two use DIFFERENT protection sets on purpose: the idle verdict
+        still protects every auto-managed and every pinned instance exactly
+        as it always has. Only the ceiling narrows them.
         """
         now = self._clock()
         # Instances an auto-managed job owns are governed by that job's
@@ -1074,50 +1141,305 @@ class Dispatcher:
         # lifecycle is ever lost (its job reached a terminal state), the
         # instance drops out of this set and the idle loop resumes as backstop.
         auto_owned = self.db.auto_managed_instance_ids()
+        running = self.db.running_tasks()
         # A running task pins ITS OWN instance only (Phase 35): with several
         # GPUs up, a job on box A must not keep an idle box B billing.
-        pinned = {t["instance_id"] for t in self.db.running_tasks()
-                  if t.get("instance_id")}
+        pinned = {t["instance_id"] for t in running if t.get("instance_id")}
+        # The ceiling defers to a BATCH job only. A batch job has a 90% — a
+        # fine-tune destroyed at 90% is the failure this project refuses to
+        # cause. A server daemon has no 90%: it streams until something stops
+        # it, so deferring to one would make the ceiling a feature that never
+        # does anything, which is worse than not shipping it.
+        pinned_batch = {t["instance_id"] for t in running
+                        if t.get("instance_id")
+                        and not self._is_server(t["template"])}
         for instance_id, conn in list(self.orchestrator.connections.items()):
-            if instance_id in auto_owned or instance_id in pinned:
-                continue
-            if conn.state != ConnectionState.CONNECTED:
-                # Not reachable: don't count unreachable time as idle.
-                self.last_activity.pop(instance_id, None)
-                continue
-            if self.keep_alive_enabled(instance_id):
-                continue
-            timeout = self._effective_timeout(instance_id)
-            last = self.last_activity.setdefault(instance_id, now)
-            if now - last < timeout:
-                continue
-            logger.info("instance %s idle for %.0fs; requesting termination",
-                        instance_id, now - last)
-            self.db.record_audit(
-                "backend", "idle_termination",
-                f"{instance_id} idle {now - last:.0f}s (limit {timeout:.0f}s)",
-            )
+            # One poison instance must not disable termination for every box
+            # behind it in this iteration. Only TerminationBlocked used to be
+            # caught, so a ProviderError out of terminate() escaped to the
+            # loop's blanket handler and abandoned the rest of the sweep —
+            # every cycle, silently, for as long as the bad box stayed up.
             try:
-                # force=False: terminate() rescues the instance's data first
-                # (sync to the persistent volume and/or download here, per the
-                # data-safety policy) and only refuses if something could NOT
-                # be saved. No sync-then-force dance here any more — that lived
-                # in this loop when terminate() did not rescue, and it meant
-                # every OTHER caller had to reimplement it.
-                await self.orchestrator.terminate(instance_id, force=False)
-                self.last_activity.pop(instance_id, None)
-            except TerminationBlocked as exc:
-                # The rescue could not save everything. Leave the box up with
-                # the data intact rather than destroying it; the orchestrator
-                # has already pinged the user. Retried next cycle.
-                logger.warning(
-                    "idle termination of %s refused: %d file(s) unsaveable",
-                    instance_id, len(exc.files))
-                self.db.record_audit(
-                    "backend", "idle_termination_blocked",
-                    f"{instance_id}: {len(exc.files)} file(s) could not be "
-                    f"saved; instance left running",
-                )
+                connected = conn.state == ConnectionState.CONNECTED
+                launch = self.db.find_launch_by_instance(instance_id)
+                over = self._ceiling_breach(launch)
+
+                if over is not None:
+                    # -- ceiling verdict. At most ONE terminate per instance
+                    # per pass: two independent blocks would let the same box
+                    # be terminated twice, and the second call re-enters
+                    # rescue() against an already-popped connection, gets an
+                    # empty report back, and fires a second provider destroy.
+                    if not connected:
+                        # We cannot rescue what we cannot reach: rescue()
+                        # returns an empty report over a dead connection, so
+                        # terminating here would destroy data behind a rescue
+                        # that did nothing. The box outlives its ceiling; the
+                        # user is told, not left to discover the bill.
+                        self._note_ceiling_unreachable(instance_id)
+                        self.last_activity.pop(instance_id, None)
+                    elif instance_id in auto_owned:
+                        self._defer_ceiling_to_auto_managed(
+                            instance_id, auto_owned)
+                    elif instance_id in pinned_batch:
+                        self._note_ceiling_deferred(
+                            instance_id, "batch job running")
+                    else:
+                        self._clear_ceiling_deferral(instance_id)
+                        await self._terminate_for(
+                            instance_id, "ceiling",
+                            f"{over:.0f}s past max_lifetime")
+                    continue
+
+                self._clear_ceiling_deferral(instance_id)
+                self._maybe_warn_ceiling(instance_id, launch)
+
+                # -- idle verdict: the ladder exactly as it has always run,
+                # against the FULL auto_owned and pinned sets. A served model
+                # is still protected from IDLE termination.
+                if instance_id in auto_owned or instance_id in pinned:
+                    continue
+                if not connected:
+                    # Not reachable: don't count unreachable time as idle.
+                    self.last_activity.pop(instance_id, None)
+                    continue
+                if self.keep_alive_enabled(instance_id):
+                    continue
+                timeout = self._effective_timeout(instance_id)
+                last = self.last_activity.setdefault(instance_id, now)
+                if now - last < timeout:
+                    continue
+                await self._terminate_for(
+                    instance_id, "idle",
+                    f"idle {now - last:.0f}s (limit {timeout:.0f}s)")
+            except Exception:   # noqa: BLE001 - see the comment above
+                logger.exception("idle check failed for %s", instance_id)
+                continue
+
+    # -- the ceiling ---------------------------------------------------------------
+
+    @staticmethod
+    def _launch_age_seconds(launch: dict | None) -> float | None:
+        """Wall-clock seconds since the provider ACCEPTED this launch.
+
+        None (never an exception) when there is no row, no launched_at, or an
+        unparsable one: an unreadable anchor must be a no-op, not a crash and
+        certainly not a termination.
+        """
+        stamp = (launch or {}).get("launched_at")
+        if not stamp:
+            return None
+        try:
+            started = datetime.fromisoformat(str(stamp))
+        except (TypeError, ValueError):
+            return None
+        if started.tzinfo is None:
+            started = started.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - started).total_seconds()
+
+    def _ceiling_breach(self, launch: dict | None) -> float | None:
+        """Seconds this launch is PAST its max lifetime, or None.
+
+        WALL clock, never self._clock(). _clock defaults to time.monotonic,
+        and launched_at is a UTC ISO timestamp in SQLite: subtracting one
+        from the other yields a number with no meaning whatsoever, and that
+        number decides whether a paid instance is destroyed. Wall clock is
+        also the only anchor that survives a backend restart, which is the
+        entire reason the ceiling lives in the database.
+        """
+        if not launch:
+            return None
+        limit = launch.get("max_lifetime_seconds")
+        if limit is None:
+            return None                       # the default: no ceiling at all
+        age = self._launch_age_seconds(launch)
+        if age is None:
+            return None
+        over = age - float(limit)
+        return over if over >= 0 else None
+
+    def _auto_owned_active(self, auto_owned: set[str]) -> set[str]:
+        """Auto-managed instances whose job is still doing something.
+
+        Excludes 'terminating'. A blocked auto-managed teardown parks in that
+        state and retries forever, so treating it as "the lifecycle has this
+        covered" would make the ceiling unreachable in the one state where
+        money burns without bound. v1 auto-manage is sequential: at most one
+        job is in flight, which is the same assumption _auto_manage_once
+        makes.
+        """
+        job = self.db.active_auto_managed_task()
+        if job is None or job.get("lifecycle") != "terminating":
+            return set(auto_owned)
+        stuck = self._job_instance_id(job)
+        return {i for i in auto_owned if i != stuck}
+
+    def _defer_ceiling_to_auto_managed(self, instance_id: str,
+                                       auto_owned: set[str]) -> None:
+        """The ceiling fired on a box an auto-managed job owns.
+
+        Either way we issue no terminate of our own — the job's lifecycle is
+        the only thing allowed to tear its own instance down, and racing it
+        double-rescues and double-destroys. What differs is how loud we are:
+        a live job will finish and clean up, while one parked in 'terminating'
+        is blocked on files nobody has saved and will sit there billing until
+        a human acts.
+        """
+        if instance_id in self._auto_owned_active(auto_owned):
+            self._note_ceiling_deferred(
+                instance_id, "auto-managed job owns teardown")
+            return
+        self._note_ceiling_deferred(
+            instance_id, "auto-managed teardown blocked on unsaved files")
+        detail = ""
+        job = self.db.active_auto_managed_task()
+        if job is not None:
+            detail = job.get("lifecycle_detail") or ""
+        self._notify_ceiling_once(
+            instance_id, "blocked-teardown",
+            f"Instance {instance_id[:12]} is past its max lifetime",
+            (f"Its auto-managed job is trying to shut it down and cannot: "
+             f"{detail or 'files on it could not be saved'}. "
+             f"Manifold will not force a destroy. Save or discard those "
+             f"files from the instance card and the teardown completes on "
+             f"its own — until then the GPU is still billing."))
+
+    def _clear_ceiling_deferral(self, instance_id: str) -> None:
+        """Forget any recorded deferral for this instance.
+
+        Called on every pass where the ceiling is not deferring, which is what
+        makes the card's ceiling_deferred_by honest the moment the blocking
+        job finishes — and what re-arms the audit note if it comes back.
+        """
+        self._ceiling_deferred.pop(instance_id, None)
+        self._ceiling_notes.pop(instance_id, None)
+
+    def _note_ceiling_deferred(self, instance_id: str, why: str) -> None:
+        """Record (once) that the ceiling fired and we did NOT terminate."""
+        self._ceiling_deferred[instance_id] = why
+        if self._ceiling_notes.get(instance_id) == why:
+            return                      # already recorded; do not re-flood
+        self._ceiling_notes[instance_id] = why
+        self.db.record_audit(
+            "backend", "ceiling_deferred",
+            f"{instance_id} is past its max lifetime but {why}; "
+            f"not terminating")
+
+    def _note_ceiling_unreachable(self, instance_id: str) -> None:
+        """Past its ceiling and off SSH: state the limit, do not hide it."""
+        self._ceiling_deferred[instance_id] = "instance unreachable"
+        if self._ceiling_notes.get(instance_id) != "unreachable":
+            self._ceiling_notes[instance_id] = "unreachable"
+            self.db.record_audit(
+                "backend", "ceiling_unreachable",
+                f"{instance_id} is past its max lifetime but is not "
+                f"reachable over SSH; its files cannot be saved, so it was "
+                f"NOT terminated")
+        self._notify_ceiling_once(
+            instance_id, "unreachable",
+            f"Instance {instance_id[:12]} is past its max lifetime and "
+            f"unreachable",
+            "Manifold only terminates a box it can reach and save the files "
+            "off first, so this one is still billing. Check your cloud "
+            "console.")
+
+    def _maybe_warn_ceiling(self, instance_id: str,
+                            launch: dict | None) -> None:
+        """One heads-up per instance, on a FIXED lead before the ceiling.
+
+        Fixed, not a percentage: 90% of a 30-day ceiling is three days of
+        nagging, and 90% of a 70-minute one is seven minutes of notice. A
+        ceiling shorter than twice the lead gets no warning at all, because
+        that warning would land at (or before) launch and mean nothing.
+        """
+        limit = (launch or {}).get("max_lifetime_seconds")
+        if limit is None:
+            return
+        lead = self.settings.idle.ceiling_warning_seconds
+        if lead <= 0 or float(limit) < 2 * lead:
+            return
+        age = self._launch_age_seconds(launch)
+        if age is None:
+            return
+        remaining = float(limit) - age
+        if remaining > lead:
+            return
+        self._notify_ceiling_once(
+            instance_id, "warning",
+            f"Instance {instance_id[:12]} hits its max lifetime in "
+            f"{remaining / 60:.0f} min",
+            (f"It has been running for {age / 3600:.1f}h against a "
+             f"{float(limit) / 3600:.1f}h limit. Manifold will terminate it "
+             f"then — if it can reach it and save its files first. Raise the "
+             f"limit from the instance card if you still need the box."))
+
+    def _notify_ceiling_once(self, instance_id: str, key: str, title: str,
+                             body: str) -> None:
+        """One ceiling ping per (instance, kind of news). In memory: the idle
+        loop runs every 15s and this is a bell, not a log."""
+        if self.notifier is None:
+            return
+        if self._ceiling_pings.get(instance_id) == key:
+            return
+        self._ceiling_pings[instance_id] = key
+        self.notifier.notify("instance_ceiling", title, body, ref=instance_id)
+
+    # F7b: a blocked termination is retried by this loop forever, and every
+    # retry re-runs the FULL rescue (sidecar walk, whole-scratch rsync,
+    # per-file SSH downloads) against files that have not moved. At the 15s
+    # idle poll that is four full rescues a minute, indefinitely. Back off
+    # per instance instead: 15s -> 30s -> 60s -> ... -> 15 minutes.
+    BLOCKED_RETRY_BASE_SECONDS = 15.0
+    BLOCKED_RETRY_MAX_SECONDS = 900.0
+
+    async def _terminate_for(self, instance_id: str, kind: str,
+                             detail: str) -> None:
+        """The single destructive call in this loop. `force=True` is the
+        user's explicit "burn it" (CLAUDE.md); no unattended loop may issue
+        it. If you are adding a `force` parameter here, you are adding an
+        automatic destroy path — that needs its own phase and its own gate.
+
+        force=False means terminate() rescues the instance's data first (sync
+        to the persistent volume and/or download here, per the data-safety
+        policy) and refuses only if something could NOT be saved. No
+        sync-then-force dance lives here: that belonged to this loop back when
+        terminate() did not rescue, and it meant every OTHER caller had to
+        reimplement the same dance.
+
+        `kind` names the verdict that sent us here ("idle", "ceiling"). It is
+        the audit action's prefix and nothing more — it never reaches
+        terminate() and never changes what is destroyed or how.
+        """
+        retry_at, last_delay = self._blocked_retry.get(instance_id, (0.0, 0.0))
+        if self._clock() < retry_at:
+            return                          # still backing off from a block
+        logger.info("instance %s: %s termination requested (%s)",
+                    instance_id, kind, detail)
+        self.db.record_audit("backend", f"{kind}_termination",
+                             f"{instance_id} {detail}")
+        try:
+            await self.orchestrator.terminate(instance_id, force=False)
+            self._blocked_retry.pop(instance_id, None)
+        except TerminationBlocked as exc:
+            # The rescue could not save everything. Leave the box up with the
+            # data intact rather than destroying it; the orchestrator has
+            # already pinged the user (once, until the file set changes).
+            delay = min(self.BLOCKED_RETRY_MAX_SECONDS,
+                        max(self.BLOCKED_RETRY_BASE_SECONDS, last_delay * 2))
+            self._blocked_retry[instance_id] = (self._clock() + delay, delay)
+            logger.warning(
+                "%s termination of %s refused: %d file(s) unsaveable; "
+                "retrying in %.0fs", kind, instance_id, len(exc.files), delay)
+            self.db.record_audit(
+                "backend", f"{kind}_termination_blocked",
+                f"{instance_id}: {len(exc.files)} file(s) could not be "
+                f"saved; instance left running",
+            )
+        # Both outcomes settle this instance's idle clock: on success the box
+        # is gone (a stale clock would be reported for a dead instance); on a
+        # block the countdown has already fired and re-arming it would hide
+        # the fact that this box is over its limit and still billing.
+        self.last_activity.pop(instance_id, None)
 
     # -- auto-manage lifecycle loop -----------------------------------------------------
 
@@ -1484,6 +1806,30 @@ class Dispatcher:
             except Exception:
                 logger.exception("telemetry loop iteration failed")
 
+    @staticmethod
+    def _reported(gpus: list[dict], key: str) -> list[float]:
+        """Every GPU's value for `key`, skipping the ones that did not
+        report it.
+
+        ABSENT IS NOT ZERO, and that is why this exists rather than an inline
+        `.get(key, 0)`. A sidecar is frozen into an instance at launch, so a
+        box running since before a field existed simply omits it; defaulting
+        that to 0 would record "the GPUs were doing nothing" for a box we
+        know nothing about, and idle-spend accounting would then bill its
+        whole lifetime as idle. An empty list becomes a NULL column, which
+        every reader treats as "not measured".
+        """
+        out = []
+        for gpu in gpus:
+            raw = gpu.get(key)
+            if raw is None:
+                continue
+            try:
+                out.append(float(raw))
+            except (TypeError, ValueError):
+                continue
+        return out
+
     async def _sample_telemetry_once(self) -> None:
         for instance_id, conn in list(self.orchestrator.connections.items()):
             if conn.state != ConnectionState.CONNECTED:
@@ -1507,14 +1853,97 @@ class Dispatcher:
                 gpus = (payload or {}).get("gpus")
             if not gpus:
                 continue
-            g = gpus[0]
+
+            # ONE ROW PER BOX, NOT PER CARD. This used to record gpus[0] and
+            # nothing else, which made peak VRAM a GPU-0 figure on a
+            # multi-GPU instance - so a run that filled GPU 3 looked like it
+            # had room to spare, and the right-size hint could tell you to
+            # downsize into an OOM. MAX across the cards is the OOM-relevant
+            # number and tightens the hint, which is the safe direction.
+            used = self._reported(gpus, "vram_used_mib")
+            total = self._reported(gpus, "vram_total_mib")
+            util = self._reported(gpus, "utilization_pct")
             self.db.record_telemetry_sample(
                 instance_id,
-                gpu_name=g.get("name", ""),
-                vram_used_mib=int(g.get("vram_used_mib", 0)),
-                vram_total_mib=int(g.get("vram_total_mib", 0)),
-                util_pct=int(g.get("utilization_pct", 0)),
+                gpu_name=gpus[0].get("name", ""),
+                vram_used_mib=int(max(used)) if used else None,
+                vram_total_mib=int(max(total)) if total else None,
+                util_pct=int(max(util)) if util else None,
+                # The mean is what idle-spend accounting reads: with the max,
+                # one busy GPU out of eight would hide seven idle ones and
+                # idle spend would be under-reported. See spend.idle_spend.
+                util_pct_mean=(sum(util) / len(util)) if util else None,
+                gpu_count=len(gpus),
             )
+            self._maybe_notify_idle(instance_id)
+
+    def _maybe_notify_idle(self, instance_id: str) -> None:
+        """Ping ONCE when an instance has been idle long enough to matter, in
+        money. Never raises, and never terminates anything.
+
+        This is the point of idle-spend accounting: an instance nobody
+        noticed is exactly the one still billing. It reports and stops there
+        - the phase rule is that GPU utilization may report but must never
+        gate a destructive decision, so this raises a notification and leaves
+        the decision with the person reading it.
+
+        Deduped on (kind, ref) in the notifications table rather than in
+        memory, so neither the next telemetry tick nor a backend restart can
+        re-ping a condition you have already seen.
+        """
+        if self.notifier is None:
+            return
+        # Imported here rather than at module scope: this is the only use of
+        # the accounting module in the dispatcher, and a report-only helper
+        # has no business appearing among the dispatch path's dependencies.
+        from . import spend
+        try:
+            # notify_once() would catch this anyway; checking first is what
+            # keeps an already-pinged instance from re-loading its whole
+            # sample window on every tick for the rest of its life.
+            if self.db.notification_exists("instance_idle",
+                                           f"idle:{instance_id}"):
+                return
+            policy = self.settings.idle_spend
+            launch = self.db.find_launch_by_instance(instance_id)
+            if launch is None:
+                return
+            now = utcnow()
+            window = spend.idle_window(launch, now_iso=now)
+            if window is None:
+                return
+            report = spend.idle_spend(
+                launch,
+                self.db.telemetry_samples_between(
+                    instance_id, window["start_iso"], window["end_iso"]),
+                now_iso=now, util_pct=policy.util_pct,
+                sample_interval_seconds=self.settings.telemetry.sample_seconds,
+                min_window_seconds=policy.min_window_seconds,
+            )
+            idle_seconds, idle_usd = report["idle_seconds"], report["idle_usd"]
+            # BOTH gates, and an unknown cost fails them: "idle for a while,
+            # value unknown" is not worth interrupting someone for, and the
+            # message would have no number in it.
+            if idle_seconds is None or idle_usd is None:
+                return
+            if (idle_seconds < policy.notify_after_seconds
+                    or idle_usd < policy.notify_usd):
+                return
+            gpu = (launch.get("launched_type") or launch.get("requested_type")
+                   or "This instance")
+            self.notifier.notify_once(
+                "instance_idle",
+                f"{gpu} has been idle for {round(idle_seconds / 60)} minutes",
+                f"It has stayed at or below {policy.util_pct:g}% average GPU "
+                f"utilization for {round(idle_seconds / 60)} minutes, which "
+                f"is ${idle_usd:.2f} of idle spend so far. That can be "
+                f"normal for a served model between requests. If it is not, "
+                f"give it work or terminate it.",
+                ref=f"idle:{instance_id}",
+            )
+        except Exception:   # noqa: BLE001 - reporting must never break sampling
+            logger.exception("idle-spend notification check failed for %s",
+                             instance_id)
 
     # -- adoption sweep ----------------------------------------------------------------
 

@@ -16,6 +16,8 @@ const TONE: Record<NotificationKind, string> = {
   run_finished: "text-sky-400",
   data_transferred: "text-teal-400",
   capacity_available: "text-emerald-400",
+  instance_idle: "text-amber-400",
+  instance_ceiling: "text-orange-400",
 };
 
 const LABEL: Record<NotificationKind, string> = {
@@ -25,6 +27,8 @@ const LABEL: Record<NotificationKind, string> = {
   run_finished: "autopilot",
   data_transferred: "data",
   capacity_available: "capacity",
+  instance_idle: "idle spend",
+  instance_ceiling: "max lifetime",
 };
 
 export function NotificationBell() {

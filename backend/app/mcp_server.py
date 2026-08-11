@@ -196,6 +196,7 @@ async def launch_gpu(
     filesystem: str,
     connection_mode: str | None = None,
     idle_timeout_seconds: float | None = None,
+    max_lifetime_seconds: float | None = None,
     note: str = "",
 ) -> dict:
     """Launch a GPU instance. Flows through ALL backend guards (budget,
@@ -206,7 +207,15 @@ async def launch_gpu(
     Call list_launch_options FIRST and pass one of its targets: it returns
     only {type, region, filesystem} combinations that have capacity right now
     and are co-located with your data, which avoids a blind region guess that
-    fails on capacity or a region-filesystem mismatch."""
+    fails on capacity or a region-filesystem mismatch.
+
+    `max_lifetime_seconds` is an optional hard ceiling on the instance's TOTAL
+    lifetime, timed from the moment the provider accepts the launch, so it
+    includes boot (15-40 minutes on a big box) — the backend rejects a value
+    that does not cover the boot budget rather than quietly raising it. Unlike
+    the idle timeout, nothing on the instance can push it out, and it applies
+    even to a box serving a model. Manifold terminates at the ceiling if it
+    can reach the instance and save its files first."""
     body = {
         "instance_type": instance_type,
         "region": region,
@@ -216,6 +225,8 @@ async def launch_gpu(
         body["connection_mode"] = connection_mode
     if idle_timeout_seconds is not None:
         body["idle_timeout_seconds"] = idle_timeout_seconds
+    if max_lifetime_seconds is not None:
+        body["max_lifetime_seconds"] = max_lifetime_seconds
     return await _call(
         "launch_gpu", "POST", "/instances",
         note=note, args=body, body=body,

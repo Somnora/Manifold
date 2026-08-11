@@ -148,9 +148,18 @@ def test_instances_expose_idle_countdown(idle_app):
                     if i["id"] == instance_id)
         idle = inst["idle"]
         assert idle is not None
+        # Phase 76b added the max-lifetime ceiling and deliberately did NOT
+        # put it in here. `idle` is null whenever the instance is not
+        # connected, and a box that has dropped off SSH past its ceiling is
+        # exactly the one whose limit the user needs to see — so the ceiling
+        # fields live on the INSTANCE, asserted just below. This exact-set
+        # assertion is what keeps them from drifting back inside.
         assert set(idle) == {"idle_seconds", "timeout_seconds", "keep_alive"}
         assert idle["keep_alive"] is False
         assert idle["idle_seconds"] >= 0
+        assert inst["max_lifetime_seconds"] is None      # off by default
+        assert inst["ceiling_seconds_remaining"] is None
+        assert inst["ceiling_deferred_by"] is None
 
 
 # -- db migration -------------------------------------------------------------------
