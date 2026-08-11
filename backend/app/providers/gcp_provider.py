@@ -61,7 +61,8 @@ class MockGCPProvider(GCPProvider):
     async def list_instance_types(self) -> List[CloudInstanceTypeSpec]:
         return list(self._types.values())
 
-    async def list_instances(self) -> List[CloudInstanceInfo]:
+    async def list_instances(self, *, fresh: bool = False) -> List[CloudInstanceInfo]:
+        # No cache here; the mock's dict is always current, so fresh is moot.
         return [i for i in self.instances.values() if i.status != "terminated"]
 
     async def get_instance(self, instance_id: str) -> Optional[CloudInstanceInfo]:
@@ -106,7 +107,9 @@ class RealGCPProvider(GCPProvider):
             return []
         raise NotImplementedError("Real GCP API integration pending credentials")
 
-    async def list_instances(self) -> List[CloudInstanceInfo]:
+    async def list_instances(self, *, fresh: bool = False) -> List[CloudInstanceInfo]:
+        # GCP fetches live data on every call; fresh is accepted for the
+        # CloudProvider contract and ignored.
         if not self.project_id:
             return []
         raise NotImplementedError("Real GCP API integration pending credentials")

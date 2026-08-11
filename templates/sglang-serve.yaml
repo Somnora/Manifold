@@ -9,8 +9,7 @@ description: Serve a model with SGLang (OpenAI-compatible API on a loopback port
 image: lmsysorg/sglang:latest
 
 command: >
-  python3 -c '
-  import os, sys
+  python3 -c 'import os, sys
 
   (model_id, max_context, port, tensor_parallel,
    lora_paths, mem_fraction_static, enable_lora, max_loras, max_lora_rank) = sys.argv[1:10]
@@ -28,8 +27,6 @@ command: >
       cmd.extend(["--mem-fraction-static", str(mem_fraction_static).strip()])
 
   if str(enable_lora).lower() in ("true", "1", "yes"):
-      # Some versions of SGLang use --enable-lora, but it's safe to pass if explicitly asked
-      # We also pass max_loras and max_lora_rank for dynamic loading
       cmd.append("--enable-lora")
       if max_loras and str(max_loras).isdigit() and int(max_loras) > 0:
           cmd.extend(["--max-loras", str(max_loras)])
@@ -42,7 +39,10 @@ command: >
           if path.strip():
               cmd.append(path.strip())
 
-  print(f"manifold: launching sglang -> {\" \".join(cmd)}", flush=True)
+  joined = " ".join(cmd)
+
+  print(f"manifold: launching sglang -> {joined}", flush=True)
+
   os.execvp(cmd[0], cmd)
   ' manifold {{model_id}} {{max_context}} {{port}} {{tensor_parallel}} {{lora_paths}} {{mem_fraction_static}} {{enable_lora}} {{max_loras}} {{max_lora_rank}}
 
@@ -110,4 +110,3 @@ gpu:
     - gpu_1x_a10
     - gpu_1x_h100_pcie
     - gpu_1x_h100_sxm5
-

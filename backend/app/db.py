@@ -125,7 +125,7 @@ CREATE TABLE IF NOT EXISTS clusters (
     id                  TEXT PRIMARY KEY,
     name                TEXT NOT NULL,
     created_at          TEXT NOT NULL,
-    status              TEXT NOT NULL,   -- provisioning|active|degraded|terminated
+    status              TEXT NOT NULL,   -- provisioning|active|degraded|failed|terminated
     gpu_type            TEXT NOT NULL,
     region              TEXT NOT NULL,
     filesystem          TEXT NOT NULL,
@@ -372,6 +372,38 @@ class Database:
             "SELECT * FROM launches ORDER BY created_at DESC"
         ).fetchall()
         return [dict(r) for r in rows]
+
+    def pending_launch_count(self) -> int:
+        """How MANY launches are admitted but not yet visible on the cloud.
+
+        The concurrency guard adds these to the cloud's running count:
+        cluster nodes launch in detached tasks, so without this N sibling
+        launches admitted in the same window would each see the same
+        baseline and all pass a 1-instance limit. Rows that already have a
+        lambda_instance_id are cloud-visible and counted there instead —
+        the two sets never overlap."""
+        row = self._execute(
+            """SELECT COUNT(*) AS n FROM launches
+                WHERE status IN ('launching', 'retrying')
+                  AND lambda_instance_id IS NULL""",
+        ).fetchone()
+        return row["n"] or 0
+
+    def pending_launch_spend_cents(self) -> int:
+        """The hourly SPEND of those same admitted-but-not-yet-visible
+        launches. The budget guard adds this to the cloud's running spend,
+        exactly parallel to pending_launch_count on the concurrency axis:
+        without it, two quick launches both see the same spend baseline and
+        both admit, blowing past the budget. create_launch stamps the
+        requested rate on the 'launching' row, so pending rows carry a
+        price; and since they have no lambda_instance_id they are not
+        cloud-visible, so this never double-counts with `running`."""
+        row = self._execute(
+            """SELECT COALESCE(SUM(hourly_rate_cents), 0) AS c FROM launches
+                WHERE status IN ('launching', 'retrying')
+                  AND lambda_instance_id IS NULL""",
+        ).fetchone()
+        return row["c"] or 0
 
     # -- cost/utilization intelligence (read-only; off the launch path) --------
 

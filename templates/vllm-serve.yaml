@@ -7,8 +7,7 @@ description: Serve a model with vLLM (OpenAI-compatible API on a loopback port).
 image: vllm/vllm-openai:latest
 
 command: >
-  python3 -c '
-  import os, sys, subprocess
+  python3 -c 'import os, sys, subprocess
 
   (model_id, max_context, port, tensor_parallel, tool_call_parser,
    enable_lora, max_loras, max_cpu_loras, lora_modules, max_lora_rank,
@@ -41,7 +40,10 @@ command: >
       if num_speculative_tokens and str(num_speculative_tokens).isdigit():
           cmd.extend(["--num-speculative-tokens", str(num_speculative_tokens)])
 
-  print(f"manifold: launching vllm -> {\" \".join(cmd)}", flush=True)
+  joined = " ".join(cmd)
+
+  print(f"manifold: launching vllm -> {joined}", flush=True)
+
   os.execvp(cmd[0], cmd)
   ' manifold {{model_id}} {{max_context}} {{port}} {{tensor_parallel}} {{tool_call_parser}} {{enable_lora}} {{max_loras}} {{max_cpu_loras}} {{lora_modules}} {{max_lora_rank}} {{speculative_model}} {{num_speculative_tokens}}
 
@@ -122,4 +124,3 @@ gpu:
     - gpu_1x_a10
     - gpu_1x_h100_pcie
     - gpu_1x_h100_sxm5
-

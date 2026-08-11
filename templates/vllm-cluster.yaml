@@ -1,15 +1,24 @@
-# Multi-node vLLM distributed inference across an elastic GPU cluster.
+# Serve very large models with vLLM tensor/pipeline parallelism on a single
+# multi-GPU instance (OpenAI-compatible API).
+# Loopback-safe: no host networking; the API port is bound to 127.0.0.1 on the
+# instance by the dispatcher, reachable through the backend's SSH port forward
+# (same pattern as vllm-serve).
+# Multi-node distribution (head_ip + Ray) needs inter-node comms over the
+# managed tunnel, which is not wired yet: a non-empty head_ip exits with a
+# clear error instead of silently opening the network (phase 2 work).
 name: vllm-cluster
-description: Serve ultra-large models across multiple GPU cluster instances using vLLM + Ray distributed pipeline/tensor parallelism.
+description: Serve ultra-large models with vLLM tensor/pipeline parallelism on a single multi-GPU instance (OpenAI-compatible API on a loopback port). Multi-node distribution is not yet supported.
 image: vllm/vllm-openai:latest
-network: host
 
 command: >
-  python3 -c '
-  import os, sys, subprocess
+  python3 -c 'import os, sys
 
   (model_id, head_ip, ray_port, port, tensor_parallel, pipeline_parallel,
    max_context, tool_call_parser) = sys.argv[1:9]
+
+  if head_ip and head_ip.strip():
+      print("manifold error: multi-node vLLM distribution is not yet supported; leave head_ip empty to serve on this single node", file=sys.stderr)
+      sys.exit(1)
 
   cmd = [
       "vllm", "serve", model_id,
@@ -21,10 +30,10 @@ command: >
       "--enable-auto-tool-choice",
   ]
 
-  if head_ip and head_ip.strip():
-      cmd.extend(["--ray-address", f"{head_ip}:{ray_port}"])
+  joined = " ".join(cmd)
 
-  print(f"manifold: launching distributed vllm -> {\" \".join(cmd)}", flush=True)
+  print(f"manifold: launching vllm -> {joined}", flush=True)
+
   os.execvp(cmd[0], cmd)
   ' manifold {{model_id}} {{head_ip}} {{ray_port}} {{port}} {{tensor_parallel}} {{pipeline_parallel}} {{max_context}} {{tool_call_parser}}
 
@@ -35,23 +44,23 @@ parameters:
   - name: head_ip
     type: string
     default: ""
-    description: Ray head node IP for multi-node distribution. Leave empty if running on single multi-GPU node.
+    description: Reserved for multi-node distribution (not yet supported). Leave empty to serve on a single multi-GPU node.
   - name: ray_port
     type: integer
     default: 6379
-    description: Ray GCS port on head node.
+    description: Reserved for multi-node distribution (not yet supported). Unused while head_ip is empty.
   - name: port
     type: integer
     default: 8080
-    description: HTTP API server port.
+    description: Container port for the API server (loopback-only on the host).
   - name: tensor_parallel
     type: integer
     default: 8
-    description: Tensor parallel degree (GPUs per node).
+    description: Tensor parallel degree (shard across this many GPUs on the node).
   - name: pipeline_parallel
     type: integer
-    default: 2
-    description: Pipeline parallel degree (number of nodes).
+    default: 1
+    description: Pipeline parallel degree. Keep tensor_parallel x pipeline_parallel within the GPUs on this node.
   - name: max_context
     type: integer
     default: 16384
@@ -67,3 +76,12 @@ volumes:
   - host: "{persistent}/models"
     container: /data/models
     read_only: true
+
+ports:
+  # Bound to 127.0.0.1 on the instance by the dispatcher; reach it through
+  # the backend's SSH port forward.
+  - host: 8080
+    container: 8080
+
+env:
+  VLLM_NO_USAGE_STATS: "1"

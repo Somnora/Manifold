@@ -26,6 +26,12 @@ export function ClusterPanel() {
   const [launching, setLaunching] = useState(false);
   const [formErr, setFormErr] = useState("");
   const [termBusy, setTermBusy] = useState<string | null>(null);
+  // Set when termination was REFUSED: a node's data-rescue could not save
+  // every file, so the cluster kept running. Holds the per-node reasons.
+  const [termBlocked, setTermBlocked] = useState<{
+    clusterId: string;
+    errors: string[];
+  } | null>(null);
 
   useEffect(() => {
     api.instanceTypes().then(setTypes).catch(() => {});
@@ -60,11 +66,29 @@ export function ClusterPanel() {
     }
   }
 
-  async function handleTerminate(clusterId: string) {
-    if (!confirm("Are you sure you want to terminate this cluster? All nodes will be safely stopped.")) return;
+  // Termination saves each node's scratch files first (per the data-safety
+  // policy), then stops the billing. It only refuses if a file could NOT be
+  // saved — and then it says which node and why. force=true is the explicit
+  // "lose the files" override, only offered after a blocked rescue.
+  async function handleTerminate(clusterId: string, force = false) {
+    const retrying = termBlocked?.clusterId === clusterId;
+    if (!force && !retrying && !confirm(
+      "Terminate this cluster? Each node's unsaved files are rescued first; termination stops if a file can't be saved.",
+    )) return;
     setTermBusy(clusterId);
     try {
-      await api.terminateCluster(clusterId, true);
+      const res = await api.terminateCluster(clusterId, force);
+      if (res.terminated) {
+        setTermBlocked(null);
+      } else {
+        const errors = res.reports
+          .filter((r) => r.error)
+          .map((r) => `${r.instance_id ?? "node"}: ${r.error}`);
+        setTermBlocked({
+          clusterId,
+          errors: errors.length ? errors : ["A node could not be terminated safely."],
+        });
+      }
       refresh();
     } catch (err) {
       alert(err instanceof ApiError ? err.message : String(err));
@@ -205,6 +229,50 @@ export function ClusterPanel() {
                   </div>
                 </div>
               </div>
+
+              {/* Blocked termination: the data-rescue refused, so nothing was
+                  destroyed. Same language as InstanceCard's blocked panel. */}
+              {termBlocked?.clusterId === c.id && (
+                <div className="mt-4 rounded-lg border border-amber-800/60 bg-amber-950/40 p-3">
+                  <p className="text-sm font-medium text-amber-300">
+                    Kept running: some files could not be saved
+                  </p>
+                  <p className="mt-1 text-xs text-amber-400/80">
+                    Manifold tried to save each node&apos;s scratch files before
+                    shutting the cluster down and could not. It is still billing,
+                    because losing these files is permanent and an extra billing
+                    hour is not.
+                  </p>
+                  <ul className="mt-2 max-h-40 overflow-y-auto font-mono text-xs text-amber-300/90 space-y-0.5">
+                    {termBlocked.errors.map((e) => (
+                      <li key={e}>{e}</li>
+                    ))}
+                  </ul>
+                  <div className="mt-3 flex flex-wrap gap-2">
+                    <button
+                      onClick={() => handleTerminate(c.id)}
+                      disabled={termBusy === c.id}
+                      className="rounded bg-zinc-100 px-3 py-1 text-xs font-medium text-zinc-900 hover:bg-white disabled:opacity-50 transition-colors"
+                    >
+                      {termBusy === c.id ? "Saving..." : "Try saving them again, then terminate"}
+                    </button>
+                    <button
+                      onClick={() => handleTerminate(c.id, true)}
+                      disabled={termBusy === c.id}
+                      className="rounded border border-red-900/50 bg-red-950/40 px-3 py-1 text-xs font-medium text-red-400 hover:bg-red-900/60 disabled:opacity-50 transition-colors"
+                    >
+                      Terminate anyway (lose unsaved files)
+                    </button>
+                    <button
+                      onClick={() => setTermBlocked(null)}
+                      disabled={termBusy === c.id}
+                      className="rounded border border-zinc-700/60 px-3 py-1 text-xs text-zinc-300 hover:bg-zinc-800/50 disabled:opacity-50 transition-colors"
+                    >
+                      Keep running
+                    </button>
+                  </div>
+                </div>
+              )}
 
               {/* Node Details Expansion - Sleek Tree Topology */}
               <AnimatePresence>

@@ -1,14 +1,26 @@
-# Multi-node DeepSpeed ZeRO-3 / FSDP distributed model fine-tuning across GPU cluster nodes.
+# DeepSpeed ZeRO-3 / FSDP fine-tuning via torchrun + Axolotl on a single
+# multi-GPU instance.
+# Loopback-safe: no host networking; the torchrun rendezvous stays on
+# 127.0.0.1 inside the container, so nothing here can listen on a public
+# interface (hard rule).
+# Multi-node training (nnodes > 1) needs a master reachable across nodes over
+# the managed tunnel, which is not wired yet: nnodes other than 1 exits with a
+# clear error instead of silently opening the network (phase 2 work).
 name: deepspeed-cluster
-description: Multi-node distributed training and fine-tuning across GPU cluster instances using torchrun / DeepSpeed.
-image: winglian/axolotl:main-py3.11-cu124-20241010
-network: host
+description: DeepSpeed ZeRO-3 / FSDP fine-tuning with torchrun and Axolotl on a single multi-GPU instance. Multi-node training is not yet supported.
+# Pinned py3.12 Axolotl build, verified on Docker Hub. axolotlai is the
+# current official namespace for these images (same family as the old
+# winglian/axolotl pin); cu128 stays close to the previous cu124 driver floor.
+image: axolotlai/axolotl:main-py3.12-cu128-2.10.0
 
 command: >
-  python3 -c '
-  import os, sys, subprocess
+  python3 -c 'import os, sys
 
   (nnodes, node_rank, master_addr, master_port, nproc_per_node, config_path) = sys.argv[1:7]
+
+  if nnodes.strip() != "1":
+      print("manifold error: multi-node DeepSpeed training is not yet supported; set nnodes to 1 for single-node training", file=sys.stderr)
+      sys.exit(1)
 
   cmd = [
       "torchrun",
@@ -21,30 +33,34 @@ command: >
       config_path,
   ]
 
-  print(f"manifold: launching deepspeed cluster rank {node_rank}/{nnodes} -> {\" \".join(cmd)}", flush=True)
+  joined = " ".join(cmd)
+
+  print(f"manifold: launching torchrun training rank {node_rank}/{nnodes} -> {joined}", flush=True)
+
   os.execvp(cmd[0], cmd)
   ' manifold {{nnodes}} {{node_rank}} {{master_addr}} {{master_port}} {{nproc_per_node}} {{config_path}}
 
 parameters:
   - name: nnodes
     type: integer
-    default: 2
-    description: Total number of cluster nodes participating in training.
+    default: 1
+    description: Total number of nodes. Only 1 (single-node) works today; anything else exits with an error until multi-node is wired up.
   - name: node_rank
     type: integer
     default: 0
-    description: Rank of this node (0 for master/head node, 1..N-1 for worker nodes).
+    description: Rank of this node. Must stay 0 until multi-node is supported.
   - name: master_addr
     type: string
-    description: IP address or hostname of node_rank 0 master head node.
+    default: "127.0.0.1"
+    description: Rendezvous address. Loopback for single-node training; reserved for multi-node (not yet supported).
   - name: master_port
     type: integer
     default: 29500
-    description: PyTorch distributed rendezvous port.
+    description: PyTorch distributed rendezvous port (loopback inside the container).
   - name: nproc_per_node
     type: integer
     default: 8
-    description: Number of GPUs per node.
+    description: Number of GPUs on this node.
   - name: config_path
     type: string
     default: /data/config.yaml

@@ -28,6 +28,7 @@ Control flow for a launch:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import uuid
 import re
@@ -402,44 +403,13 @@ class Orchestrator:
                 f"Registered keys: {', '.join(registered) or '(none)'}.",
             )
 
-        # Guards run against LIVE state, not our database, so instances
-        # launched outside Manifold still count toward the limits. fresh=True
-        # bypasses the list cache: a spend guard must never pass on a stale
-        # snapshot (two quick launches both seeing "0 running").
-        running = [i for i in await cloud_provider.list_instances() # fresh=True not strictly supported on CloudProvider, but list_instances fetches fresh for GCP
-                   if i.is_running]
-        # The NUMBERS come from Settings when the user set them there
-        # (preferences.guardrails; 0 = unset), falling back to config.yaml.
-        # The guards themselves never move out of this function.
-        prefs_guard = self.prefs.get().guardrails if self.prefs else None
-        limit = (prefs_guard.max_concurrent_instances
-                 if prefs_guard and prefs_guard.max_concurrent_instances > 0
-                 else self.settings.guardrails.max_concurrent_instances)
-        if len(running) + 1 > limit:
-            raise LaunchRejected(
-                409,
-                f"Concurrency guard: {len(running)} instance(s) already "
-                f"running, limit is {limit}. Terminate one first or raise "
-                f"the limit under Settings -> Spending guardrails.",
-                reason_code="concurrency",
-            )
-
-        current_spend = sum(i.hourly_rate_cents for i in running)
-        budget_usd = (prefs_guard.max_hourly_spend_usd
-                      if prefs_guard and prefs_guard.max_hourly_spend_usd > 0
-                      else self.settings.guardrails.max_hourly_spend_usd)
-        budget_cents = round(budget_usd * 100)
         price = types[instance_type].price_cents_per_hour
-        if current_spend + price > budget_cents:
-            raise LaunchRejected(
-                409,
-                f"Budget guard: launching {instance_type} "
-                f"(${price / 100:.2f}/hr) would bring hourly spend to "
-                f"${(current_spend + price) / 100:.2f}, over the "
-                f"${budget_cents / 100:.2f} limit "
-                f"(Settings -> Spending guardrails).",
-                reason_code="budget",
-            )
+        current_spend, budget_cents = await self._guard_capacity(
+            cloud_provider=cloud_provider,
+            instance_type=instance_type,
+            unit_price_cents=price,
+            added_count=1,
+        )
 
         # Fallback types must exist and independently fit the budget;
         # ones that don't are skipped rather than failing the launch.
@@ -472,6 +442,88 @@ class Orchestrator:
         )
         self._launch_tasks[launch_id] = asyncio.create_task(self._run_launch(plan))
         return self.db.get_launch(launch_id)
+
+    async def _guard_capacity(
+        self,
+        *,
+        cloud_provider: CloudProvider,
+        instance_type: str,
+        unit_price_cents: int,
+        added_count: int,
+    ) -> tuple[int, int]:
+        """The concurrency and budget guards, shared by single launches
+        (added_count=1) and whole clusters (added_count=N, judged atomically
+        so N nodes cannot each sneak past a per-node check).
+
+        Guards run against LIVE state, not our database, so instances
+        launched outside Manifold still count toward the limits. fresh=True
+        bypasses the list cache: a spend guard must never pass on a stale
+        snapshot (two quick launches both seeing "0 running"). On top of the
+        live list, BOTH guards fold in launches already ADMITTED but not yet
+        visible on the cloud (pending rows) — each launch runs in a detached
+        task, so without this, siblings admitted in the same window would all
+        see the same baseline: the concurrency guard adds their COUNT, the
+        budget guard adds their hourly SPEND.
+
+        Returns (current_spend_cents, budget_cents) so request_launch can
+        filter fallback types against the same numbers this guard used.
+        Raises LaunchRejected on violation.
+        """
+        running = [i for i in await cloud_provider.list_instances(fresh=True)
+                   if i.is_running]
+        pending = self.db.pending_launch_count()
+        in_flight = len(running) + pending
+        # The NUMBERS come from Settings when the user set them there
+        # (preferences.guardrails; 0 = unset), falling back to config.yaml.
+        # The guards themselves never move out of this function.
+        prefs_guard = self.prefs.get().guardrails if self.prefs else None
+        limit = (prefs_guard.max_concurrent_instances
+                 if prefs_guard and prefs_guard.max_concurrent_instances > 0
+                 else self.settings.guardrails.max_concurrent_instances)
+        if in_flight + added_count > limit:
+            if added_count == 1:
+                detail = (
+                    f"Concurrency guard: {in_flight} instance(s) running or "
+                    f"launching, limit is {limit}. Terminate one first or "
+                    f"raise the limit under Settings -> Spending guardrails."
+                )
+            else:
+                detail = (
+                    f"Concurrency guard: launching {added_count} nodes with "
+                    f"{in_flight} instance(s) running or launching would "
+                    f"exceed the limit of {limit}. Terminate instances first "
+                    f"or raise the limit under Settings -> Spending guardrails."
+                )
+            raise LaunchRejected(409, detail, reason_code="concurrency")
+
+        # Cloud-visible spend PLUS the spend already committed by pending
+        # launches — the budget parallel of the pending count above.
+        current_spend = (sum(i.hourly_rate_cents for i in running)
+                         + self.db.pending_launch_spend_cents())
+        budget_usd = (prefs_guard.max_hourly_spend_usd
+                      if prefs_guard and prefs_guard.max_hourly_spend_usd > 0
+                      else self.settings.guardrails.max_hourly_spend_usd)
+        budget_cents = round(budget_usd * 100)
+        added_cents = added_count * unit_price_cents
+        if current_spend + added_cents > budget_cents:
+            if added_count == 1:
+                detail = (
+                    f"Budget guard: launching {instance_type} "
+                    f"(${added_cents / 100:.2f}/hr) would bring hourly spend to "
+                    f"${(current_spend + added_cents) / 100:.2f}, over the "
+                    f"${budget_cents / 100:.2f} limit "
+                    f"(Settings -> Spending guardrails)."
+                )
+            else:
+                detail = (
+                    f"Budget guard: launching {added_count}x {instance_type} "
+                    f"(${added_cents / 100:.2f}/hr total) would bring hourly "
+                    f"spend to ${(current_spend + added_cents) / 100:.2f}, "
+                    f"over the ${budget_cents / 100:.2f} limit "
+                    f"(Settings -> Spending guardrails)."
+                )
+            raise LaunchRejected(409, detail, reason_code="budget")
+        return current_spend, budget_cents
 
     async def create_filesystem(self, name: str, region: str) -> dict:
         """Create a persistent filesystem through the guarded gateway.
@@ -518,6 +570,32 @@ class Orchestrator:
         """Launch a multi-node GPU cluster with head and worker nodes."""
         if node_count < 1:
             raise LaunchRejected(400, "Cluster must have at least 1 node.")
+        if node_count > 16:
+            raise LaunchRejected(
+                400,
+                f"Cluster of {node_count} nodes refused: the cap is 16 nodes "
+                f"per cluster. Launch a smaller cluster.",
+            )
+
+        # Admit the WHOLE cluster before writing any row. Each node launches
+        # in a detached task, so per-node guards would all see the same
+        # baseline and admit N nodes against a 1-instance limit; guarding
+        # N-at-once here closes that. Rejecting before create_cluster also
+        # means a refused cluster leaves no ghost "provisioning" row behind.
+        cloud_provider = self.providers.get_provider(provider)
+        types = {t.name: t for t in await cloud_provider.list_instance_types()}
+        if instance_type not in types:
+            raise LaunchRejected(
+                400,
+                f"Unknown instance type '{instance_type}'. "
+                f"Valid types: {', '.join(sorted(types))}",
+            )
+        await self._guard_capacity(
+            cloud_provider=cloud_provider,
+            instance_type=instance_type,
+            unit_price_cents=types[instance_type].price_cents_per_hour,
+            added_count=node_count,
+        )
 
         cluster_id = uuid.uuid4().hex[:12]
         cluster_name = name or f"cluster-{cluster_id}"
@@ -532,45 +610,66 @@ class Orchestrator:
             node_count=node_count,
         )
 
-        # 1. Launch head node
-        head_name = f"{cluster_name}-head"
-        head_launch = await self.request_launch(
-            instance_type=instance_type,
-            region=region,
-            filesystem=filesystem,
-            connection_mode=connection_mode,
-            ssh_key_name=ssh_key_name,
-            name=head_name,
-            provider=provider,
-        )
-        self.db.add_cluster_node(
-            cluster_id=cluster_id,
-            instance_id=head_launch["id"],
-            role="head",
-            node_index=0,
-            status=head_launch.get("status", "provisioning"),
-        )
-        self.db.update_cluster_status(cluster_id, "provisioning", head_instance_id=head_launch["id"])
-
-        # 2. Launch worker nodes
-        for i in range(1, node_count):
-            worker_name = f"{cluster_name}-worker-{i}"
-            worker_launch = await self.request_launch(
+        try:
+            # 1. Launch head node
+            head_name = f"{cluster_name}-head"
+            head_launch = await self.request_launch(
                 instance_type=instance_type,
                 region=region,
                 filesystem=filesystem,
                 connection_mode=connection_mode,
                 ssh_key_name=ssh_key_name,
-                name=worker_name,
+                name=head_name,
                 provider=provider,
             )
             self.db.add_cluster_node(
                 cluster_id=cluster_id,
-                instance_id=worker_launch["id"],
-                role="worker",
-                node_index=i,
-                status=worker_launch.get("status", "provisioning"),
+                instance_id=head_launch["id"],
+                role="head",
+                node_index=0,
+                status=head_launch.get("status", "provisioning"),
             )
+            self.db.update_cluster_status(cluster_id, "provisioning", head_instance_id=head_launch["id"])
+
+            # 2. Launch worker nodes
+            for i in range(1, node_count):
+                worker_name = f"{cluster_name}-worker-{i}"
+                worker_launch = await self.request_launch(
+                    instance_type=instance_type,
+                    region=region,
+                    filesystem=filesystem,
+                    connection_mode=connection_mode,
+                    ssh_key_name=ssh_key_name,
+                    name=worker_name,
+                    provider=provider,
+                )
+                self.db.add_cluster_node(
+                    cluster_id=cluster_id,
+                    instance_id=worker_launch["id"],
+                    role="worker",
+                    node_index=i,
+                    status=worker_launch.get("status", "provisioning"),
+                )
+        except Exception:
+            # A node was refused mid-loop (a guard race, validation, or a
+            # provider error). A half cluster is worse than none: tear down
+            # the nodes that did launch, mark the cluster failed, and let
+            # the original error reach the caller.
+            logger.exception(
+                "cluster %s failed mid-launch; rolling back", cluster_id)
+            try:
+                await self.terminate_cluster(cluster_id, force=False)
+            except Exception:
+                logger.exception(
+                    "cluster %s rollback termination failed", cluster_id)
+            try:
+                self.db.update_cluster_status(cluster_id, "failed")
+            except Exception:
+                # A DB error marking the cluster failed must not mask the
+                # real launch exception we are about to re-raise.
+                logger.exception(
+                    "cluster %s could not be marked failed", cluster_id)
+            raise
 
         self.db.record_audit("backend", "cluster_launch", f"Launched cluster {cluster_id} with {node_count} nodes")
         return self.db.get_cluster(cluster_id) or {}
@@ -587,6 +686,20 @@ class Orchestrator:
             if not inst_id:
                 continue
             launch = self.db.get_launch(inst_id)
+            if launch and not launch.get("lambda_instance_id"):
+                # The node was admitted but its detached launch task may
+                # still be running (retrying for capacity). Cancel it FIRST,
+                # or it would go on to create a real billed instance whose
+                # row already says terminated.
+                task = self._launch_tasks.get(inst_id)
+                if task is not None:
+                    task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await task
+                    # The task may have won the race and created the
+                    # instance just before the cancel landed; re-read so a
+                    # real instance goes down the real terminate path below.
+                    launch = self.db.get_launch(inst_id)
             if launch and not launch.get("lambda_instance_id"):
                 self.db.update_launch(inst_id, status="terminated", terminated_at=utcnow())
                 reports.append({"instance_id": inst_id, "terminated": True})
@@ -1049,10 +1162,16 @@ class Orchestrator:
         attempts = 0
         for round_no in range(policy.max_attempts):
             for candidate in plan.types_to_try:
+                # Terminated while we were backing off? terminate_cluster
+                # closes pending rows (and cancels tasks, but a cancel can
+                # lose the race); creating an instance now would bill for a
+                # box whose row already says terminated. Abort cleanly.
+                launch_rec = self.db.get_launch(plan.launch_id)
+                if launch_rec and launch_rec["status"] == "terminated":
+                    return None
                 attempts += 1
                 self.db.update_launch(plan.launch_id, attempts=attempts)
                 try:
-                    launch_rec = self.db.get_launch(plan.launch_id)
                     p_name = launch_rec['provider'] if launch_rec else 'lambda'
                     instance_id = await self.providers.get_provider(p_name).launch_instance(
                         instance_type=candidate,
@@ -1277,6 +1396,19 @@ class Orchestrator:
         """
         resumed = 0
         for launch in self.db.list_launches():
+            if (launch["status"] in ("launching", "retrying")
+                    and launch["id"] not in self._launch_tasks
+                    and not launch.get("lambda_instance_id")):
+                # Its launch task died with the old process before an
+                # instance existed. Close the row: nothing will ever finish
+                # it, and the spend guard counts open pending rows, so a
+                # stale one would wrongly eat a concurrency slot forever.
+                self.db.update_launch(
+                    launch["id"], status="failed",
+                    error="launch was interrupted by a backend restart "
+                          "before an instance was created; relaunch it",
+                )
+                continue
             if launch["status"] != "booting":
                 continue
             if launch["id"] in self._launch_tasks:

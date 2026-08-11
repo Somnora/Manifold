@@ -24,6 +24,8 @@ node_modules/
 .DS_Store
 
 # desktop packaging
+*.dmg
+*.msi
 dashboard/out/
 backend/dist/
 backend/build/

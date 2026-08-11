@@ -55,7 +55,10 @@ class CloudProvider(ABC):
         pass
 
     @abstractmethod
-    async def list_instances(self) -> List[CloudInstanceInfo]:
+    async def list_instances(self, *, fresh: bool = False) -> List[CloudInstanceInfo]:
+        # fresh=True must bypass any client-side cache: spend guards call
+        # this and must never decide on a stale snapshot. Providers that
+        # always fetch live data may simply ignore the flag.
         pass
 
     @abstractmethod

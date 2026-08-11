@@ -561,7 +561,7 @@ export const api = {
     ),
 
   setGcpConfig: (projectId: string, zone: string, credentialsPath: string) =>
-    request<{ saved: boolean }>("/settings/gcp", {
+    request<{ valid: boolean; applied_live: boolean }>("/settings/gcp-config", {
       method: "POST",
       body: JSON.stringify({
         project_id: projectId,
@@ -835,11 +835,15 @@ export const api = {
       body: JSON.stringify(body),
     }),
 
+  // Safe by default: force=false runs the rescue-before-destroy hook on every
+  // node. A blocked rescue comes back as terminated=false with the reason in
+  // that node's report `error` — the cluster keeps running (and billing).
   terminateCluster: (clusterId: string, force = false) =>
-    request<{ cluster_id: string; terminated: boolean }>(
-      `/clusters/${clusterId}/terminate?force=${force}`,
-      { method: "POST" },
-    ),
+    request<{
+      cluster_id: string;
+      terminated: boolean;
+      reports: { instance_id?: string; terminated?: boolean; error?: string }[];
+    }>(`/clusters/${clusterId}/terminate?force=${force}`, { method: "POST" }),
 };
 
 export type ClusterNode = {

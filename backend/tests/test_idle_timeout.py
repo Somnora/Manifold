@@ -1,5 +1,18 @@
 import pytest
 
+from app.config import Guardrails
+from tests.conftest import make_settings
+
+
+@pytest.fixture
+def settings(tmp_path):
+    """This file launches several instances back to back; the honest
+    concurrency guard (which counts admitted-but-pending launches) needs
+    room, or the default 1-instance limit refuses launch #2."""
+    return make_settings(tmp_path, guardrails=Guardrails(
+        max_concurrent_instances=8, max_hourly_spend_usd=50.0))
+
+
 async def test_launch_idle_timeout_clamping(orchestrator):
     # Clamp min
     launch1 = await orchestrator.request_launch(

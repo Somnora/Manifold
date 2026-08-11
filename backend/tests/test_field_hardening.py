@@ -222,6 +222,24 @@ async def test_resume_fails_booting_launch_with_no_instance(tmp_path, db):
     assert db.get_launch(launch_id)["status"] == "failed"
 
 
+async def test_resume_fails_stale_pending_launch(tmp_path, db):
+    """A 'launching' row whose task died with the old process is closed at
+    startup — the spend guard counts open pending rows, so a stale one
+    would wrongly eat a concurrency slot forever."""
+    settings = make_settings(tmp_path)
+    launch_id = db.create_launch(          # rows start as 'launching'
+        requested_type="gpu_1x_a10", region="us-east-1",
+        filesystem="manifold-data", connection_mode="direct-ssh",
+        hourly_rate_cents=129,
+    )
+    assert db.pending_launch_count() == 1
+    orch = Orchestrator(settings, MockLambdaClient(), db,
+                        connect_fn=mock_connect_fn)
+    await orch.resume_pending_launches()
+    assert db.get_launch(launch_id)["status"] == "failed"
+    assert db.pending_launch_count() == 0
+
+
 def test_restart_resumes_mid_boot_over_http(tmp_path, mock_storage, mock_sidecar):
     """End to end: a launch left 'booting' in the DB (as --reload would) is
     carried to active by a fresh app on startup, with an audit trail."""

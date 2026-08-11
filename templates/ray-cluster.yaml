@@ -1,37 +1,38 @@
-# Spawns a Ray cluster node (Head or Worker) for multi-node distributed compute.
+# Start a Ray head node for distributed compute on a single instance.
+# Loopback-safe: no host networking, and the dashboard binds to 127.0.0.1, so
+# nothing here can listen on a public interface (hard rule). Without host
+# networking the GCS and dashboard ports stay container-internal.
+# Multi-node join (role=worker) needs head-IP discovery and inter-node comms
+# over the managed SSH tunnel, which is not wired yet: a worker exits with a
+# clear error instead of silently opening the network (phase 2 work).
 name: ray-cluster
-description: Spawn a Ray cluster node for distributed GPU compute swarms (Ray head or Ray worker).
+description: Start a Ray head node for distributed GPU compute on a single instance. Multi-node worker join is not yet supported.
 image: rayproject/ray:latest-gpu
-network: host
 
 command: >
-  python3 -c '
-  import os, sys, subprocess
+  python3 -c 'import os, sys
 
   role, head_ip, ray_port, dashboard_port, num_gpus = sys.argv[1:6]
 
-  if role.lower() == "head":
-      cmd = [
-          "ray", "start", "--head",
-          f"--port={ray_port}",
-          "--dashboard-host=0.0.0.0",
-          f"--dashboard-port={dashboard_port}",
-          "--block",
-      ]
-  else:
-      if not head_ip or head_ip.strip() in ("", "127.0.0.1", "localhost"):
-          print("manifold error: worker role requires a valid head_ip parameter", file=sys.stderr)
-          sys.exit(1)
-      cmd = [
-          "ray", "start",
-          f"--address={head_ip}:{ray_port}",
-          "--block",
-      ]
+  if role.lower() != "head":
+      print("manifold error: multi-node Ray join (role=worker) is not yet supported; run role=head for a single-node cluster", file=sys.stderr)
+      sys.exit(1)
+
+  cmd = [
+      "ray", "start", "--head",
+      f"--port={ray_port}",
+      "--dashboard-host=127.0.0.1",
+      f"--dashboard-port={dashboard_port}",
+      "--block",
+  ]
 
   if num_gpus and str(num_gpus).isdigit() and int(num_gpus) > 0:
       cmd.append(f"--num-gpus={num_gpus}")
 
-  print(f"manifold: launching ray {role} node -> {\" \".join(cmd)}", flush=True)
+  joined = " ".join(cmd)
+
+  print(f"manifold: launching ray {role} node -> {joined}", flush=True)
+
   os.execvp(cmd[0], cmd)
   ' manifold {{role}} {{head_ip}} {{ray_port}} {{dashboard_port}} {{num_gpus}}
 
@@ -39,19 +40,19 @@ parameters:
   - name: role
     type: string
     default: head
-    description: Role of this Ray node - 'head' for the master coordinator or 'worker' to join an existing cluster.
+    description: Role of this Ray node. Only 'head' (single-node) works today; 'worker' exits with an error until multi-node join is wired up.
   - name: head_ip
     type: string
     default: ""
-    description: IP address of the Ray head node (required when role is 'worker').
+    description: Reserved for multi-node join (not yet supported). Leave empty.
   - name: ray_port
     type: integer
     default: 6379
-    description: Primary GCS port for the Ray cluster head node.
+    description: Ray GCS port. Container-internal; nothing is published on the instance.
   - name: dashboard_port
     type: integer
     default: 8265
-    description: Ray dashboard Web UI port.
+    description: Ray dashboard port, bound to 127.0.0.1 inside the container.
   - name: num_gpus
     type: integer
     default: 8

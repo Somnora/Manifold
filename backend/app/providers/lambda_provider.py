@@ -26,8 +26,8 @@ class LambdaProvider(CloudProvider):
             )
         return specs
 
-    async def list_instances(self) -> List[CloudInstanceInfo]:
-        instances = await self.client.list_instances()
+    async def list_instances(self, *, fresh: bool = False) -> List[CloudInstanceInfo]:
+        instances = await self.client.list_instances(fresh=fresh)
         return [
             CloudInstanceInfo(
                 id=i.id,
