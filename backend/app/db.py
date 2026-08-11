@@ -59,9 +59,19 @@ CREATE TABLE IF NOT EXISTS launches (
     attempts            INTEGER NOT NULL DEFAULT 0,
     error               TEXT,                   -- last error message, for the dashboard
     lambda_instance_id  TEXT,
-    launched_at         TEXT,                   -- when Lambda accepted the launch (billing starts)
+    -- When Lambda ACCEPTED the launch. NOT when billing starts: Lambda bills
+    -- from the moment the instance passes health checks, which is later. So
+    -- this is a deliberate UPPER BOUND on billing start (see spend.py).
+    launched_at         TEXT,
     active_at           TEXT,                   -- when the instance reached "active"
-    terminated_at       TEXT,
+    terminated_at       TEXT,                   -- a stop we OBSERVED
+    -- The last sweep that saw this instance alive on the cloud, and the sweep
+    -- that concluded it was gone without observing the stop. Together they
+    -- bound the cost of a launch nobody watched die (spend.py "unresolved").
+    -- resolved_at is never a substitute for terminated_at: inferring a stop
+    -- time and writing it there would turn a visible unknown into a lie.
+    last_seen_at        TEXT,
+    resolved_at         TEXT,
     keep_alive          INTEGER NOT NULL DEFAULT 0,  -- idle auto-termination switched off
     idle_timeout_seconds REAL
 );
@@ -255,6 +265,12 @@ CREATE TABLE IF NOT EXISTS telemetry_samples (
 );
 CREATE INDEX IF NOT EXISTS idx_telemetry_instance
     ON telemetry_samples(instance_id);
+-- Additional composite for the time-windowed reads (spend/idle history):
+-- the single-column index above still serves "everything for one instance",
+-- this one keeps "one instance, one window" from scanning the whole table
+-- as samples accumulate.
+CREATE INDEX IF NOT EXISTS idx_telemetry_instance_at
+    ON telemetry_samples(instance_id, at);
 """
 
 
@@ -275,6 +291,7 @@ def _interval(start_iso: str | None, end_iso: str | None) -> float | None:
 
 class Database:
     def __init__(self, path: str):
+        self._path = path
         self._conn = sqlite3.connect(path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
@@ -285,6 +302,11 @@ class Database:
                             "INTEGER NOT NULL DEFAULT 0")
         self._ensure_column("launches", "idle_timeout_seconds", "REAL")
         self._ensure_column("launches", "provider", "TEXT NOT NULL DEFAULT 'lambda'")
+        # Phase 76: the two bounds on a launch whose stop was never observed.
+        # Historical rows have neither, which spend.py reads as "unknown" and
+        # caps at the boot timeout rather than letting a cost grow forever.
+        self._ensure_column("launches", "last_seen_at", "TEXT")
+        self._ensure_column("launches", "resolved_at", "TEXT")
         # Auto-manage columns (Phase 24) for databases created earlier.
         self._ensure_column("tasks", "auto_manage",
                             "INTEGER NOT NULL DEFAULT 0")
@@ -305,6 +327,20 @@ class Database:
         # old clients keep working.
         self._ensure_column("agent_runs", "approval_policy", "TEXT")
         self._lock = threading.Lock()
+
+    def open_path(self) -> str:
+        """The file this connection is ACTUALLY writing to.
+
+        Asked of SQLite rather than trusted from a caller's argument, because
+        the mock seeder gates on it before fabricating money and a gate that
+        checks a passed-in string can be handed one that names a different
+        file than the connection is open on. 'main' is the schema a plain
+        connect() opens; '' means there is no file behind it (:memory:).
+        """
+        for _, schema, file in self._execute("PRAGMA database_list").fetchall():
+            if schema == "main":
+                return file or ""
+        return self._path
 
     def _ensure_column(self, table: str, column: str, decl: str) -> None:
         cols = [r[1] for r in self._conn.execute(f"PRAGMA table_info({table})")]
@@ -333,15 +369,29 @@ class Database:
         hourly_rate_cents: int,
         idle_timeout_seconds: float | None = None,
         provider: str = "lambda",
+        launch_id: str | None = None,
+        created_at: str | None = None,
     ) -> str:
-        launch_id = uuid.uuid4().hex[:12]
+        """Insert a launch row and return its id.
+
+        `launch_id` and `created_at` default to a fresh id and the current
+        time, which is what the live launch path wants and what every caller
+        but one passes. The exception is the mock-history seeder, whose rows
+        must carry greppable `seed-` ids and sit at fabricated times inside
+        the demo window. Two optional parameters here are the boring way to
+        give it that; the alternative (the seeder reaching in from outside
+        to rebind this module's `uuid` and `utcnow`) made a fixture's needs
+        into a live writer's hazard.
+        """
+        launch_id = launch_id or uuid.uuid4().hex[:12]
         self._execute(
             """INSERT INTO launches
                (id, provider, created_at, requested_type, region, filesystem,
                 connection_mode, hourly_rate_cents, status, idle_timeout_seconds)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'launching', ?)""",
-            (launch_id, provider, utcnow(), requested_type, region, filesystem,
-             connection_mode, hourly_rate_cents, idle_timeout_seconds),
+            (launch_id, provider, created_at or utcnow(), requested_type,
+             region, filesystem, connection_mode, hourly_rate_cents,
+             idle_timeout_seconds),
         )
         return launch_id
 
@@ -350,7 +400,7 @@ class Database:
             "status", "attempts", "error", "lambda_instance_id",
             "launched_type", "hourly_rate_cents",
             "launched_at", "active_at", "terminated_at", "keep_alive",
-            "idle_timeout_seconds",
+            "idle_timeout_seconds", "last_seen_at", "resolved_at",
         }
         unknown = set(fields) - allowed
         if unknown:
@@ -404,6 +454,23 @@ class Database:
                   AND lambda_instance_id IS NULL""",
         ).fetchone()
         return row["c"] or 0
+
+    def mark_launches_seen(self, instance_ids: list[str]) -> None:
+        """Stamp last_seen_at on the launches behind these live instances.
+
+        Called from the reconcile sweep, which already has the live id list in
+        hand, so this is near-free. Its whole job is to leave evidence: when a
+        launch later turns out to have stopped unobserved, last_seen_at is the
+        only honest LOWER bound on how long it billed (see spend.py). Without
+        it the cheapest defensible answer is "we have no idea"."""
+        if not instance_ids:
+            return
+        placeholders = ", ".join("?" for _ in instance_ids)
+        self._execute(
+            f"""UPDATE launches SET last_seen_at = ?
+                 WHERE lambda_instance_id IN ({placeholders})""",
+            (utcnow(), *instance_ids),
+        )
 
     # -- cost/utilization intelligence (read-only; off the launch path) --------
 

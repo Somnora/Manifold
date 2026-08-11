@@ -316,6 +316,36 @@ async def sync_outputs(instance_id: str, note: str = "") -> dict:
     )
 
 
+@mcp.tool()
+async def get_spend(note: str = "") -> dict:
+    """What Manifold's launches have cost: today, this week, month to date,
+    all time, and the rate money is burning at right now ($/hour).
+
+    Call this BEFORE launching anything expensive. An agent that can start
+    GPUs but cannot see the bill cannot limit itself; this is how you check
+    what the session has already spent, and how you notice a box that is
+    still running.
+
+    Two honest limits on every number here:
+
+    - It is MANIFOLD-OBSERVED. Only launches Manifold itself started are
+      counted. An instance created in the Lambda console, and filesystem
+      storage (billed per GiB for as long as it exists), are not in these
+      figures. `lower_bound` says so in the response.
+    - It is an UPPER BOUND on what it does count: the clock starts when the
+      cloud accepted the launch, while billing really starts a little later,
+      when the instance passes health checks. Over-reporting is the safe
+      direction for a spend guard; `disclaimer` carries the same sentence
+      the dashboard shows.
+
+    Costs that cannot be known are reported as `unresolved` (a low/high
+    range, with launch ids) and `rate_unknown` (a count) — never folded into
+    a total as $0. Report them as unknown too; do not treat them as free.
+    Times are bucketed in UTC. `mock: true` means fixture data, not spend.
+    """
+    return await _call("get_spend", "GET", "/spend/summary", note=note)
+
+
 # -- jobs -----------------------------------------------------------------------
 
 

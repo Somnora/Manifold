@@ -13,6 +13,22 @@ class ProviderError(Exception):
     """
     pass
 
+class ProviderUnavailable(ProviderError):
+    """A provider could not be READ, so its silence proves nothing.
+
+    The distinction this type exists to make: "I listed your account and it
+    is empty" and "I could not list your account" are the same empty list,
+    and code that cannot tell them apart draws the wrong conclusion from the
+    second. The reconcile sweep closes launch rows whose instance is missing
+    from the live listing, so an unavailable provider returning [] would
+    write off every row it owns as gone.
+
+    Read paths that cannot answer raise this instead. Sweeps catch it per
+    provider, log at debug, and mark that provider as NOT listed — its rows
+    are left alone while every other provider still reconciles normally.
+    """
+    pass
+
 class CloudInstanceTypeSpec(BaseModel):
     name: str
     description: str

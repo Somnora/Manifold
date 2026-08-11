@@ -68,8 +68,19 @@ from .model_client import ModelClient, RealModelClient
 from .sidecar_client import RealSidecarClient, SidecarClient, SidecarError
 from .ide_attach import remove_ssh_config_block
 from .providers import ProviderRegistry
+from .providers.base import ProviderUnavailable
 
 logger = logging.getLogger("manifold.orchestrator")
+
+# Statuses that end a boot: keep waiting for one of these is pointless, the
+# launch has failed.
+BOOT_ABORT_STATUSES = ("terminated", "terminating", "preempted", "unhealthy")
+
+# ...and the subset of those that mean the box has actually STOPPED, so the
+# pipeline may record an observed stop time (see _wait_until_active).
+# 'unhealthy' is deliberately absent: an unhealthy instance is still running
+# and still billing, and calling that a stop would under-report the cost.
+OBSERVED_STOP_STATUSES = ("terminated", "terminating", "preempted")
 
 # Sidecar-free GPU sampling (gpu_metrics_via_ssh): one CSV line per GPU.
 NVIDIA_SMI_METRICS = (
@@ -305,6 +316,14 @@ class Orchestrator:
         }
         self.connections: dict[str, ManagedConnection] = {}   # lambda instance id -> conn
         self._launch_tasks: dict[str, asyncio.Task] = {}
+        # Evidence from the last instances_with_state() sweep: which ids the
+        # cloud listed as running, and which providers actually answered.
+        # Kept so read-only consumers (the polled spend routes) can classify
+        # launch rows against the same evidence without firing a cloud call
+        # of their own. None until the first sweep — "no snapshot", which the
+        # cost model reads as "trust the row" rather than "it all stopped".
+        self._live_ids: set[str] | None = None
+        self._listed_providers: set[str] | None = None
         # TOFU host-key pins live next to the database (both are local state).
         self.host_keys = HostKeyStore(
             str(Path(settings.db_path).with_name("host_keys.json"))
@@ -1035,64 +1054,79 @@ class Orchestrator:
                 "rsync_stats": stdout.strip()[:500]}
 
     async def instances_with_state(self) -> list[dict]:
-        """Live Lambda instances joined with connection state + launch info.
+        """Live cloud instances joined with connection state + launch info.
 
-        Also the reconcile point with Lambda's truth: instances that were
+        Also the reconcile point with the cloud's truth: instances that were
         terminated out-of-band (Lambda console, API) are dropped from the
-        view, their SSH supervisors reaped, and their launch rows closed —
+        view, their SSH supervisors reaped, and their launch rows resolved —
         otherwise a ghost card lingers and a supervisor reconnect-loops at
-        a dead host forever."""
+        a dead host forever. See _reconcile_launches for what "resolved"
+        may and may not write."""
         listed = []
-        list_failed = False
+        listed_providers: set[str] = set()
+        unavailable_providers: set[str] = set()
         for name, p in self.providers.items():
             try:
                 listed.extend(await p.list_instances())
+                listed_providers.add(name)
+            except ProviderUnavailable as exc:
+                # The provider could not be READ at all. An empty answer from
+                # it is not evidence of anything, so it stays OUT of
+                # listed_providers and none of its rows are judged this sweep.
+                # It goes into unavailable_providers instead, because a
+                # provider that cannot list also cannot be RUNNING anything
+                # for us: no launch of ours ever reached it. See
+                # _may_conclude for why that difference matters.
+                # Debug, not warning: a not-yet-wired provider is a known
+                # state, and this runs on a poll.
+                unavailable_providers.add(name)
+                logger.debug("instances view: provider %r unavailable: %s",
+                             name, exc)
             except Exception as exc:   # noqa: BLE001 - one bad provider must
                 # never blank the whole view. Skip it, keep the others.
-                list_failed = True
+                # Deliberately NOT unavailable_providers: this provider works
+                # in general and just failed this call, so it may well be
+                # running one of our instances. It has to keep blocking
+                # conclusions.
                 logger.warning(
                     "instances view: skipping provider %r: %s", name, exc)
         gone_statuses = ("terminated", "terminating")
-        live_ids = {i.id for i in listed if i.status not in gone_statuses}
+        live = {i.id: i for i in listed if i.status not in gone_statuses}
+        live_ids = set(live)
+        self._live_ids, self._listed_providers = live_ids, listed_providers
 
-        # Reap connections to instances the cloud no longer runs. Only do this
-        # when EVERY provider listed successfully: an incomplete snapshot (a
-        # provider erroring, or a transient outage) must not reap a healthy
-        # connection just because its instance is missing from a partial list.
-        if not list_failed:
-            for instance_id in list(self.connections):
-                if instance_id in live_ids:
-                    continue
-                conn = self.connections.pop(instance_id)
-                await conn.close()
-                self.host_keys.forget(conn.host)   # IP may be recycled
-                launch = self.db.find_launch_by_instance(instance_id)
-                if launch and launch["status"] not in ("terminated", "failed"):
-                    self.db.update_launch(
-                        launch["id"], status="terminated", terminated_at=utcnow()
-                    )
+        # Evidence first: stamp every live instance's launch row. When one of
+        # them later stops unobserved, last_seen_at is the only honest LOWER
+        # bound on how long it billed (see spend.py "unresolved").
+        self.db.mark_launches_seen(list(live_ids))
+
+        # Reap connections to instances the cloud no longer runs, so a
+        # supervisor stops reconnect-looping at a dead host. Scoped the same
+        # way as the row reconcile: an incomplete snapshot must not reap a
+        # healthy connection just because its instance is missing from a
+        # partial list.
+        for instance_id in list(self.connections):
+            if instance_id in live_ids:
+                continue
+            launch = self.db.find_launch_by_instance(instance_id)
+            if not self._may_conclude(launch, listed_providers,
+                                      unavailable_providers):
+                continue
+            conn = self.connections.pop(instance_id)
+            await conn.close()
+            self.host_keys.forget(conn.host)   # IP may be recycled
+            if launch is None:
+                # An adopted instance has no launch row for the reconcile pass
+                # below to close, so its disappearance would otherwise leave no
+                # trace at all. Rows are audited there, exactly once.
                 self.db.record_audit(
                     "backend", "external_termination_detected",
-                    f"{instance_id} no longer running on Lambda; connection "
-                    f"reaped and history closed",
+                    f"{instance_id} is no longer running; connection reaped "
+                    f"(adopted instance, so there is no launch history to "
+                    f"close)",
                 )
 
-            # History rows still marked active whose instance is gone (e.g. it
-            # was terminated while the backend was down, so there was never a
-            # connection to reap). Close them so cost history stops ticking.
-            for launch in self.db.list_launches():
-                if (launch["status"] == "active"
-                        and launch["lambda_instance_id"]
-                        and launch["lambda_instance_id"] not in live_ids):
-                    self.db.update_launch(
-                        launch["id"], status="terminated", terminated_at=utcnow()
-                    )
-                    self.db.record_audit(
-                        "backend", "external_termination_detected",
-                        f"launch {launch['id']}: instance "
-                        f"{launch['lambda_instance_id']} gone from Lambda; "
-                        f"history closed",
-                    )
+        self._reconcile_launches(live, listed_providers)
 
         result = []
         # User display names overlay Lambda's launch-time names (which
@@ -1119,6 +1153,127 @@ class Orchestrator:
                 "launch_id": launch["id"] if launch else None,
             })
         return result
+
+    def last_cloud_snapshot(self) -> tuple[set[str] | None, set[str] | None]:
+        """What the most recent instances_with_state() sweep saw: the ids the
+        cloud listed as running, and the providers that answered it.
+
+        (None, None) before any sweep has run. Read-only consumers pass these
+        straight to spend.launch_cost, which is written for exactly this
+        evidence: None means "no snapshot, trust the row", and a provider
+        missing from the second set means its rows are not judged at all.
+        Copies, so a caller cannot edit the orchestrator's view of the cloud.
+        """
+        return (None if self._live_ids is None else set(self._live_ids),
+                None if self._listed_providers is None
+                else set(self._listed_providers))
+
+    def _may_conclude(
+        self, launch: dict | None, listed_providers: set[str],
+        unavailable_providers: frozenset[str] | set[str] = frozenset(),
+    ) -> bool:
+        """May this sweep draw conclusions about `launch` from the live list?
+
+        Only if the row's OWN provider answered. A single global "did anything
+        fail" flag is not enough: with two providers registered, GCP answering
+        while Lambda is unreachable would otherwise write off every Lambda row
+        as gone.
+
+        An ADOPTED connection has no launch row, so no known provider, and
+        takes the strict rule: nobody may still owe us an answer. Two ways to
+        not owe one, and conflating them is a bug we have already shipped:
+
+        - the provider LISTED, so its answer is in hand;
+        - the provider is UNAVAILABLE (raised ProviderUnavailable), meaning it
+          cannot be read at all. A provider we cannot read is also a provider
+          we never launched through, so it owns no instances by construction
+          and it has no answer to owe. Treating "unavailable" as "silent" is
+          what made filling in GCP_PROJECT_ID silently disable connection
+          reaping for everything, leaving supervisors reconnect-looping at
+          dead hosts forever.
+
+        Any OTHER failure (a transient outage, a broken client) still blocks:
+        that provider works in general, so it might be running the very
+        instance we are about to write off.
+        """
+        if launch is None:
+            return all(name in listed_providers or name in unavailable_providers
+                       for name, _ in self.providers.items())
+        return (launch.get("provider") or "lambda") in listed_providers
+
+    def _reconcile_launches(self, live: dict,
+                            listed_providers: set[str]) -> None:
+        """Bring launch rows back in line with what the cloud actually runs.
+
+        ONE pass with an explicit state dispatch. Two passes would let a row
+        be repaired by the first and then re-examined (and undone) by the
+        second inside the same sweep.
+
+        Two rules keep this honest:
+
+        - `terminated_at` means "we SAW it stop", and only an observed stop
+          may write it. A stop we merely infer goes to `resolved_at`, which
+          bounds the unknown instead of inventing a fact: stamping a guessed
+          stop time on a row that boot-timed-out 6 weeks ago would print a
+          five-figure "final" cost that never happened.
+        - a 'failed' row whose instance is ALIVE is not history, it is a box
+          burning money behind a row that reads as over. Repairing it makes
+          cost right from that moment on.
+        """
+        for launch in self.db.list_launches():
+            instance_id = launch.get("lambda_instance_id")
+            if not instance_id:
+                continue
+            if not self._may_conclude(launch, listed_providers):
+                continue
+            status = launch["status"]
+            instance = live.get(instance_id)
+
+            if status == "active" and instance is None:
+                # OBSERVED: it was running for us, and its own provider now
+                # does not list it. terminated_at is legitimate here;
+                # resolved_at is stamped alongside it so the cost model can
+                # still tell an observed stop from an inferred one.
+                self.db.update_launch(
+                    launch["id"], status="terminated",
+                    terminated_at=utcnow(), resolved_at=utcnow(),
+                )
+                self.db.record_audit(
+                    "backend", "external_termination_detected",
+                    f"launch {launch['id']}: instance {instance_id} is no "
+                    f"longer running; connection reaped and history closed",
+                )
+            elif (status == "failed" and instance is not None
+                    and instance.status == "active"):
+                # ORPHAN: the launch gave up (usually a boot timeout) but the
+                # instance came up anyway and is billing. Repair the status
+                # only from a genuinely ACTIVE instance — repairing a
+                # booting/unhealthy one re-enters the boot pipeline with no
+                # waiter behind it. Deliberately NOT stamping active_at: we
+                # never saw this boot finish, and inventing the timestamp
+                # would fabricate the very boot_seconds figure we publish to
+                # show how much of the bill is boot.
+                self.db.update_launch(launch["id"], status="active")
+                self.db.record_audit(
+                    "backend", "orphan_repaired",
+                    f"launch {launch['id']}: instance {instance_id} is alive "
+                    f"despite a failed launch row; status repaired to active "
+                    f"so its cost is counted",
+                )
+            elif (status == "failed" and instance is None
+                    and launch.get("launched_at")
+                    and not launch.get("resolved_at")):
+                # It started, and it is gone, and nobody watched it stop.
+                # Record WHEN WE FOUND OUT, in its own column: that freezes
+                # the upper bound of the cost range instead of letting it
+                # grow with the clock forever.
+                self.db.update_launch(launch["id"], resolved_at=utcnow())
+                self.db.record_audit(
+                    "backend", "launch_cost_bounded",
+                    f"launch {launch['id']}: instance {instance_id} is gone "
+                    f"and its stop was never observed; cost bounded as a "
+                    f"range rather than guessed",
+                )
 
     async def shutdown(self) -> None:
         """Close background tasks and connections (instances keep running)."""
@@ -1275,18 +1430,31 @@ class Orchestrator:
             p_name = launch_rec['provider'] if launch_rec else 'lambda'
             instance = await self.providers.get_provider(p_name).get_instance(instance_id)
             if instance is None:
+                # OBSERVED: the provider we just launched through no longer
+                # has this instance. That is the best evidence in the system —
+                # we were watching — so the stop is recorded as a fact rather
+                # than left to the reconcile sweep to bound as a guess. The
+                # LAUNCH still failed, so status and error are unchanged.
                 self.db.update_launch(
                     plan.launch_id, status="failed",
                     error=f"instance {instance_id} no longer exists",
+                    terminated_at=utcnow(), resolved_at=utcnow(),
                 )
                 return None
             if instance.status == "active" and instance.ip:
                 return instance
-            if instance.status in ("terminated", "terminating", "preempted", "unhealthy"):
-                self.db.update_launch(
-                    plan.launch_id, status="failed",
-                    error=f"instance entered status '{instance.status}' while booting",
-                )
+            if instance.status in BOOT_ABORT_STATUSES:
+                fields: dict = {
+                    "status": "failed",
+                    "error": f"instance entered status '{instance.status}' "
+                             f"while booting",
+                }
+                if instance.status in OBSERVED_STOP_STATUSES:
+                    # Same observed stop as above: we watched it reach a
+                    # status that means it is gone. An 'unhealthy' box gets
+                    # no timestamps — it is still running, and still billing.
+                    fields["terminated_at"] = fields["resolved_at"] = utcnow()
+                self.db.update_launch(plan.launch_id, **fields)
                 return None
             if waited >= policy.boot_timeout_seconds:
                 self.db.update_launch(
@@ -1344,6 +1512,10 @@ class Orchestrator:
                 # API key does not fill the log with the same line forever.
                 log = logger.info if startup else logger.debug
                 log("skip %s adoption: %s", name, exc.message)
+            except ProviderUnavailable as exc:
+                # A provider that cannot be read is a known state, not a
+                # crash: debug, and never a stack trace on the sweep.
+                logger.debug("skip %s adoption: %s", name, exc)
             except Exception:
                 if startup:
                     logger.exception(

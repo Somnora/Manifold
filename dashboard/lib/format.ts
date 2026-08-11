@@ -26,21 +26,9 @@ export function formatDuration(seconds: number): string {
   return h > 0 ? `${h}h ${m}m` : `${m}m`;
 }
 
-// Cost of a launch: hourly rate times billable runtime. Billing starts when
-// Lambda accepts the launch (launched_at) and ends at termination or now.
-export function launchCost(launch: {
-  hourly_rate_cents: number | null;
-  launched_at: string | null;
-  terminated_at: string | null;
-}): { seconds: number; usd: number } | null {
-  if (!launch.launched_at || launch.hourly_rate_cents == null) return null;
-  const start = new Date(launch.launched_at).getTime();
-  const end = launch.terminated_at
-    ? new Date(launch.terminated_at).getTime()
-    : Date.now();
-  const seconds = Math.max(0, (end - start) / 1000);
-  return {
-    seconds,
-    usd: (launch.hourly_rate_cents / 100) * (seconds / 3600),
-  };
-}
+// There is deliberately no cost formula in this file. Spend is accounting,
+// not formatting: the backend owns the single implementation (see
+// /spend/summary and backend/app/spend.py), because a launch whose instance
+// existed but whose end time was never observed has no point cost at all,
+// and a client that substitutes "now" for the missing end grows that number
+// forever. The dashboard renders what the backend answers.

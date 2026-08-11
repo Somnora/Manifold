@@ -131,3 +131,12 @@ accepts losing the listed files.
   will build on a server that is not there. Fail loudly instead.
 - Costs are real. Say what an instance costs per hour when you launch it,
   and terminate what you are done with.
+- Check `get_spend` before anything expensive, and again before you stop:
+  it gives today / this week / month to date / all time plus the $/hour
+  burning right now, which is also how you notice a box you forgot. Quote
+  its two limits honestly - it counts only what Manifold launched (console
+  instances and filesystem storage are outside it), and what it does count
+  is an upper bound, since the clock starts when the cloud accepted the
+  launch rather than when billing did. Costs it cannot know come back as
+  `unresolved` (a range) or `rate_unknown`; report those as unknown, never
+  as $0.

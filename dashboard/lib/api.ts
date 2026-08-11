@@ -281,6 +281,38 @@ export type Utilization = {
   hint?: string;
 };
 
+// Spend accounting, computed entirely by the backend (backend/app/spend.py).
+// The dashboard never re-derives cost. Every launch resolves to one of six
+// states there, and the two that cannot be priced arrive here separately:
+// `unresolved` as a count plus a range (the instance stopped at a time nobody
+// observed), `rate_unknown_count` as a count (duration known, price not).
+// Neither is ever folded into a total, because a fabricated $0 or a
+// confident-looking point cost is the one thing a spend page must not show.
+export type SpendSummary = {
+  today_usd: number;
+  week_usd: number;
+  month_to_date_usd: number;
+  all_time_usd: number;
+  live_burn_usd_per_hour: number;
+  unresolved: {
+    count: number;
+    usd_low: number;
+    usd_high: number;
+    launch_ids: string[];
+  };
+  // Alive on the cloud behind a launch row that reads as failed: money
+  // burning right now that nothing in Manifold is going to stop.
+  orphaned: { count: number; launch_ids: string[] };
+  rate_unknown_count: number;
+  // Totals only cover launches Manifold started; instances adopted from the
+  // Lambda console have no launch row and no cost here.
+  lower_bound: boolean;
+  timezone_offset_minutes: number;
+  timezone_label: string;
+  disclaimer: string;
+  mock: boolean;
+};
+
 export type Brain = {
   ref: string; // "instance:<id>" | "local:<endpoint>/<model>" | "api:<name>"
   kind: "instance" | "local" | "api" | "cli";
@@ -543,6 +575,13 @@ export const api = {
 
   launchUtilization: (launchId: string) =>
     request<Utilization>(`/launches/${launchId}/utilization`),
+
+  // tzOffsetMinutes is minutes EAST of UTC, so the backend knows where the
+  // user's "today" starts. A locale fact the browser owns, not a policy.
+  spendSummary: (tzOffsetMinutes: number) =>
+    request<SpendSummary>(
+      `/spend/summary?tz_offset_minutes=${Math.round(tzOffsetMinutes)}`,
+    ),
 
   settingsStatus: () =>
     request<{

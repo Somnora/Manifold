@@ -116,6 +116,7 @@ Add to `~/.gemini/settings.json` (create it if needed):
 | `get_launch_status(launch_id)` | One snapshot: phase + boot countdown while it boots |
 | `wait_for_launch(launch_id, timeout=120)` | Block until active/failed instead of polling (best for slow SXM4 boots) |
 | `list_instances()` | Live instances + SSH connection state |
+| `get_spend()` | What the launches have cost (today / week / month to date / all time) + the current $/hour burn — call it before an expensive launch so the agent can limit itself |
 | `terminate_instance(id, force=false)` | force=false returns the unsaved-file list instead of terminating |
 | `sync_outputs(instance_id)` | rsync ephemeral scratch → persistent filesystem |
 | `list_templates()` | Job templates with parameter schemas |
@@ -126,6 +127,13 @@ Add to `~/.gemini/settings.json` (create it if needed):
 | `download_file(remote_path, local_path)` | Pull results back to this machine (SFTP) |
 | `run_command(instance_id, command, timeout=120)` | ONE shell command on the instance, audited with its exit code |
 | `save_template(yaml_text)` / `delete_template(name)` | Author a custom job template (see docs/custom-templates.md) |
+
+Two honest limits on every number `get_spend` returns: it counts only
+launches Manifold itself started (a box created in the Lambda console, and
+filesystem storage, are outside it), and what it does count is an upper
+bound, because the clock starts when the cloud accepted the launch rather
+than when billing did. Costs it cannot know come back as `unresolved` (a
+range) or `rate_unknown` — never folded into a total as $0.
 
 Every tool takes an optional `note` — one line of intent that lands in the
 audit log. Everything an agent does is visible live on the dashboard's

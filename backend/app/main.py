@@ -62,6 +62,7 @@ from .orchestrator import (
     launch_progress,
 )
 from .preferences import GATEABLE_ACTIONS, PreferenceStore
+from . import spend
 from .sidecar_client import MockSidecarClient
 from .image_checker import MockImageChecker, RealImageChecker
 from .storage import MockStorage, S3AdapterStorage, StorageClient
@@ -343,6 +344,7 @@ def create_app(
     templates_dir=None,
     custom_templates_dir=None,     # user-authored templates (DATA_ROOT/custom-templates)
     mock: bool = False,
+    mock_seed_days: int = 0,       # mock mode only: days of fabricated demo history
 ) -> FastAPI:
     settings = settings or load_settings()
     lambda_client_factory = lambda_client_factory or RealLambdaClient
@@ -447,6 +449,36 @@ def create_app(
             )
 
     db = Database(settings.db_path)
+
+    # Demo history (MANIFOLD_MOCK_SEED_DAYS): fabricated launches so the
+    # spend page has a past to show in mock mode. Never in real mode — this
+    # writes invented dollar amounts, and there is no undo. Both of the
+    # seeder's own gates still apply underneath: it refuses without an
+    # explicit mock=True, and unless the connection it is handed is open on a
+    # '<stem>-mock.db' file (the mock branch above derived exactly that path),
+    # so this call site being wrong is not enough to touch the real ledger.
+    if mock and mock_seed_days > 0:
+        from .mock_seed import register_live_instances, seed_mock_history
+        created = seed_mock_history(db, days=mock_seed_days, now_iso=utcnow(),
+                                    mock=True, db_path=settings.db_path)
+        # The fixture's still-running launch is only honest if the mock cloud
+        # lists the instance behind it; it then counts toward the concurrency
+        # and budget guards exactly as a real running box would.
+        running = register_live_instances(db, lambda_client)
+        # Name the instance, not just the count: it holds the single
+        # concurrency slot, so the next launch attempt comes back 409 and the
+        # rejection alone does not explain why. Name the knob too, so the way
+        # to turn the fixture off is in the same line as its consequence.
+        logger.info(
+            "mock seed (MANIFOLD_MOCK_SEED_DAYS=%d): %d fabricated launch(es). "
+            "Fixture instance(s) now RUNNING in the mock cloud: %s. They hold "
+            "the concurrency slot and count against the hourly budget exactly "
+            "as real boxes would, so your next launch can be refused with a "
+            "409 until you terminate them; start without "
+            "MANIFOLD_MOCK_SEED_DAYS for an empty demo.",
+            mock_seed_days, created,
+            ", ".join(running) if running else "none",
+        )
 
     # Preferences: the policies the user edits in Settings (approval gates,
     # notification toggles, data safety). config.yaml supplies the defaults;
@@ -2596,6 +2628,94 @@ def create_app(
         )
         return {"available": summary["sample_count"] > 0, **util.to_dict()}
 
+    # -- spend (accounting: what the launches actually cost) -----------------------
+    # Thin, like every route here: spend.py owns the whole cost formula, these
+    # three only fetch the rows, hand over the evidence, and stamp the demo
+    # marker. `tz_offset_minutes` comes from the client (a browser's
+    # getTimezoneOffset, negated) because "today" is a locale fact the caller
+    # owns; the backend has no business guessing which midnight the user means.
+
+    # A year of history is plenty for a chart, and a bound is what keeps a
+    # hand-typed days=999999 from gap-filling a million buckets.
+    SPEND_MAX_DAYS = 365
+
+    # Real UTC offsets run from -12:00 (Baker Island) to +14:00 (Kiritimati).
+    # Outside that it is a typo or a probe, and an unbounded offset does not
+    # fail loudly — it silently moves which midnight "today" and "month to
+    # date" are measured from (99999 minutes shifts them by 69 days), so the
+    # page reports the wrong number while looking perfectly fine.
+    TZ_OFFSET_MIN, TZ_OFFSET_MAX = -720, 840
+
+    def clamp_tz(tz_offset_minutes: int) -> int:
+        return max(TZ_OFFSET_MIN, min(tz_offset_minutes, TZ_OFFSET_MAX))
+
+    def spend_evidence() -> tuple[list[dict], set[str] | None, set[str] | None]:
+        """Every launch row, plus the cloud evidence to classify it against.
+
+        The evidence is the LAST instances sweep, never a fresh cloud call:
+        these routes get polled, and a spend page must not add an API call
+        per poll (nor let the cloud's latency decide whether the page loads).
+        Before the first sweep it is (None, None), which spend.py reads as
+        "no snapshot" and so keeps trusting each row's own status — a live
+        box goes on billing instead of being written off as stopped.
+        """
+        live_ids, listed_providers = orchestrator.last_cloud_snapshot()
+        return db.list_launches(), live_ids, listed_providers
+
+    @app.get("/spend/summary")
+    async def spend_summary(tz_offset_minutes: int = 0):
+        """Today / this week / month to date / all time, the current burn
+        rate, and the launches whose cost is NOT known (never counted as $0)."""
+        rows, live_ids, listed_providers = spend_evidence()
+        summary = spend.summarize(
+            rows, now_iso=utcnow(),
+            tz_offset_minutes=clamp_tz(tz_offset_minutes),
+            live_ids=live_ids, listed_providers=listed_providers,
+            boot_timeout_seconds=settings.launch.boot_timeout_seconds,
+        )
+        # Fixture spend has to be self-identifying wherever it is shown: a
+        # dollar figure in a screenshot with no demo marker is the worst
+        # artifact this project could publish.
+        return {**summary, "mock": mock}
+
+    @app.get("/spend/series")
+    async def spend_series(bucket: str = "day", days: int = 30,
+                           tz_offset_minutes: int = 0):
+        """Spend over time, oldest first, gap-filled with zeros.
+        bucket: day | week | month."""
+        rows, live_ids, listed_providers = spend_evidence()
+        try:
+            # spend.py owns the valid bucket names; re-listing them here would
+            # be a second copy of the contract, free to drift.
+            points = spend.series(
+                rows, now_iso=utcnow(), bucket=bucket,
+                days=max(1, min(days, SPEND_MAX_DAYS)),
+                tz_offset_minutes=clamp_tz(tz_offset_minutes),
+                live_ids=live_ids, listed_providers=listed_providers,
+                boot_timeout_seconds=settings.launch.boot_timeout_seconds,
+            )
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+        return {"series": points, "mock": mock}
+
+    @app.get("/spend/breakdown")
+    async def spend_breakdown(by: str = "instance_type", days: int = 30,
+                              tz_offset_minutes: int = 0):
+        """Where the money went, biggest first.
+        by: instance_type | region | provider | status."""
+        rows, live_ids, listed_providers = spend_evidence()
+        try:
+            groups = spend.breakdown(
+                rows, now_iso=utcnow(), by=by,
+                days=max(1, min(days, SPEND_MAX_DAYS)),
+                tz_offset_minutes=clamp_tz(tz_offset_minutes),
+                live_ids=live_ids, listed_providers=listed_providers,
+                boot_timeout_seconds=settings.launch.boot_timeout_seconds,
+            )
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+        return {"breakdown": groups, "mock": mock}
+
     # -- cluster management --------------------------------------------------------
 
     class ClusterLaunchRequest(BaseModel):
@@ -2765,6 +2885,40 @@ def create_app(
     return app
 
 
+def mock_seed_days_from_env(raw: str) -> int:
+    """MANIFOLD_MOCK_SEED_DAYS, turned into a number the seeder will accept.
+
+    A demo knob must never be able to stop the backend from starting, and
+    both of the obvious wrong values used to do exactly that: `abc` raised
+    from int(), and `400` raised from the seeder's own 1..365 check, either
+    one killing the process at startup. So: unreadable input is ignored,
+    an out-of-range number is clamped, and both say so in the log.
+    """
+    from .mock_seed import MAX_SEED_DAYS, MIN_SEED_DAYS
+
+    if not raw.strip():
+        return 0
+    try:
+        days = int(raw)
+    except ValueError:
+        logger.warning(
+            "MANIFOLD_MOCK_SEED_DAYS=%r is not a whole number; starting with "
+            "no demo history (set it to 1..%d to seed some)",
+            raw, MAX_SEED_DAYS,
+        )
+        return 0
+    if days <= 0:
+        return 0                      # 0 and negatives are both "off"
+    clamped = min(max(days, MIN_SEED_DAYS), MAX_SEED_DAYS)
+    if clamped != days:
+        logger.warning(
+            "MANIFOLD_MOCK_SEED_DAYS=%d is outside the seeder's %d..%d "
+            "window; seeding %d day(s) of demo history instead",
+            days, MIN_SEED_DAYS, MAX_SEED_DAYS, clamped,
+        )
+    return clamped
+
+
 def create_default_app() -> FastAPI:
     """Uvicorn entry point (run with --factory so importing this module
     never requires credentials): reads MANIFOLD_MOCK to pick the mode.
@@ -2772,13 +2926,29 @@ def create_default_app() -> FastAPI:
     In mock mode, MANIFOLD_MOCK_CAPACITY_FAILURES=N scripts N
     insufficient-capacity errors before launches succeed, so the
     dashboard's retry states can be demonstrated end to end.
+
+    Also in mock mode, MANIFOLD_MOCK_SEED_DAYS=N fabricates N days of demo
+    launch history (0, the default, is off) so the spend page has a past to
+    show. It is forced to 0 outside mock mode: invented dollar amounts must
+    never reach the real ledger.
     """
     mock = os.environ.get("MANIFOLD_MOCK", "") == "1"
+    seed_days = mock_seed_days_from_env(
+        os.environ.get("MANIFOLD_MOCK_SEED_DAYS", ""))
     lambda_client = None
     if mock:
-        failures = int(os.environ.get("MANIFOLD_MOCK_CAPACITY_FAILURES", "0"))
+        # Same tolerance as MANIFOLD_MOCK_SEED_DAYS: a mistyped demo knob
+        # must never stop the backend from starting.
+        try:
+            failures = int(os.environ.get("MANIFOLD_MOCK_CAPACITY_FAILURES", "0"))
+        except ValueError:
+            logger.warning(
+                "ignoring MANIFOLD_MOCK_CAPACITY_FAILURES=%r: not a number",
+                os.environ.get("MANIFOLD_MOCK_CAPACITY_FAILURES"))
+            failures = 0
         if failures:
             lambda_client = MockLambdaClient(
                 scripted_launch_errors=[capacity_error() for _ in range(failures)]
             )
-    return create_app(mock=mock, lambda_client=lambda_client)
+    return create_app(mock=mock, lambda_client=lambda_client,
+                      mock_seed_days=seed_days if mock else 0)

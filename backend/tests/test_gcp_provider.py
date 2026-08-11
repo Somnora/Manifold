@@ -3,7 +3,7 @@ import sqlite3
 from app.providers.gcp_provider import MockGCPProvider, RealGCPProvider
 from app.providers.registry import ProviderRegistry
 from app.providers.lambda_provider import LambdaProvider
-from app.providers.base import ProviderError
+from app.providers.base import ProviderError, ProviderUnavailable
 from app.db import Database, SCHEMA
 from app.lambda_api import MockLambdaClient
 from app.orchestrator import Orchestrator
@@ -49,17 +49,29 @@ async def test_mock_gcp_provider():
     assert len(instances) == 0
 
 @pytest.mark.asyncio
-async def test_real_gcp_provider_degrades_instead_of_raising():
+async def test_real_gcp_provider_answers_with_what_is_actually_true():
     """Setting GCP_PROJECT_ID before the live API exists must not brick the
-    read paths: list/get DEGRADE to empty. Only the explicit write actions
-    raise, and they raise a typed, catchable ProviderError — never a bare
-    NotImplementedError that could escape a background sweep."""
+    paths that sweep every provider, but it must not lie either.
+
+    The catalog degrades to empty, because "you cannot launch GCP types yet"
+    is true. Liveness raises ProviderUnavailable, because an empty list there
+    would claim the account is idle when we never looked — and the reconcile
+    sweep would then close every GCP launch row as terminated. Writes raise a
+    typed ProviderError, never a bare NotImplementedError that could escape a
+    background sweep."""
     gcp = RealGCPProvider(project_id="my-proj", default_zone="us-central1-a")
 
-    assert await gcp.list_instances() == []
-    assert await gcp.list_instances(fresh=True) == []
     assert await gcp.list_instance_types() == []
-    assert await gcp.get_instance("whatever") is None
+
+    with pytest.raises(ProviderUnavailable):
+        await gcp.list_instances()
+    with pytest.raises(ProviderUnavailable):
+        await gcp.list_instances(fresh=True)
+    with pytest.raises(ProviderUnavailable):
+        await gcp.get_instance("whatever")
+    # It stays catchable as the base type, so existing per-provider handlers
+    # keep working.
+    assert issubclass(ProviderUnavailable, ProviderError)
 
     with pytest.raises(ProviderError):
         await gcp.launch_instance("us-central1", "g2-standard-4", ["k"], [])
@@ -67,6 +79,17 @@ async def test_real_gcp_provider_degrades_instead_of_raising():
         await gcp.terminate_instance("whatever")
     with pytest.raises(ProviderError):
         await gcp.ensure_ssh_key("ssh-rsa AAA", "key")
+
+
+@pytest.mark.asyncio
+async def test_unconfigured_gcp_is_genuinely_empty():
+    """With no project set there is nothing to read and nothing to run, so
+    empty is the honest answer and no sweep needs to skip anything."""
+    gcp = RealGCPProvider(project_id="", default_zone="us-central1-a")
+
+    assert await gcp.list_instances() == []
+    assert await gcp.list_instance_types() == []
+    assert await gcp.get_instance("whatever") is None
 
 
 class _BoomProvider(MockGCPProvider):

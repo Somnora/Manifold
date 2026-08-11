@@ -5,17 +5,13 @@ import { api, type Launch, type Utilization } from "@/lib/api";
 import { usePolling } from "@/lib/usePolling";
 import { StatusBadge } from "@/components/Badge";
 import { AuditLog } from "@/components/AuditLog";
-import {
-  formatDate,
-  formatDuration,
-  formatMoney,
-  launchCost,
-} from "@/lib/format";
+import { SpendSummaryPanel } from "@/components/SpendSummary";
+import { formatDate, formatDuration, formatMoney } from "@/lib/format";
 
-// Activity: everything that happened, in two ledgers. "Spend" is the launch
-// history with cost = rate x billable runtime; "Audit" is the full action
-// trail (agents, MCP, backend safety actions). One place to answer both
-// "what did this cost me" and "who did what" - they used to be two nav
+// Activity: everything that happened, in two ledgers. "Spend" is the
+// backend's spend summary over the launch history; "Audit" is the full
+// action trail (agents, MCP, backend safety actions). One place to answer
+// both "what did this cost me" and "who did what" - they used to be two nav
 // destinations, which made each feel thinner than it is.
 type Tab = "spend" | "audit";
 
@@ -58,21 +54,21 @@ export default function ActivityPage() {
   );
 }
 
-// Launch history straight from SQLite, with cost = rate x billable runtime.
-// Billing runs from launch acceptance to termination; running launches show
-// a live, still-growing cost. Each row expands to a post-run utilization
-// verdict (peak VRAM, avg util) with an advisory right-size hint.
+// Money on top, launch records underneath. The panel is the ONLY thing here
+// that talks in dollars, and it gets its dollars from the backend. The table
+// stays factual: what was asked for, what it ran at, and how long it ran
+// between two timestamps the record actually holds. A row whose end was
+// never observed says so instead of inventing one, and the panel above
+// carries those launches as a bounded range.
 function SpendLedger() {
   const { data: launches, error } = usePolling(() => api.launches(), 5000);
 
   const rows = launches ?? [];
-  const totalUsd = rows.reduce(
-    (sum, l) => sum + (launchCost(l)?.usd ?? 0),
-    0,
-  );
 
   return (
     <div className="space-y-4">
+      <SpendSummaryPanel />
+
       {error && (
         <p className="rounded border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-800">
           {error}
@@ -91,7 +87,6 @@ function SpendLedger() {
               <th className="px-4 py-2 font-medium text-right">Attempts</th>
               <th className="px-4 py-2 font-medium text-right">Rate</th>
               <th className="px-4 py-2 font-medium text-right">Runtime</th>
-              <th className="px-4 py-2 font-medium text-right">Cost</th>
             </tr>
           </thead>
           <tbody className="divide-y divide-zinc-100">
@@ -101,7 +96,7 @@ function SpendLedger() {
             {rows.length === 0 && (
               <tr>
                 <td
-                  colSpan={9}
+                  colSpan={8}
                   className="px-4 py-8 text-center text-sm text-zinc-500"
                 >
                   No launches yet.
@@ -111,10 +106,6 @@ function SpendLedger() {
           </tbody>
         </table>
       </div>
-
-      <p className="text-right text-sm text-zinc-600">
-        Total spend shown: <span className="font-medium">{formatMoney(totalUsd)}</span>
-      </p>
     </div>
   );
 }
@@ -124,7 +115,19 @@ function LaunchRow({ launch: l }: { launch: Launch }) {
   const [util, setUtil] = useState<Utilization | null>(null);
   const [loading, setLoading] = useState(false);
 
-  const cost = launchCost(l);
+  // Wall clock between two timestamps the record HAS. When there is no end
+  // time, Manifold never observed one, and substituting "now" is exactly the
+  // bug this ledger used to ship: a failed launch's runtime (and cost) grew
+  // forever. Say "unknown" and let the summary above bound it.
+  const runtimeSeconds =
+    l.launched_at && l.terminated_at
+      ? Math.max(
+          0,
+          (new Date(l.terminated_at).getTime() -
+            new Date(l.launched_at).getTime()) /
+            1000,
+        )
+      : null;
   const fellBack = l.launched_type && l.launched_type !== l.requested_type;
 
   function toggle() {
@@ -172,16 +175,28 @@ function LaunchRow({ launch: l }: { launch: Launch }) {
             ? `${formatMoney(l.hourly_rate_cents / 100)}/hr`
             : "-"}
         </td>
-        <td className="px-4 py-2 text-right text-zinc-600">
-          {cost ? formatDuration(cost.seconds) : "-"}
-        </td>
-        <td className="px-4 py-2 text-right font-medium">
-          {cost ? formatMoney(cost.usd) : "-"}
+        <td className="px-4 py-2 text-right tabular-nums text-zinc-600">
+          {runtimeSeconds != null ? (
+            formatDuration(runtimeSeconds)
+          ) : l.launched_at ? (
+            <span
+              className="text-amber-700"
+              title={
+                l.status === "active"
+                  ? "Still running. Its cost so far is in the summary above."
+                  : "This instance existed but Manifold never observed it stop, so its runtime is a range, not a number. See the summary above."
+              }
+            >
+              {l.status === "active" ? "running" : "unknown"}
+            </span>
+          ) : (
+            "-"
+          )}
         </td>
       </tr>
       {open && (
         <tr className="bg-zinc-50/60">
-          <td colSpan={9} className="px-4 py-3">
+          <td colSpan={8} className="px-4 py-3">
             <UtilizationDetail loading={loading} util={util} />
           </td>
         </tr>

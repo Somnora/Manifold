@@ -227,3 +227,88 @@ async def test_terminate_closes_connection_and_records(orchestrator, mock_client
     row = orchestrator.db.find_launch_by_instance(instance_id)
     assert row["status"] == "terminated"
     assert row["terminated_at"] is not None
+
+
+# -- what the boot wait may write (Phase 76) ----------------------------------
+#
+# The pipeline WATCHES the instance while it boots, so a stop it sees there is
+# the best evidence in the system. Throwing it away pushed the row into the
+# guess-bounded `unresolved` class, where spend.py can only publish a range.
+
+
+class _VanishingClient(MockLambdaClient):
+    """The instance is gone by the first boot poll (deleted out of band)."""
+
+    async def get_instance(self, instance_id: str):
+        self.instances.pop(instance_id, None)
+        return None
+
+
+class _DyingClient(MockLambdaClient):
+    """The instance reaches a terminal status while booting."""
+
+    def __init__(self, *, status: str, **kwargs):
+        super().__init__(**kwargs)
+        self.dies_as = status
+
+    async def get_instance(self, instance_id: str):
+        instance = self.instances.get(instance_id)
+        if instance is not None:
+            instance.status = self.dies_as
+        return instance
+
+
+async def _failed_boot(settings, db, client) -> dict:
+    orch = Orchestrator(settings, client, db, connect_fn=mock_connect_fn)
+    launch = await orch.request_launch(
+        instance_type="gpu_1x_a10", region="us-east-1",
+        filesystem="manifold-data",
+    )
+    final = await orch.wait_for_launch(launch["id"])
+    await orch.shutdown()
+    return final
+
+
+def _cost_state(row: dict) -> str:
+    """How spend.py classifies the finished row: 'billed' is exactly-known,
+    'unresolved' is a range bounded by guesswork."""
+    from app import spend
+    from app.db import utcnow
+
+    return spend.launch_cost(row, now_iso=utcnow())["state"]
+
+
+async def test_an_instance_that_vanishes_while_booting_is_an_observed_stop(
+        settings, db):
+    """We were watching when it disappeared, so the stop is a fact. Recording
+    it keeps the row exactly-known instead of a range nobody can close."""
+    final = await _failed_boot(settings, db, _VanishingClient())
+
+    assert final["status"] == "failed"                  # the launch DID fail
+    assert "no longer exists" in final["error"]
+    assert final["terminated_at"] is not None           # ...and we saw it stop
+    assert final["resolved_at"] is not None
+    assert _cost_state(final) == "billed"               # not `unresolved`
+
+
+async def test_a_terminal_status_while_booting_is_an_observed_stop(settings, db):
+    final = await _failed_boot(settings, db, _DyingClient(status="terminated"))
+
+    assert final["status"] == "failed"
+    assert "terminated" in final["error"]
+    assert final["terminated_at"] is not None
+    assert final["resolved_at"] is not None
+    assert _cost_state(final) == "billed"
+
+
+async def test_an_unhealthy_instance_is_not_treated_as_a_stop(settings, db):
+    """'unhealthy' aborts the boot but does NOT mean the box went away: it is
+    still running and still billing, so claiming a stop time would under-report
+    the cost. This one stays a bounded unknown, honestly."""
+    final = await _failed_boot(settings, db, _DyingClient(status="unhealthy"))
+
+    assert final["status"] == "failed"
+    assert "unhealthy" in final["error"]
+    assert final["terminated_at"] is None
+    assert final["resolved_at"] is None
+    assert _cost_state(final) == "unresolved"

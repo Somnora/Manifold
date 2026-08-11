@@ -11,7 +11,12 @@ import { WatchPanel } from "@/components/WatchPanel";
 import { ClusterPanel } from "@/components/ClusterPanel";
 import { VisualTaskGraph } from "@/components/VisualTaskGraph";
 import { MultiGpuTelemetry } from "@/components/MultiGpuTelemetry";
-import { formatMoney, launchCost } from "@/lib/format";
+import {
+  useSpendSummary,
+  OrphanedSpendAlert,
+  SpendTotalLink,
+} from "@/components/SpendSummary";
+import { formatMoney } from "@/lib/format";
 
 const IN_FLIGHT = ["launching", "retrying", "booting"];
 const RECENT_FAILURE_WINDOW_MS = 15 * 60 * 1000;
@@ -28,6 +33,8 @@ export default function InstancesPage() {
   }, 2000);
 
   const { data: setup } = usePolling(() => api.settingsStatus(), 10000);
+  // Spend is the backend's number, polled slowly (see SpendSummary).
+  const { data: spend } = useSpendSummary();
   // Cheap polls that only decide whether the view-only panels below are worth
   // mounting (see the gating note near the render). The panels do their own
   // finer-grained polling once they mount.
@@ -53,13 +60,10 @@ export default function InstancesPage() {
       Date.now() - new Date(l.created_at).getTime() < RECENT_FAILURE_WINDOW_MS,
   );
 
-  // Live cost picture: what running instances burn per hour, and what every
-  // launch in the ledger has cost so far (running ones keep ticking).
+  // What the instances listed right now cost per hour. The historical total
+  // beside it is NOT derived here: it comes from /spend/summary, which is the
+  // only place the cost formula lives.
   const hourlyBurn = instances.reduce((sum, i) => sum + i.hourly_rate_usd, 0);
-  const totalSpend = launches.reduce(
-    (sum, l) => sum + (launchCost(l)?.usd ?? 0),
-    0,
-  );
 
   return (
     <div className="space-y-6">
@@ -83,23 +87,17 @@ export default function InstancesPage() {
           .
         </div>
       )}
-      <div className="flex items-center justify-end gap-6 text-sm">
+      {spend && <OrphanedSpendAlert summary={spend} linkToInstances={false} />}
+      <div className="flex flex-wrap items-start justify-end gap-x-6 gap-y-2 text-sm">
         <span className="text-zinc-500">
           Current burn:{" "}
-          <span className="font-medium text-zinc-900">
+          <span className="font-medium tabular-nums text-zinc-900">
             {formatMoney(hourlyBurn)}/hr
           </span>
         </span>
-        <Link
-          href="/history"
-          className="text-zinc-500 hover:text-zinc-900"
-          title="See the full spend history"
-        >
-          Total spend:{" "}
-          <span className="font-medium text-zinc-900 underline decoration-zinc-500 underline-offset-2">
-            {formatMoney(totalSpend)}
-          </span>
-        </Link>
+        {/* Nothing while the backend has not answered: a reassuring $0 that
+            turns out to be $400 is worse than a blank. */}
+        {spend && <SpendTotalLink summary={spend} />}
       </div>
 
       <section>

@@ -7,6 +7,7 @@ from app.providers.base import (
     CloudInstanceTypeSpec,
     CloudInstanceInfo,
     ProviderError,
+    ProviderUnavailable,
 )
 
 logger = logging.getLogger("manifold.providers.gcp")
@@ -107,13 +108,20 @@ class MockGCPProvider(GCPProvider):
 class RealGCPProvider(GCPProvider):
     """GCP provider whose live API is not wired up yet.
 
-    An operator can set GCP_PROJECT_ID before the integration lands. When
-    that happens the READ paths (list/get) must DEGRADE — return empty and
-    warn once — never raise, because they are swept by background code
-    (/instances, sync, adoption) that iterates every provider. A read that
-    raised here used to 500 the whole instances view and silently disable
-    adoption for Lambda too. The WRITE paths (launch/terminate) are explicit
-    user actions, so they raise a typed, catchable ProviderError instead.
+    An operator can set GCP_PROJECT_ID before the integration lands, and
+    nothing here may take down the paths that sweep every provider
+    (/instances, sync, adoption). So each method answers with the strongest
+    true statement it can make:
+
+    - CATALOG (list_instance_types): degrades to empty. "You cannot launch
+      GCP types yet" is simply true, and an empty catalog says exactly that.
+    - LIVENESS (list_instances, get_instance): raises ProviderUnavailable.
+      Empty here would NOT be true — it would claim the account is idle when
+      we never looked, and the reconcile sweep would then close every GCP
+      launch row as terminated. The sweep catches this type per provider and
+      skips GCP's rows while Lambda reconciles normally.
+    - WRITES (launch/terminate/ssh key): explicit user actions, so they
+      raise a typed, catchable ProviderError.
     """
 
     _NOT_WIRED = "Real GCP API integration pending credentials"
@@ -130,7 +138,7 @@ class RealGCPProvider(GCPProvider):
         if not self._warned:
             logger.warning(
                 "GCP project %r is set but the live API is not implemented "
-                "yet; treating GCP as empty. %s",
+                "yet; GCP is skipped by every sweep. %s",
                 self.project_id, self._NOT_WIRED,
             )
             self._warned = True
@@ -145,15 +153,17 @@ class RealGCPProvider(GCPProvider):
         # GCP fetches live data on every call; fresh is accepted for the
         # CloudProvider contract and ignored.
         if not self.project_id:
+            # No project configured: there is genuinely nothing to run on
+            # GCP, so empty is the truth rather than an absence of an answer.
             return []
         self._warn_once()
-        return []
+        raise ProviderUnavailable(self._NOT_WIRED)
 
     async def get_instance(self, instance_id: str) -> Optional[CloudInstanceInfo]:
         if not self.project_id:
             return None
         self._warn_once()
-        return None
+        raise ProviderUnavailable(self._NOT_WIRED)
 
     async def launch_instance(self, region: str, instance_type: str, ssh_key_names: List[str], filesystem_names: List[str], name: str = "", user_data: str = "") -> str:
         raise ProviderError("GCP launch not yet supported")
