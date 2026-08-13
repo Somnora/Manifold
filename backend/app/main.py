@@ -219,6 +219,11 @@ class TaskRequest(BaseModel):
     # Pin a manual job to a specific connected instance (multi-GPU). Omit
     # to take the first free instance. Ignored when auto_manage is set.
     target_instance_id: str | None = None
+    # Phase 77: task ids this job runs AFTER. It stays queued until every
+    # one succeeds, and settles as 'skipped' if any of them cannot. Must
+    # reference tasks that already exist; immutable after enqueue (which is
+    # what makes cycles impossible - see DECISIONS.md).
+    depends_on: list[str] = Field(default_factory=list)
 
 
 class CreateFilesystemRequest(BaseModel):
@@ -2118,6 +2123,7 @@ def create_app(
             coerce_parameters(template, req.parameters)
         except ParameterError as exc:
             raise HTTPException(422, str(exc))
+        depends_on = _validate_dependencies(req.depends_on)
 
         if req.auto_manage:
             # Fail fast on a bad GPU/region/filesystem here; the guarded launch
@@ -2127,21 +2133,56 @@ def create_app(
             task_id = queue.enqueue(
                 template=req.template, parameters=req.parameters,
                 auto_manage=True, gpu_type=req.gpu_type, region=req.region,
-                filesystem=req.filesystem)
+                filesystem=req.filesystem, depends_on=depends_on)
             db.record_audit(
                 "api", "task_enqueue_auto",
                 f"{task_id} ({req.template}) auto-manage "
-                f"{req.gpu_type}/{req.region}/{req.filesystem}")
+                f"{req.gpu_type}/{req.region}/{req.filesystem}"
+                + (f" after {', '.join(depends_on)}" if depends_on else ""))
         else:
             task_id = queue.enqueue(template=req.template,
                                     parameters=req.parameters,
-                                    target_instance_id=req.target_instance_id)
+                                    target_instance_id=req.target_instance_id,
+                                    depends_on=depends_on)
             db.record_audit(
                 "api", "task_enqueue",
                 f"{task_id} ({req.template})"
                 + (f" -> {req.target_instance_id}"
-                   if req.target_instance_id else ""))
+                   if req.target_instance_id else "")
+                + (f" after {', '.join(depends_on)}" if depends_on else ""))
         return {"task": queue.get(task_id)}
+
+    def _validate_dependencies(dep_ids: list[str]) -> list[str] | None:
+        """Enqueue-time dependency checks, all 422s (fail at submit, not
+        minutes later on a GPU). Deps may only reference tasks that already
+        exist and can still succeed - which, with immutability, is what
+        makes the graph a DAG without any cycle detector: a new task cannot
+        be depended on by an older one, because the older one's deps were
+        frozen before this task existed."""
+        deps: list[str] = []
+        for dep_id in dep_ids:
+            if dep_id in deps:
+                continue   # duplicate: harmless, dedupe silently
+            dep = queue.get(dep_id)
+            if dep is None:
+                raise HTTPException(
+                    422, f"depends_on: task '{dep_id}' does not exist")
+            if dep["status"] in ("failed", "skipped"):
+                raise HTTPException(
+                    422,
+                    f"depends_on: task {dep_id} ({dep['template']}) already "
+                    f"{dep['status']} - this pipeline is dead; enqueueing "
+                    f"its tail would only produce another skipped job")
+            if dispatcher._is_server(dep["template"]):
+                raise HTTPException(
+                    422,
+                    f"depends_on: task {dep_id} runs {dep['template']}, a "
+                    f"server that never exits on its own - 'after it "
+                    f"succeeds' would mean never. To run a batch job "
+                    f"against a live server, target the server's instance: "
+                    f"server and batch coexist there by design")
+            deps.append(dep_id)
+        return deps or None
 
     async def _validate_auto_manage(req: "TaskRequest") -> None:
         if not (req.gpu_type and req.region and req.filesystem):
@@ -2179,17 +2220,34 @@ def create_app(
         the pre-launch estimates against reality as history accumulates."""
         costs = db.task_costs()
         tasks = queue.list()
+        by_id = {t["id"]: t for t in tasks}
         for t in tasks:
             c = costs.get(t["id"])
             t["runtime_seconds"] = c["runtime_seconds"] if c else None
             t["actual_cost_cents"] = c["actual_cost_cents"] if c else None
+            t["deps"] = _resolve_deps(t, by_id)
         return {"tasks": tasks}
+
+    def _resolve_deps(task: dict, by_id: dict | None = None) -> list[dict]:
+        """depends_on resolved to live rows, so clients render dependency
+        chips without re-joining. A deleted parent reports status 'missing'
+        rather than vanishing from the list - the edge existed."""
+        out = []
+        for dep_id in task.get("depends_on") or []:
+            dep = by_id.get(dep_id) if by_id is not None else queue.get(dep_id)
+            out.append({
+                "id": dep_id,
+                "template": dep["template"] if dep else None,
+                "status": dep["status"] if dep else "missing",
+            })
+        return out
 
     @app.get("/tasks/{task_id}")
     async def get_task(task_id: str):
         task = queue.get(task_id)
         if task is None:
             raise HTTPException(404, f"task {task_id} not found")
+        task["deps"] = _resolve_deps(task)
         return task
 
     @app.get("/tasks/{task_id}/logs")
@@ -2216,7 +2274,7 @@ def create_app(
                         sent_seq = seq
                         yield f"data: {json.dumps(line)}\n\n"
                 t = queue.get(task_id)
-                if t and t.get("status") in ("succeeded", "failed", "canceled"):
+                if t and t.get("status") in ("succeeded", "failed", "skipped"):
                     lines = queue.get_logs(task_id)
                     for line in lines:
                         seq = line.get("seq", 0)
@@ -2263,7 +2321,7 @@ def create_app(
                     last_id = ev["id"]
                     yield f"data: {json.dumps(ev)}\n\n"
                 t = queue.get(task_id)
-                if t and t.get("status") in ("succeeded", "failed", "canceled"):
+                if t and t.get("status") in ("succeeded", "failed", "skipped"):
                     for ev in db.get_task_events_after(task_id, last_id):
                         last_id = ev["id"]
                         yield f"data: {json.dumps(ev)}\n\n"
@@ -2318,8 +2376,9 @@ def create_app(
     # captured as a task id.
     @app.delete("/tasks/finished")
     async def clear_finished_tasks():
-        """Clear finished (succeeded/failed) jobs from history. Active jobs
-        (queued/running) are left untouched."""
+        """Clear finished (succeeded/failed/skipped) jobs from history.
+        Active jobs (queued/running) are left untouched, as is any finished
+        task a queued job still depends on."""
         return {"cleared": queue.clear_finished()}
 
     @app.delete("/tasks/{task_id}")
@@ -2330,6 +2389,14 @@ def create_app(
         if task["status"] == "running":
             raise HTTPException(
                 409, "cannot remove a running job; wait for it to finish")
+        dependents = db.queued_dependents(task_id)
+        if dependents:
+            names = ", ".join(f"{t['id']} ({t['template']})"
+                              for t in dependents)
+            raise HTTPException(
+                409,
+                f"queued job(s) depend on this one: {names}. Their gate "
+                f"reads this task's row; remove or cancel them first")
         queue.delete(task_id)
         return {"deleted": task_id}
 

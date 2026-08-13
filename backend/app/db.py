@@ -89,7 +89,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     created_at      TEXT NOT NULL,
     template        TEXT NOT NULL,
     parameters      TEXT NOT NULL,      -- JSON of user-supplied values
-    status          TEXT NOT NULL,      -- queued|running|succeeded|failed
+    status          TEXT NOT NULL,      -- queued|running|succeeded|failed|skipped
     instance_id     TEXT,               -- where it ran
     started_at      TEXT,
     finished_at     TEXT,
@@ -342,6 +342,12 @@ class Database:
         self._ensure_column("tasks", "lifecycle_events", "TEXT")
         # Phase 35: pin a manual job to a specific instance (multi-GPU).
         self._ensure_column("tasks", "target_instance_id", "TEXT")
+        # Phase 77: JSON list of task ids this job runs after. Set only at
+        # enqueue, only referencing tasks that already exist, immutable after
+        # - which makes cycles impossible by construction (an older task's
+        # deps were frozen before this one existed). NULL = no dependencies,
+        # so every historical row keeps its exact old behavior.
+        self._ensure_column("tasks", "depends_on", "TEXT")
         # Phase 36: runs whose spend actions pause for human approval.
         self._ensure_column("agent_runs", "require_approval",
                             "INTEGER NOT NULL DEFAULT 0")
@@ -681,7 +687,8 @@ class Database:
                     auto_manage: bool = False, gpu_type: str | None = None,
                     region: str | None = None,
                     filesystem: str | None = None,
-                    target_instance_id: str | None = None) -> str:
+                    target_instance_id: str | None = None,
+                    depends_on: list[str] | None = None) -> str:
         task_id = uuid.uuid4().hex[:12]
         # Auto-managed jobs start in lifecycle 'queued' with a first event
         # stamp; manual jobs leave lifecycle NULL (the field is unused for
@@ -692,11 +699,12 @@ class Database:
             """INSERT INTO tasks
                (id, created_at, template, parameters, status,
                 auto_manage, gpu_type, region, filesystem,
-                lifecycle, lifecycle_events, target_instance_id)
-               VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?)""",
+                lifecycle, lifecycle_events, target_instance_id, depends_on)
+               VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?)""",
             (task_id, utcnow(), template, json.dumps(parameters),
              1 if auto_manage else 0, gpu_type, region, filesystem,
-             lifecycle, events, target_instance_id),
+             lifecycle, events, target_instance_id,
+             json.dumps(depends_on) if depends_on else None),
         )
         return task_id
 
@@ -759,6 +767,7 @@ class Database:
         task["parameters"] = json.loads(task["parameters"])
         task["output_paths"] = json.loads(task["output_paths"] or "[]")
         task["auto_manage"] = bool(task.get("auto_manage"))
+        task["depends_on"] = json.loads(task["depends_on"]) if task.get("depends_on") else []
         events = json.loads(task["lifecycle_events"]) if task.get("lifecycle_events") else {}
         task["lifecycle_events"] = events
         # Launch-to-ready instrumentation: how long from kicking off the
@@ -797,14 +806,18 @@ class Database:
 
     # -- auto-manage lifecycle queries -----------------------------------------
 
-    def next_pending_auto_managed_task(self) -> dict | None:
-        """Oldest auto-managed job that has not started its lifecycle yet."""
-        row = self._execute(
+    def pending_auto_managed_tasks(self) -> list[dict]:
+        """ALL not-yet-started auto-managed jobs, oldest first. The lifecycle
+        loop scans these for the first one whose dependencies are met, so a
+        job waiting on a parent does not block a younger independent job
+        from taking the launch slot (the waiter waits on a TASK, not the
+        slot - nothing starves)."""
+        rows = self._execute(
             """SELECT * FROM tasks
                 WHERE auto_manage = 1 AND lifecycle = 'queued'
-                ORDER BY created_at, id LIMIT 1"""
-        ).fetchone()
-        return self._task_row(row) if row else None
+                ORDER BY created_at, id"""
+        ).fetchall()
+        return [self._task_row(r) for r in rows]
 
     def active_auto_managed_task(self) -> dict | None:
         """The auto-managed job currently holding the instance slot, if any.
@@ -849,6 +862,14 @@ class Database:
         ).fetchone()
         return row["n"]
 
+    def queued_dependents(self, task_id: str) -> list[dict]:
+        """Queued tasks whose depends_on names task_id. These still need the
+        parent row to gate on (the dependency check reads parent rows live),
+        so deleting the parent out from under them would leave a dangling
+        edge. A Python scan, not JSON SQL: the queued list is small."""
+        return [t for t in self.queued_tasks()
+                if task_id in (t.get("depends_on") or [])]
+
     def delete_task(self, task_id: str) -> None:
         """Remove one task and its logs (used by the Job History 'remove')."""
         with self._lock:
@@ -857,18 +878,28 @@ class Database:
             self._conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
             self._conn.commit()
 
+    # Terminal statuses history-clearing may remove. 'skipped' (a dependent
+    # that never ran because its parent did not succeed) is finished too.
+    FINISHED_STATUSES = ("succeeded", "failed", "skipped")
+
     def delete_finished_tasks(self) -> int:
-        """Clear all finished (succeeded/failed) tasks and their logs. Active
-        jobs (queued/running) are left untouched. Returns the count removed."""
+        """Clear finished (succeeded/failed/skipped) tasks and their logs.
+        Active jobs (queued/running) are left untouched, and so is any
+        finished task a QUEUED task still depends on - clearing a succeeded
+        parent while its child waits to dispatch would sever the edge the
+        child's gate reads. Returns the count removed."""
+        keep = {dep for t in self.queued_tasks()
+                for dep in (t.get("depends_on") or [])}
+        placeholders = ", ".join("?" for _ in self.FINISHED_STATUSES)
         with self._lock:
             ids = [r["id"] for r in self._conn.execute(
-                "SELECT id FROM tasks WHERE status IN ('succeeded', 'failed')"
-            ).fetchall()]
+                f"SELECT id FROM tasks WHERE status IN ({placeholders})",
+                self.FINISHED_STATUSES,
+            ).fetchall() if r["id"] not in keep]
             for tid in ids:
                 self._conn.execute("DELETE FROM task_logs WHERE task_id = ?",
                                    (tid,))
-            self._conn.execute(
-                "DELETE FROM tasks WHERE status IN ('succeeded', 'failed')")
+                self._conn.execute("DELETE FROM tasks WHERE id = ?", (tid,))
             self._conn.commit()
             return len(ids)
 

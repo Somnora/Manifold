@@ -44,7 +44,7 @@ Tools:
 - read_file {"path": "<file>"} -> first 16 KB of a file (relative paths = the persistent filesystem root)
 - list_templates {} -> runnable job templates and their parameters
 - run_job {"template": str, "parameters": {...}} -> queue a job on this instance (scrapes, transcodes, synthesis...)
-- get_job_status {"task_id": str} -> queued|running|succeeded|failed + output paths
+- get_job_status {"task_id": str} -> queued|running|succeeded|failed|skipped + output paths
 - get_job_logs {"task_id": str, "tail": int} -> recent log lines
 
 The tool result arrives as JSON in the next user message; an "error" key

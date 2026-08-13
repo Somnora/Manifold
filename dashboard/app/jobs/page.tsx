@@ -34,7 +34,12 @@ function normalizeModelId(raw: string): string {
 
 // A job is still "active" while its auto-managed lifecycle is in flight, even
 // after the container itself has exited (it is still syncing/terminating).
-const TERMINAL_LIFECYCLE = ["done", "failed", "cancelled"];
+const TERMINAL_LIFECYCLE = ["done", "failed", "cancelled", "skipped"];
+
+// Serve templates cannot be dependency parents: they never exit on their
+// own, so "after it succeeds" would mean never. The backend enforces this
+// (422) for every template with ports; the picker filters the bundled two.
+const SERVE_TEMPLATES = ["vllm-serve", "sglang-serve"];
 function isActiveJob(t: Task): boolean {
   if (t.status === "queued" || t.status === "running") return true;
   return (
@@ -68,6 +73,21 @@ export default function JobsPage() {
     (i: Instance) => i.connection_state === "connected",
   );
   const [targetInstance, setTargetInstance] = useState("");
+
+  // "Run after" (Phase 77): parents this job waits on. Only unsettled
+  // non-server jobs are offered - a dep on an already-succeeded task is
+  // legal in the API but pointless to click (it is already satisfied).
+  const [dependsOn, setDependsOn] = useState<string[]>([]);
+  const depCandidates = (tasks ?? []).filter(
+    (t) =>
+      (t.status === "queued" || t.status === "running") &&
+      !SERVE_TEMPLATES.includes(t.template),
+  );
+  function toggleDep(id: string) {
+    setDependsOn((prev) =>
+      prev.includes(id) ? prev.filter((d) => d !== id) : [...prev, id],
+    );
+  }
 
   // Also called by the template editor after a save/delete, so a new custom
   // template appears in the picker immediately.
@@ -140,12 +160,17 @@ export default function JobsPage() {
         values,
         autoConfig,
         !autoConfig && targetInstance ? targetInstance : undefined,
+        dependsOn,
       );
+      const chained = dependsOn.length
+        ? `; runs after ${dependsOn.length} job${dependsOn.length === 1 ? "" : "s"}`
+        : "";
       setNotice(
         autoConfig
-          ? `Queued ${task.id} (${task.template}): Manifold will rent a ${autoConfig.gpu_type} for it`
-          : `Queued ${task.id} (${task.template})`,
+          ? `Queued ${task.id} (${task.template}): Manifold will rent a ${autoConfig.gpu_type} for it${chained}`
+          : `Queued ${task.id} (${task.template})${chained}`,
       );
+      setDependsOn([]);
       refresh();
     } catch (err) {
       setError(err instanceof ApiError ? err.message : String(err));
@@ -266,6 +291,42 @@ export default function JobsPage() {
                   until one is running (launch one on Instances), or turn on
                   auto-manage above to rent a GPU just for it.
                 </p>
+              )}
+
+              {/* Run after (Phase 77): chain this job behind others. It
+                  stays queued until every checked job succeeds, and settles
+                  as "skipped" if one of them fails. For auto-manage jobs the
+                  GPU is not rented until the parents finish. */}
+              {depCandidates.length > 0 && (
+                <div className="rounded border border-zinc-200 bg-zinc-50 p-3">
+                  <p className="text-xs font-medium text-zinc-600">
+                    Run after
+                  </p>
+                  <p className="mt-0.5 text-[11px] text-zinc-500">
+                    Waits until every checked job succeeds; if one fails,
+                    this job is skipped instead of run.
+                    {auto.enabled &&
+                      " The GPU is not rented until they finish."}
+                  </p>
+                  <div className="mt-2 space-y-1">
+                    {depCandidates.map((t) => (
+                      <label
+                        key={t.id}
+                        className="flex items-center gap-2 text-xs text-zinc-700"
+                      >
+                        <input
+                          type="checkbox"
+                          checked={dependsOn.includes(t.id)}
+                          onChange={() => toggleDep(t.id)}
+                          className="rounded border-zinc-300"
+                        />
+                        <span className="font-medium">{t.template}</span>
+                        <span className="font-mono text-zinc-400">{t.id}</span>
+                        <StatusBadge status={t.status} />
+                      </label>
+                    ))}
+                  </div>
+                </div>
               )}
 
               {/* Advisory pre-launch estimate: what a run of this template is
@@ -478,7 +539,7 @@ function TaskCard({
   const lc = task.lifecycle;
   // In-flight auto-managed jobs must not be removed (their instance is still
   // being managed); they can be cancelled instead while pre-run.
-  const inFlightAuto = auto && !!lc && !["done", "failed", "cancelled"].includes(lc);
+  const inFlightAuto = auto && !!lc && !TERMINAL_LIFECYCLE.includes(lc);
   // Any job that has not settled can be stopped: queued jobs settle as
   // cancelled; running jobs (servers included, which never exit on their
   // own) get their container stopped on the instance.
@@ -648,6 +709,31 @@ function TaskCard({
 
       {auto && <LifecyclePipeline task={task} />}
 
+      {/* Dependency chips: which jobs this one runs after, with each edge's
+          live status. The queued card explains its own wait. */}
+      {(task.deps ?? []).length > 0 && (
+        <div className="mt-2 flex flex-wrap items-center gap-1.5 text-xs">
+          <span className="text-zinc-400">after:</span>
+          {(task.deps ?? []).map((dep) => (
+            <span
+              key={dep.id}
+              className="inline-flex items-center gap-1.5 rounded border border-zinc-200 bg-zinc-50 px-1.5 py-0.5"
+              title={
+                dep.status === "missing"
+                  ? "This dependency's record was removed."
+                  : `Runs after ${dep.template} (${dep.id}) succeeds.`
+              }
+            >
+              <span className="font-medium text-zinc-700">
+                {dep.template ?? "(removed)"}
+              </span>
+              <span className="font-mono text-zinc-400">{dep.id}</span>
+              <StatusBadge status={dep.status} />
+            </span>
+          ))}
+        </div>
+      )}
+
       {Object.keys(task.parameters).length > 0 && (
         <p className="mt-1 font-mono text-xs text-zinc-500">
           {Object.entries(task.parameters)
@@ -655,7 +741,17 @@ function TaskCard({
             .join("  ")}
         </p>
       )}
-      {task.error && <p className="mt-2 text-xs text-red-700">{task.error}</p>}
+      {task.error && (
+        /* A skipped job's "error" is an explanation, not a failure of this
+           job: render it calm, not red. The red belongs on the parent. */
+        <p
+          className={`mt-2 text-xs ${
+            task.status === "skipped" ? "text-zinc-500" : "text-red-700"
+          }`}
+        >
+          {task.error}
+        </p>
+      )}
       {task.status === "failed" && failTail !== null && (
         <div className="mt-2">
           <p className="mb-1 text-[11px] font-medium uppercase tracking-wide text-zinc-400">

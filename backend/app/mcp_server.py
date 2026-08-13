@@ -368,14 +368,25 @@ async def list_templates(note: str = "") -> dict:
 
 
 @mcp.tool()
-async def run_job(template: str, parameters: dict, note: str = "") -> dict:
+async def run_job(template: str, parameters: dict, note: str = "",
+                  depends_on: list[str] | None = None) -> dict:
     """Enqueue a job from a template. Parameters are validated against the
     template schema immediately. The job runs on the connected instance;
-    poll get_job_status. Logs stream to get_job_logs."""
+    poll get_job_status. Logs stream to get_job_logs.
+
+    depends_on chains jobs into a pipeline: pass task ids from earlier
+    run_job calls and this job waits until ALL of them succeed, settling as
+    'skipped' if any of them fails. Deps must already exist and may not be
+    servers (a server never exits; to run a batch job against a live server,
+    just run it - server and batch coexist on an instance by design)."""
+    body: dict = {"template": template, "parameters": parameters}
+    if depends_on:
+        body["depends_on"] = depends_on
     return await _call(
         "run_job", "POST", "/tasks",
-        note=note, args={"template": template, "parameters": parameters},
-        body={"template": template, "parameters": parameters},
+        note=note, args={"template": template, "parameters": parameters,
+                         **({"depends_on": depends_on} if depends_on else {})},
+        body=body,
     )
 
 
@@ -431,7 +442,7 @@ async def run_command(instance_id: str, command: str, timeout: float = 45,
 
 @mcp.tool()
 async def get_job_status(task_id: str, note: str = "") -> dict:
-    """Job state (queued|running|succeeded|failed), exit code, and the
+    """Job state (queued|running|succeeded|failed|skipped), exit code, and the
     persistent output paths it writes to."""
     return await _call(
         "get_job_status", "GET", f"/tasks/{task_id}",
@@ -724,7 +735,7 @@ async def _task_settled(task_id: str) -> bool:
         status = resp.json().get("status")
     except (httpx.HTTPError, ValueError):
         return False
-    return status in ("succeeded", "failed", "canceled", "cancelled")
+    return status in ("succeeded", "failed", "skipped")
 
 
 @mcp.tool()

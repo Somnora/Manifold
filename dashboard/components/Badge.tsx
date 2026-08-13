@@ -51,6 +51,11 @@ export function statusTone(status: string): { tone: Tone; pulse: boolean } {
     case "unhealthy":
     case "preempted":
       return { tone: "red", pulse: false };
+    case "skipped":
+      // Deliberately NOT red: a skipped job never ran (its dependency did
+      // not succeed). The failure is the parent's; red here would double-
+      // report one root cause down the whole chain.
+      return { tone: "zinc", pulse: false };
     default:
       return { tone: "zinc", pulse: false };
   }

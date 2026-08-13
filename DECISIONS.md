@@ -3372,3 +3372,98 @@ month, December rolling into January, the budget never refusing a launch while
 genuinely 12x over, `/spend/summary` reporting it, the negative-value clamp,
 the notification toggle existing, and the every-section preferences round trip.
 Full suite 723 passing; dashboard builds clean.
+
+## Phase 77 — Task dependencies: real edges, guarded (2026-08-12)
+
+- **A DAG by construction, not by detection.** `depends_on` is settable only at
+  enqueue, may only reference tasks that already exist, and is immutable after.
+  That one rule makes cycles impossible without a cycle detector: a new task
+  cannot be depended on by an older one, because the older one's deps were
+  frozen before the new task existed. Validation is therefore id lookup plus
+  status checks, no graph traversal. **Alternative:** editable deps with a
+  cycle check at write time — rejected; it buys a feature nobody asked for at
+  the price of a whole class of scheduler deadlocks having to be provably
+  impossible instead of trivially impossible.
+
+- **`skipped` is a first-class task status, not a flavor of `failed`.**
+  `failed` says the job ran and broke; a skipped job never ran, and pretending
+  otherwise poisons everything downstream of the status — runtime/cost
+  annotations, the failure card's log tail (there are no logs), the worklog,
+  the "reuse this failed job's error" instinct. The status sweep touched every
+  enumeration: badge tones (deliberately zinc, not red — the failure is the
+  parent's, and red here would double-report one root cause down the chain),
+  clear-finished, the SSE terminal checks (which also carried a phantom
+  `"canceled"` state that never existed), the MCP `_task_settled` helper, and
+  the agent-facing docs.
+
+- **Two gates, because there are two moments money moves.** The dispatch scan
+  (`_pick_dispatchable`) holds a manual child until every parent succeeded.
+  Auto-manage promotion (`_next_ready_auto_job`) holds the LAUNCH: a child
+  promoted early boots a billing GPU that then sits waiting for its parent.
+  The child waits on a task, not on the slot, so a younger independent auto
+  job is promoted past it and nothing starves. The A(auto) -> B(auto) pipeline
+  comes out of this for free: A launches, runs, syncs to the filesystem,
+  terminates; only then does B launch a fresh box and read A's outputs off the
+  filesystem. Zero overlap; the filesystem is the data bus.
+
+- **Failure cascades through the settle funnel, once, loudly.** `_finish_task`
+  is already the single funnel for every completion path, so the cascade hooks
+  there: any non-success settles every queued dependent (transitively) as
+  skipped, with the dead edge named one hop at a time. The cascade runs even
+  when the settle itself is notify=False (a user cancel) — children dying is
+  not optional bookkeeping. Notification stays one ping: the root failure's
+  existing job_failed message gains a "Skipped downstream" line instead of N
+  skip pings. The dispatch scan re-checks doomed deps as a self-healing
+  backstop (a crash between settle and cascade cannot strand a child queued
+  forever), and a dep whose row is missing settles as skipped rather than
+  waiting for a parent that no longer exists.
+
+- **Deleting a parent a queued child still needs is a 409, not a cascade.**
+  The dependency gate reads parent rows live, so removing the row would leave
+  a dangling edge. Remove-single blocks with the dependents named;
+  clear-finished silently keeps such parents (clearing history must stay a
+  safe bulk action, so it skips rather than errors). **Alternative:** resolve
+  dep status onto the child at settle time so parent rows become disposable —
+  rejected as state duplication; two copies of a status will eventually
+  disagree, and the guard is two small queries.
+
+- **Server templates cannot be dependency parents (422 at enqueue).** A server
+  never exits on its own, so "after it succeeds" would mean never — a job that
+  waits forever by construction, hidden inside a legitimate-looking feature.
+  The error teaches the working pattern instead: server and batch coexist on
+  one instance by design, so a batch job that needs a live server just targets
+  the server's instance. A "run after the server is UP" edge type is real and
+  deferred; it is a different edge, not a different opinion about this one.
+
+- **The task graph now draws only real edges.** The panel previously chained
+  `tasks[i-1] -> tasks[i]` in list order — two unrelated jobs rendered as a
+  pipeline, an invented dependency on the same screen that was scrubbed of
+  invented dollars in 76a. Edges now come from `depends_on` only, layout is
+  by dependency depth (independent jobs all in column 0, no arrows), a skipped
+  child's edge renders severed (dashed), and the header claims exactly what
+  the panel shows. Rider fix in the same spirit: the cluster launch modal's
+  burn-rate preview invented $24.72/hr when the catalog had not answered; it
+  now says "rate unavailable" — never a made-up number on the screen where the
+  user decides to spend.
+
+- **Spend-route tests no longer depend on the time of day.** Two 76c tests
+  placed a launch "3 hours ago" and asserted it in today's bucket — false
+  between 00:00 and 03:00 UTC, which is evening PDT, which is when this phase
+  ran the suite. The fixture now anchors the caller's timezone so "now" is
+  local noon: same-day at any wall-clock time, and the tz plumbing gets
+  exercised for real instead of defaulting to UTC.
+
+**Test coverage:** `tests/test_task_dependencies.py` — the dispatch gate
+(queued/running parent holds the child, success releases it, dep on an
+already-succeeded parent is satisfied, independent tasks flow past a waiting
+child), the cascade (chain skip with per-hop reasons, mixed parents, cancel
+cascades with notify off, exactly one ping naming the downstream, missing-row
+self-heal), the auto-manage gate (a child is never offered the launch slot
+while its parent is unfinished — the spend test — a younger independent job
+takes the slot past it, a doomed auto child leaves the pending scan with a
+terminal lifecycle), enqueue validation (unknown/dead/server parents,
+dedupe), resolution on list/get, both delete guards, skipped reaping, and the
+pipeline over HTTP (ordered by timestamps; cancelled root skips the chain
+with the skip in the event trail). Full suite 745 passing; dashboard builds
+clean; live probe against a running mock backend confirmed the 422s, the 409
+guard, the transitive cascade, and A-before-B ordering on a real dispatch.

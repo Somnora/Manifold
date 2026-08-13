@@ -20,6 +20,19 @@ def _iso(moment: datetime) -> str:
     return moment.astimezone(timezone.utc).isoformat(timespec="seconds")
 
 
+def _noon_tz() -> int:
+    """A tz_offset_minutes that makes 'now' local noon.
+
+    The today/series assertions place a launch a few hours before now and
+    expect it in the current day's bucket. In plain UTC that is only true
+    mid-day: run the suite between 00:00 and 03:00 UTC and '3 hours ago'
+    is yesterday, so today_usd is honestly $0 and the test lies about a
+    bug. Anchoring the caller's clock at noon makes the fixture same-day
+    at any wall-clock time - and exercises the tz plumbing for real."""
+    now = datetime.now(timezone.utc)
+    return 720 - (now.hour * 60 + now.minute)
+
+
 def _finished_launch(db, *, hours_ago=4.0, hours=2.0, rate_cents=129):
     """One launch that ran and stopped, written the way the pipeline does."""
     launched = datetime.now(timezone.utc) - timedelta(hours=hours_ago)
@@ -44,12 +57,14 @@ def test_summary_totals_a_finished_run_and_carries_the_disclaimer(client):
     db = client.app.state.orchestrator.db
     _finished_launch(db, hours_ago=3.0, hours=2.0)          # 2h at $1.29/hr
 
-    body = client.get("/spend/summary").json()
+    body = client.get("/spend/summary",
+                      params={"tz_offset_minutes": _noon_tz()}).json()
     assert body["all_time_usd"] == 2.58
     assert body["today_usd"] == 2.58
     assert body["lower_bound"] is True
     assert "upper bound" in body["disclaimer"]
-    assert body["timezone_label"] == "UTC+00:00"
+    # The label's exact formatting is proved in the caller's-timezone test.
+    assert body["timezone_label"].startswith("UTC")
 
 
 def test_summary_buckets_in_the_callers_timezone(client):
@@ -71,7 +86,9 @@ def test_series_is_gap_filled_and_carries_the_mock_marker(client):
     db = client.app.state.orchestrator.db
     _finished_launch(db, hours_ago=2.0, hours=1.0)
 
-    body = client.get("/spend/series", params={"days": 7}).json()
+    body = client.get("/spend/series",
+                      params={"days": 7,
+                              "tz_offset_minutes": _noon_tz()}).json()
     assert body["mock"] is False
     assert len(body["series"]) == 7                 # zeros, not holes
     assert body["series"][-1]["usd"] == 1.29

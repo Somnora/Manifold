@@ -12,8 +12,6 @@ import {
   Position,
   Node,
   Edge,
-  useNodesState,
-  useEdgesState,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 
@@ -22,6 +20,7 @@ function TaskNode({ data }: { data: { task: Task } }) {
   const isRunning = task.status === "running";
   const isFailed = task.status === "failed";
   const isSuccess = task.status === "succeeded";
+  const isSkipped = task.status === "skipped";
 
   return (
     <div
@@ -32,6 +31,8 @@ function TaskNode({ data }: { data: { task: Task } }) {
           ? "border-emerald-200 bg-emerald-50"
           : isFailed
           ? "border-red-200 bg-red-50"
+          : isSkipped
+          ? "border-zinc-200 bg-zinc-100 opacity-70"
           : "border-zinc-200 bg-white"
       }`}
     >
@@ -78,30 +79,67 @@ export function VisualTaskGraph() {
 
   const tasks = history || [];
 
-  const initialNodes: Node[] = useMemo(() => {
-    return tasks.map((task, idx) => ({
-      id: task.id,
-      position: { x: idx * 280, y: 100 },
-      data: { task },
-      type: "taskNode",
-    }));
-  }, [tasks]);
+  // Layout and edges both come from depends_on, the REAL dependency data.
+  // (An earlier version drew an arrow from each task to the next one in
+  // list order, which presented two unrelated jobs as a pipeline. Edges
+  // that do not exist in the scheduler must not exist on screen.)
+  //
+  // Depth = longest dependency chain above the task: parents at depth d,
+  // children at d+1, independent jobs all in column 0.
+  const { initialNodes, initialEdges } = useMemo(() => {
+    const byId = new Map(tasks.map((t) => [t.id, t]));
+    const depths = new Map<string, number>();
+    const depth = (id: string, seen: Set<string> = new Set()): number => {
+      const known = depths.get(id);
+      if (known !== undefined) return known;
+      if (seen.has(id)) return 0; // impossible by construction; stay safe
+      seen.add(id);
+      const task = byId.get(id);
+      const parents = (task?.depends_on ?? []).filter((p) => byId.has(p));
+      const d =
+        parents.length === 0
+          ? 0
+          : 1 + Math.max(...parents.map((p) => depth(p, seen)));
+      depths.set(id, d);
+      return d;
+    };
 
-  const initialEdges: Edge[] = useMemo(() => {
-    return tasks.slice(1).map((task, idx) => {
-      const prevTask = tasks[idx];
-      const isRunning = task.status === "running";
+    const rows = new Map<number, number>(); // depth -> next free row
+    const nodes: Node[] = tasks.map((task) => {
+      const d = depth(task.id);
+      const row = rows.get(d) ?? 0;
+      rows.set(d, row + 1);
       return {
-        id: `e-${prevTask.id}-${task.id}`,
-        source: prevTask.id,
-        target: task.id,
-        animated: isRunning,
-        style: {
-          stroke: isRunning ? "var(--color-amber-500)" : "var(--color-zinc-300)",
-          strokeWidth: 2,
-        },
+        id: task.id,
+        position: { x: d * 280, y: row * 150 },
+        data: { task },
+        type: "taskNode",
       };
     });
+
+    const edges: Edge[] = tasks.flatMap((task) =>
+      (task.depends_on ?? [])
+        .filter((p) => byId.has(p)) // a deleted parent has no node to point from
+        .map((parentId) => {
+          const isRunning = task.status === "running";
+          const isSkipped = task.status === "skipped";
+          return {
+            id: `e-${parentId}-${task.id}`,
+            source: parentId,
+            target: task.id,
+            animated: isRunning,
+            style: {
+              stroke: isRunning
+                ? "var(--color-amber-500)"
+                : "var(--color-zinc-300)",
+              strokeWidth: 2,
+              // A dead edge (the child was skipped) reads as severed.
+              ...(isSkipped ? { strokeDasharray: "6 4" } : {}),
+            },
+          };
+        }),
+    );
+    return { initialNodes: nodes, initialEdges: edges };
   }, [tasks]);
 
   const onNodeClick = (_: React.MouseEvent, node: Node) => {
@@ -116,14 +154,15 @@ export function VisualTaskGraph() {
         <div>
           <h2 className="text-lg font-semibold tracking-tight text-zinc-900 flex items-center gap-2">
             <span className="h-2.5 w-2.5 rounded-full bg-sky-500 animate-pulse" />
-            Visual Agent Task Graph
+            Job pipeline
           </h2>
           <p className="text-xs text-zinc-500 mt-0.5">
-            Real-time execution workflow, subagent task trees, and cluster jobs
+            Every job, with its declared run-after dependencies. An arrow
+            means "runs after"; jobs with no arrows are independent.
           </p>
         </div>
         <span className="rounded-full bg-zinc-100 border border-zinc-200 px-3 py-1 text-xs text-zinc-600 font-mono">
-          {tasks.filter((t) => t.status === "running").length} Active Node(s)
+          {tasks.filter((t) => t.status === "running").length} running
         </span>
       </div>
 
@@ -131,7 +170,8 @@ export function VisualTaskGraph() {
       <div className="mt-4 h-[400px] w-full rounded-lg border border-zinc-200 bg-zinc-950 relative overflow-hidden shrink-0">
         {tasks.length === 0 ? (
           <div className="absolute inset-0 flex items-center justify-center text-xs text-zinc-500">
-            No active or historical tasks in workflow graph.
+            No jobs yet. Queue one on the Jobs page; chain jobs with "Run
+            after" and the arrows appear here.
           </div>
         ) : (
           <ReactFlow

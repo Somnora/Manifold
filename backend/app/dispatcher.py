@@ -406,11 +406,15 @@ class Dispatcher:
         self.queue.mark_finished(task_id, exit_code=exit_code,
                                  output_paths=output_paths, error=error)
         self._worklog_task(task_id)
+        task = self.queue.get(task_id) or {}
+        succeeded = task.get("status") == "succeeded"
+        # A task that will never succeed takes its queued dependents with it
+        # - cancelled included, and whether or not anyone gets pinged. The
+        # cascade must not depend on the notification path.
+        downstream = [] if succeeded else self._skip_dependents(task_id)
         if not notify or self.notifier is None:
             return
-        task = self.queue.get(task_id) or {}
         name = task.get("template", "job")
-        succeeded = task.get("status") == "succeeded"
         where = f" on {task['instance_id']}" if task.get("instance_id") else ""
         if succeeded:
             outputs = task.get("output_paths") or []
@@ -421,10 +425,11 @@ class Dispatcher:
                 ref=task_id,
             )
         else:
+            body = f"{task_id}{where}\n{(error or f'exit {exit_code}')[:200]}"
+            if downstream:
+                body += "\nSkipped downstream: " + ", ".join(downstream)
             self.notifier.notify(
-                "job_failed", f"Job failed: {name}",
-                f"{task_id}{where}\n{(error or f'exit {exit_code}')[:200]}",
-                ref=task_id,
+                "job_failed", f"Job failed: {name}", body, ref=task_id,
             )
 
     def _worklog_task(self, task_id: str) -> None:
@@ -473,6 +478,61 @@ class Dispatcher:
                 f"job {task['template']} {task['status']}", lines)
         except Exception:   # a log entry must never break the funnel
             logger.exception("worklog entry for task %s failed", task_id)
+
+    # -- task dependencies (Phase 77) --------------------------------------------------
+
+    def _dep_state(self, task: dict) -> tuple[bool, str]:
+        """Resolve a task's depends_on against the live task table.
+
+        Returns (met, blocked). met means every dependency succeeded and the
+        task may dispatch (or, for auto-manage, launch). blocked is non-empty
+        when a dependency can never succeed anymore - failed, skipped, or its
+        row is gone - so the task should settle as skipped rather than sit
+        queued forever."""
+        met = True
+        for dep_id in task.get("depends_on") or []:
+            dep = self.queue.get(dep_id)
+            if dep is None:
+                return False, f"dependency {dep_id} no longer exists"
+            if dep["status"] in ("failed", "skipped"):
+                return False, (f"dependency {dep_id} ({dep['template']}) "
+                               f"{dep['status']}")
+            if dep["status"] != "succeeded":
+                met = False
+        return met, ""
+
+    def _skip_task(self, task: dict, reason: str) -> None:
+        """Settle a queued task as skipped: it never ran and never will.
+
+        Mirrors _finish_task's bookkeeping (event, audit, worklog) but never
+        pings per task - the root failure's own notification carries the list
+        of everything it took down, so a dead pipeline is one ping, not N."""
+        reason = f"skipped: {reason}"
+        self.db.record_task_event(task["id"], "skipped", detail=reason)
+        self.queue.mark_skipped(task["id"], reason)
+        if task.get("auto_manage"):
+            # Terminal lifecycle too, or the pending scan would keep offering
+            # this job the launch slot forever.
+            self.db.set_task_lifecycle(task["id"], "skipped", detail=reason)
+        self.db.record_audit("backend", "task_skipped",
+                             f"{task['id']}: {reason}")
+        self._worklog_task(task["id"])
+
+    def _skip_dependents(self, root_id: str) -> list[str]:
+        """Cascade a non-success: every queued task depending on root,
+        transitively, settles as skipped. Returns the skipped ids."""
+        skipped: list[str] = []
+        frontier = [root_id]
+        while frontier:
+            parent_id = frontier.pop(0)
+            parent = self.queue.get(parent_id)
+            label = (f"{parent_id} ({parent['template']})"
+                     if parent else parent_id)
+            for t in self.db.queued_dependents(parent_id):
+                self._skip_task(t, f"dependency {label} did not succeed")
+                skipped.append(t["id"])
+                frontier.append(t["id"])
+        return skipped
 
     # -- idle keep-alive ---------------------------------------------------------------
 
@@ -728,6 +788,15 @@ class Dispatcher:
         for task in self.db.queued_tasks():
             if task["id"] in self._dispatching:
                 continue   # picked on a previous tick, not yet marked running
+            met, blocked = self._dep_state(task)
+            if blocked:
+                # Normally the cascade settles these the moment the parent
+                # fails; this catches anything that slipped through (a crash
+                # between settle and cascade). Self-healing, never stuck.
+                self._skip_task(task, blocked)
+                continue
+            if not met:
+                continue   # waiting on a parent; younger tasks flow past
             server = self._is_server(task["template"])
             if task["auto_manage"]:
                 if task["lifecycle"] != "ready" or not task["launch_id"]:
@@ -1479,7 +1548,7 @@ class Dispatcher:
         # the slot is free (the current one reached a terminal state).
         job = self.db.active_auto_managed_task()
         if job is None:
-            job = self.db.next_pending_auto_managed_task()
+            job = self._next_ready_auto_job()
             if job is None:
                 return
         lc = job["lifecycle"]
@@ -1498,6 +1567,24 @@ class Dispatcher:
             await self._auto_sync(job)
         elif lc == "terminating":
             await self._auto_terminate(job)
+
+    def _next_ready_auto_job(self) -> dict | None:
+        """Oldest pending auto-managed job whose dependencies are met.
+
+        Promotion LAUNCHES a GPU, so a child whose parent is still running
+        must not be promoted - a box booted early bills for the whole wait.
+        The child waits on its parent, not on the slot, so a younger
+        independent job may take the slot meanwhile and nothing starves.
+        Doomed jobs (a parent that can never succeed) settle as skipped here
+        rather than clogging the pending scan."""
+        for job in self.db.pending_auto_managed_tasks():
+            met, blocked = self._dep_state(job)
+            if blocked:
+                self._skip_task(job, blocked)
+                continue
+            if met:
+                return job
+        return None
 
     def _job_instance_id(self, job: dict,
                          launch_id: str | None = None) -> str | None:
@@ -1650,7 +1737,7 @@ class Dispatcher:
     def _auto_check_run_done(self, job: dict) -> None:
         """running -> syncing once the dispatched task settles."""
         task = self.queue.get(job["id"])
-        if task and task["status"] in ("succeeded", "failed"):
+        if task and task["status"] in ("succeeded", "failed", "skipped"):
             self._transition(
                 job, "syncing", instance_id=self._job_instance_id(job),
                 detail=f"job {task['status']}; syncing outputs to persistent")
@@ -1772,7 +1859,7 @@ class Dispatcher:
         if not task["auto_manage"]:
             raise LaunchRejected(400, f"task {task_id} is not auto-managed")
         lc = task["lifecycle"]
-        if lc in ("done", "failed", "cancelled"):
+        if lc in ("done", "failed", "cancelled", "skipped"):
             raise LaunchRejected(409, f"job is already {lc}")
         if lc in ("running", "syncing", "terminating"):
             raise LaunchRejected(

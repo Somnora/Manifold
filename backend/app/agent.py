@@ -107,7 +107,7 @@ Actions:
 - list_templates {} -> runnable job templates and their parameters
 - run_job {"template": str, "parameters": {...}} -> queue a job on the connected instance
 - save_template {"yaml": str} -> create a custom job template (image, command with {{param}} placeholders, parameter schema; mounts only under {persistent} or /workspace/ephemeral). Use when the goal needs a job no existing template covers - then run it with run_job. The template stays for the user afterwards, so parameterize it well.
-- get_job_status {"task_id": str} -> queued|running|succeeded|failed + outputs
+- get_job_status {"task_id": str} -> queued|running|succeeded|failed|skipped + outputs
 - get_job_logs {"task_id": str, "tail": int} -> recent log lines
 - sync_outputs {"instance_id": str} -> save ephemeral scratch to persistent storage
 - terminate_instance {"instance_id": str, "force": bool} -> stop billing; force=false first RESCUES ephemeral files (saving them to persistent storage), and is blocked only if some file still could not be saved

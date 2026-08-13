@@ -209,14 +209,25 @@ export type Lifecycle =
   | "terminating"
   | "done"
   | "failed"
-  | "cancelled";
+  | "cancelled"
+  | "skipped";
+
+// A dependency edge, resolved by the backend so cards can render chips
+// without re-joining. status "missing" = the parent row was deleted.
+export type TaskDep = {
+  id: string;
+  template: string | null;
+  status: Task["status"] | "missing";
+};
 
 export type Task = {
   id: string;
   created_at: string;
   template: string;
   parameters: Record<string, unknown>;
-  status: "queued" | "running" | "succeeded" | "failed";
+  // "skipped": never ran and never will - a task it depends on did not
+  // succeed. Distinct from "failed" (which means the job ran and broke).
+  status: "queued" | "running" | "succeeded" | "failed" | "skipped";
   instance_id: string | null;
   started_at: string | null;
   finished_at: string | null;
@@ -238,6 +249,11 @@ export type Task = {
   // rate (null on adopted instances where the rate is unknown).
   runtime_seconds: number | null;
   actual_cost_cents: number | null;
+  // Phase 77: task ids this job runs after, plus the backend's resolution
+  // of each edge. deps is absent on some payloads (single-task fetch older
+  // than the list call) - treat undefined as [].
+  depends_on: string[];
+  deps?: TaskDep[];
 };
 
 export type AutoManageConfig = {
@@ -592,6 +608,7 @@ export const api = {
     parameters: Record<string, unknown>,
     auto?: AutoManageConfig,
     targetInstanceId?: string,
+    dependsOn?: string[],
   ) =>
     request<{ task: Task }>("/tasks", {
       method: "POST",
@@ -602,6 +619,7 @@ export const api = {
         ...(!auto && targetInstanceId
           ? { target_instance_id: targetInstanceId }
           : {}),
+        ...(dependsOn && dependsOn.length ? { depends_on: dependsOn } : {}),
       }),
     }).then((r) => r.task),
 

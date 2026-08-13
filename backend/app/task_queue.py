@@ -59,12 +59,18 @@ class TaskQueue(abc.ABC):
                 auto_manage: bool = False, gpu_type: str | None = None,
                 region: str | None = None,
                 filesystem: str | None = None,
-                target_instance_id: str | None = None) -> str:
+                target_instance_id: str | None = None,
+                depends_on: list[str] | None = None) -> str:
         """Add a task; returns its id.
 
         When auto_manage is set, the dispatcher owns the instance lifecycle
         for this job (launch -> run -> sync -> terminate) using the supplied
-        gpu_type/region/filesystem."""
+        gpu_type/region/filesystem.
+
+        depends_on lists task ids this job runs AFTER: it stays queued until
+        every one of them has succeeded, and settles as 'skipped' if any of
+        them cannot succeed anymore. Validated by the caller (ids must exist),
+        immutable after enqueue."""
 
     @abc.abstractmethod
     def next_queued(self) -> dict | None:
@@ -76,6 +82,12 @@ class TaskQueue(abc.ABC):
     @abc.abstractmethod
     def mark_finished(self, task_id: str, *, exit_code: int,
                       output_paths: list[str], error: str = "") -> None: ...
+
+    @abc.abstractmethod
+    def mark_skipped(self, task_id: str, reason: str) -> None:
+        """Settle a queued task as 'skipped': it never ran and never will,
+        because a task it depends on did not succeed. Distinct from 'failed'
+        on purpose - failed says the job ran and broke."""
 
     @abc.abstractmethod
     def append_log(self, task_id: str, line: str) -> None: ...
@@ -107,12 +119,15 @@ class SQLiteTaskQueue(TaskQueue):
                 auto_manage: bool = False, gpu_type: str | None = None,
                 region: str | None = None,
                 filesystem: str | None = None,
-                target_instance_id: str | None = None) -> str:
+                target_instance_id: str | None = None,
+                depends_on: list[str] | None = None) -> str:
         task_id = self._db.create_task(
             template=template, parameters=parameters, auto_manage=auto_manage,
             gpu_type=gpu_type, region=region, filesystem=filesystem,
-            target_instance_id=target_instance_id)
-        self._db.record_task_event(task_id, "queued")
+            target_instance_id=target_instance_id, depends_on=depends_on)
+        self._db.record_task_event(
+            task_id, "queued",
+            detail=f"after {', '.join(depends_on)}" if depends_on else None)
         return task_id
 
     def next_queued(self) -> dict | None:
@@ -133,6 +148,14 @@ class SQLiteTaskQueue(TaskQueue):
             exit_code=exit_code,
             output_paths=output_paths,
             error=error or None,
+        )
+
+    def mark_skipped(self, task_id: str, reason: str) -> None:
+        self._db.update_task(
+            task_id,
+            status="skipped",
+            finished_at=utcnow(),
+            error=reason,
         )
 
     def append_log(self, task_id: str, line: str) -> None:

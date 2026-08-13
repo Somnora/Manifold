@@ -87,6 +87,11 @@ desktop app or a dev backend must be running). GET /health confirms it.
 
 - `run_job` with `script-run` for one-off scripts, or `save_template` to
   turn a proven workflow into a reusable recipe with parameters.
+- Chain jobs with `depends_on`: pass earlier task ids and the job waits
+  until ALL of them succeed, settling as `skipped` if any fails. No
+  polling loop needed to sequence a pipeline; enqueue the whole chain up
+  front. Servers cannot be parents (they never exit); to use a live
+  server, just run the batch job - server and batch coexist per instance.
 - `upload_file` puts local files on the instance (relative paths land on
   the persistent filesystem). `download_file` brings results back.
 - Outputs you care about belong on the persistent filesystem. Check
@@ -97,7 +102,9 @@ desktop app or a dev backend must be running). GET /health confirms it.
 The proven pipeline, end to end (see docs/distill-your-own-model.md):
 `vllm-serve` a teacher, `llm-synthesize` a dataset from it, then
 `axolotl-finetune` a student LoRA. All three are templates; all three
-run on the same instance sequentially.
+run on the same instance sequentially. The finetune step can be
+enqueued up front with `depends_on` on the synthesize task: it holds
+until the dataset job succeeds and is skipped if it fails.
 
 ### Browse files
 

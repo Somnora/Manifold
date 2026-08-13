@@ -469,9 +469,18 @@ export function ClusterPanel() {
                 <div className="pt-4 flex justify-between items-center border-t border-zinc-200">
                   <div className="text-xs text-zinc-500 flex flex-col">
                     <span>Est. Burn Rate</span>
-                    <span className="text-emerald-700 font-mono font-medium">
-                      ${((types[gpuType]?.price_usd_per_hour || 24.72) * nodeCount).toFixed(2)}/hr
-                    </span>
+                    {/* Catalog rate only. Never invent a number on the
+                        screen where the user decides to spend: until the
+                        catalog answers, say so. */}
+                    {types[gpuType] ? (
+                      <span className="text-emerald-700 font-mono font-medium">
+                        ${(types[gpuType].price_usd_per_hour * nodeCount).toFixed(2)}/hr
+                      </span>
+                    ) : (
+                      <span className="font-mono text-zinc-400">
+                        rate unavailable
+                      </span>
+                    )}
                   </div>
                   <div className="flex gap-3">
                     <button
