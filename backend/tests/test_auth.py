@@ -278,17 +278,25 @@ def test_v1_accepts_api_token_when_no_proxy_key(auth_client):
     assert auth_client.get("/v1/models", headers=AUTH).status_code == 200
 
 
-def test_v1_proxy_key_wins_over_api_token(tmp_path, mock_client,
-                                          mock_storage, mock_sidecar):
+def test_v1_accepts_proxy_key_and_principals_alike(tmp_path, mock_client,
+                                                   mock_storage,
+                                                   mock_sidecar):
+    """CONTRACT CHANGE (Phase 80): 78 made the proxy key exclusive when
+    set. With roles, principals are legitimate /v1 callers - role-gated -
+    and exclusivity would lock every minted token out of the proxy the
+    moment a dedicated key exists, while buying nothing (the api token
+    holder already had full API power). The proxy key remains the
+    no-principal credential for pure model tools."""
     app = auth_app(tmp_path, mock_client, mock_storage, mock_sidecar,
                    proxy_api_key="proxy-secret")
     with TestClient(app) as client:
         ok = client.get("/v1/models",
                         headers={"Authorization": "Bearer proxy-secret"})
         assert ok.status_code == 200
-        # The dedicated key is THE /v1 credential once set; the global
-        # token does not also open the proxy.
-        assert client.get("/v1/models", headers=AUTH).status_code == 401
+        assert client.get("/v1/models", headers=AUTH).status_code == 200
+        assert client.get(
+            "/v1/models",
+            headers={"Authorization": "Bearer wrong"}).status_code == 401
     # (Open-when-neither is pinned by test_openai_proxy.py's
     # test_proxy_open_when_no_key, unchanged.)
 

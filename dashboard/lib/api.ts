@@ -170,9 +170,14 @@ export type Launch = {
 
 // Phase 79: a named API credential. The token value exists only in the
 // mint response; list rows carry liveness, never secrets.
+// Phase 80: each carries a role - viewer observes, operator works,
+// admin governs. The .env token is always admin.
+export type PrincipalRole = "viewer" | "operator" | "admin";
+
 export type Principal = {
   id: string;
   name: string;
+  role: PrincipalRole;
   created_at: string;
   created_by: string;
   last_used_at: string | null;
@@ -668,11 +673,14 @@ export const api = {
   principals: () =>
     request<{ principals: Principal[]; auth_enabled: boolean }>("/principals"),
 
-  createPrincipal: (name: string) =>
-    request<{ name: string; token: string; note: string }>("/principals", {
-      method: "POST",
-      body: JSON.stringify({ name }),
-    }),
+  createPrincipal: (name: string, role: PrincipalRole = "operator") =>
+    request<{ name: string; role: PrincipalRole; token: string; note: string }>(
+      "/principals",
+      {
+        method: "POST",
+        body: JSON.stringify({ name, role }),
+      },
+    ),
 
   revokePrincipal: (name: string) =>
     request<{ revoked: string }>(`/principals/${name}`, { method: "DELETE" }),

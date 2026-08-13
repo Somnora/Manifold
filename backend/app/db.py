@@ -372,6 +372,11 @@ class Database:
         self._ensure_column("tasks", "created_by", "TEXT")
         self._ensure_column("watches", "created_by", "TEXT")
         self._ensure_column("agent_runs", "created_by", "TEXT")
+        # Phase 80: a principal's role. Pre-80 rows default to operator -
+        # exactly what a minted token could do before roles existed (act,
+        # but not manage credentials or policy).
+        self._ensure_column("api_principals", "role",
+                            "TEXT NOT NULL DEFAULT 'operator'")
         # Phase 36: runs whose spend actions pause for human approval.
         self._ensure_column("agent_runs", "require_approval",
                             "INTEGER NOT NULL DEFAULT 0")
@@ -691,13 +696,13 @@ class Database:
     # -- api principals (Phase 79) ---------------------------------------------
 
     def create_principal(self, *, name: str, token_hash: str,
-                         created_by: str) -> str:
+                         created_by: str, role: str = "operator") -> str:
         pid = uuid.uuid4().hex[:12]
         self._execute(
             """INSERT INTO api_principals
-               (id, name, token_hash, created_at, created_by)
-               VALUES (?, ?, ?, ?, ?)""",
-            (pid, name, token_hash, utcnow(), created_by),
+               (id, name, token_hash, created_at, created_by, role)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (pid, name, token_hash, utcnow(), created_by, role),
         )
         return pid
 
@@ -719,7 +724,7 @@ class Database:
         """All principals WITHOUT their hashes: this feeds the API, and a
         hash is still an offline-crackable fingerprint of a secret."""
         rows = self._execute(
-            """SELECT id, name, created_at, created_by, last_used_at,
+            """SELECT id, name, role, created_at, created_by, last_used_at,
                       revoked_at
                  FROM api_principals ORDER BY created_at, id"""
         ).fetchall()

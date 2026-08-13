@@ -1,8 +1,20 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { api, ApiError, type Principal } from "@/lib/api";
+import {
+  api,
+  ApiError,
+  type Principal,
+  type PrincipalRole,
+} from "@/lib/api";
 import { formatDate } from "@/lib/format";
+
+// What each role means, shown where the choice is made (Phase 80).
+const ROLE_HELP: Record<PrincipalRole, string> = {
+  viewer: "observes: instances, spend, logs. Launches nothing.",
+  operator: "works: launches, jobs, terminals, files.",
+  admin: "governs: secrets, policy, credentials. Owner-minted only.",
+};
 
 // Named API tokens (Phase 79). Every launch, job, and audit row carries
 // the name of the token that caused it, so give each caller its own:
@@ -13,6 +25,7 @@ export function PrincipalsPanel() {
   const [principals, setPrincipals] = useState<Principal[]>([]);
   const [authEnabled, setAuthEnabled] = useState<boolean | null>(null);
   const [name, setName] = useState("");
+  const [role, setRole] = useState<PrincipalRole>("operator");
   const [minted, setMinted] = useState<{ name: string; token: string } | null>(
     null,
   );
@@ -36,7 +49,7 @@ export function PrincipalsPanel() {
     setError("");
     setMinted(null);
     try {
-      const r = await api.createPrincipal(name.trim().toLowerCase());
+      const r = await api.createPrincipal(name.trim().toLowerCase(), role);
       setMinted({ name: r.name, token: r.token });
       setCopied(false);
       setName("");
@@ -85,20 +98,34 @@ export function PrincipalsPanel() {
       )}
 
       {authEnabled && (
-        <div className="mt-3 flex gap-2">
-          <input
-            value={name}
-            onChange={(e) => setName(e.target.value)}
-            placeholder="e.g. claude-mcp, ci-runner"
-            className="w-56 rounded border border-zinc-300 px-2.5 py-1.5 text-sm"
-          />
-          <button
-            onClick={mint}
-            disabled={busy || name.trim().length < 2}
-            className="rounded border border-zinc-900 bg-zinc-900 px-3 py-1.5 text-xs font-medium text-white hover:bg-zinc-700 disabled:opacity-50"
-          >
-            {busy ? "Minting..." : "Mint token"}
-          </button>
+        <div className="mt-3 space-y-1.5">
+          <div className="flex gap-2">
+            <input
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              placeholder="e.g. claude-mcp, ci-runner"
+              className="w-56 rounded border border-zinc-300 px-2.5 py-1.5 text-sm"
+            />
+            <select
+              value={role}
+              onChange={(e) => setRole(e.target.value as PrincipalRole)}
+              className="rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm"
+            >
+              <option value="viewer">viewer</option>
+              <option value="operator">operator</option>
+              <option value="admin">admin</option>
+            </select>
+            <button
+              onClick={mint}
+              disabled={busy || name.trim().length < 2}
+              className="rounded border border-zinc-900 bg-zinc-900 px-3 py-1.5 text-xs font-medium text-white hover:bg-zinc-700 disabled:opacity-50"
+            >
+              {busy ? "Minting..." : "Mint token"}
+            </button>
+          </div>
+          <p className="text-[11px] text-zinc-400">
+            {role}: {ROLE_HELP[role]}
+          </p>
         </div>
       )}
 
@@ -131,6 +158,18 @@ export function PrincipalsPanel() {
           {principals.map((p) => (
             <li key={p.id} className="flex items-center gap-3 py-2 text-sm">
               <span className="font-mono text-zinc-800">{p.name}</span>
+              <span
+                title={ROLE_HELP[p.role] ?? ""}
+                className={`rounded px-1.5 py-0.5 text-[11px] font-medium ${
+                  p.role === "admin"
+                    ? "bg-amber-100 text-amber-800"
+                    : p.role === "viewer"
+                      ? "bg-zinc-100 text-zinc-500"
+                      : "bg-sky-100 text-sky-800"
+                }`}
+              >
+                {p.role}
+              </span>
               {p.revoked_at ? (
                 <span className="rounded bg-zinc-100 px-1.5 py-0.5 text-[11px] text-zinc-500">
                   revoked {formatDate(p.revoked_at)}

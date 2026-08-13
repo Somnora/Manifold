@@ -40,6 +40,11 @@ and audit row the agent causes then carries its name instead of yours,
 and revoking the agent's access is one click that does not touch your own
 credential.
 
+Mint it with role `operator` (the default): the agent can launch, run
+jobs, and manage files, but cannot read or write secrets, change policy,
+or mint more tokens. A monitoring-only agent gets `viewer` and can
+observe everything while spending nothing.
+
 Mock mode enforces nothing, so the variable is optional there. If you
 rotate the token in `.env`, update it in any MCP config that carries it.
 

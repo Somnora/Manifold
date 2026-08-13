@@ -3634,3 +3634,59 @@ round-trip; auto-manage chain attribution at the dispatcher level; NULL on
 pre-attribution rows. Full suite 792 passing; dashboard builds clean; live
 probe confirmed 401/200/403 behavior, named audit actors, chain attribution,
 and instant revocation against a running backend, repo .env untouched.
+
+## Phase 80 — Roles: viewer observes, operator works, admin governs (2026-08-13)
+
+- **The role table is closed, and closing it is the design.** Every route's
+  minimum role lives in one dict (`auth.ROUTE_ROLES`); `RoleTable.build`
+  walks the app's REAL route table at startup and refuses to boot over an
+  unclassified endpoint. Deciding who may call a route is part of shipping
+  it, enforced the same way the exempt-path list is enforced: default deny,
+  and a drift that compiles is a drift that cannot happen. Matching reuses
+  Starlette's own compiled path regexes, so the middleware agrees with the
+  router about which route a path is.
+
+- **Three roles, one rule above them.** viewer reads and estimates (and a
+  GET that executes on the instance - sidecar diagnose - is classified as
+  work, not observation: the method is not the semantics); operator does
+  everything that moves money or runs code; admin touches secrets, policy,
+  and credentials. Above the table: only the OWNER token mints or revokes
+  admin credentials, both directions - an admin minting admins is lateral
+  escalation, the exact leak mode RBAC exists to stop. Owner itself is
+  always admin and cannot be demoted (the recovery path again).
+
+- **Approving a gated action is operator, not admin.** The approval IS the
+  spend decision, and spend is operator's job; making it admin would turn
+  every autopilot approval into an interruption for whoever holds policy.
+
+- **/v1 is role-gated inside its own scheme, not by the middleware.** The
+  middleware passes /v1 through untouched (its 403 shape would break
+  OpenAI SDK clients) but still binds the caller's identity; the proxy
+  then enforces viewer-for-models, operator-for-chat in the OpenAI error
+  envelope. CONTRACT CHANGE from 78: the dedicated proxy key is no longer
+  exclusive - minted principals are legitimate /v1 callers now that roles
+  gate them, and exclusivity locked every principal out of the proxy the
+  moment a proxy key existed while buying nothing (the api-token holder
+  already had full power). The proxy key remains the no-principal
+  credential for pure model tools.
+
+- **Open mode ignores roles entirely.** No token = no identities to rank:
+  `current_role()` falls back to admin so neither the harness, mock mode,
+  nor background loops can ever be blocked by a rank check. Role checks
+  bind only where an identity was actually resolved. Unknown role strings
+  rank below viewer - a corrupted value fails closed.
+
+- **Pre-80 principals default to operator** - exactly what a minted token
+  could do before roles existed: act, but not manage credentials or
+  policy. No stored row gets more powerful by upgrading.
+
+**Test coverage:** `tests/test_rbac.py` - the ranking (unknown fails closed
+both ways); viewer reading but not spending/acting (403 names have and
+need), viewer WS split (terminal 4403, metrics allowed); operator working
+but not governing; admin governing but blocked from admin credentials both
+directions while owner is not; unknown role 422; a 79-era row acting as
+operator; /v1 viewer/operator split in the OpenAI envelope; the builder
+refusing an unclassified route; open mode unaffected. Full suite 806
+passing; dashboard builds clean; live probe walked the ladder on a running
+backend (viewer 200-read/403-launch, operator 202-launch/403-govern,
+/v1 permission_error envelope), repo .env untouched.

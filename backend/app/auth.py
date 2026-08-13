@@ -95,6 +95,203 @@ def bind_principal(name: str | None) -> None:
     _current_principal.set(name or "")
 
 
+# -- roles (Phase 80) -------------------------------------------------------
+
+# Ordered least to most powerful. viewer observes (reads, estimates,
+# spend pages); operator works (launches, jobs, terminals, files);
+# admin governs (secrets, policy, credentials). "owner" - the .env
+# token - is always admin: the bootstrap credential cannot be demoted,
+# because demoting the recovery path locks you out of the lock.
+ROLES = ("viewer", "operator", "admin")
+_RANK = {role: i for i, role in enumerate(ROLES)}
+
+_current_role: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "manifold_role", default="")
+
+
+def current_role() -> str:
+    """The role behind the current request. Falls back to "admin" when
+    nothing resolved a role: an OPEN backend (no token configured) has no
+    identities to rank, and background loops act for the system itself -
+    neither may ever be blocked by a role check."""
+    return _current_role.get() or "admin"
+
+
+def role_allows(have: str, needed: str) -> bool:
+    """Unknown role strings rank below viewer on purpose: a corrupted or
+    future role value fails closed, not open."""
+    return _RANK.get(have, -1) >= _RANK.get(needed, len(ROLES))
+
+
+# Every route's minimum role, keyed by (METHOD, path template); "WS" for
+# WebSockets. This table is CLOSED: RoleTable.build() walks the app's
+# actual route table at startup and refuses to boot if any route is
+# missing here, so a new endpoint cannot ship without someone deciding
+# who may call it. The rule of thumb the table encodes:
+#   viewer   reads and estimates; mutates nothing, executes nothing
+#   operator everything that does work or moves money
+#   admin    secrets, policy, and credentials
+ROUTE_ROLES: dict[tuple[str, str], str] = {
+    # -- open/observe ----------------------------------------------------
+    ("GET", "/health"): "viewer",
+    ("GET", "/skill"): "viewer",
+    ("GET", "/settings/status"): "viewer",
+    ("GET", "/preferences"): "viewer",
+    ("GET", "/notifications"): "viewer",
+    ("GET", "/agent/context/{session_id}"): "viewer",
+    ("GET", "/instance-types"): "viewer",
+    ("GET", "/launch-options"): "viewer",
+    ("GET", "/regions"): "viewer",
+    ("GET", "/ssh-keys"): "viewer",
+    ("GET", "/instances"): "viewer",
+    ("GET", "/instances/{instance_id}/metrics"): "viewer",
+    ("GET", "/instances/{instance_id}/model"): "viewer",
+    ("GET", "/instances/{instance_id}/files/list"): "viewer",
+    ("GET", "/instances/{instance_id}/files/usage"): "viewer",
+    ("GET", "/instances/{instance_id}/files/recent"): "viewer",
+    ("WS", "/instances/{instance_id}/metrics/stream"): "viewer",
+    ("GET", "/templates"): "viewer",
+    ("GET", "/tasks"): "viewer",
+    ("GET", "/tasks/{task_id}"): "viewer",
+    ("GET", "/tasks/{task_id}/logs"): "viewer",
+    ("GET", "/tasks/{task_id}/logs/stream"): "viewer",
+    ("GET", "/tasks/{task_id}/events"): "viewer",
+    ("GET", "/tasks/{task_id}/events/stream"): "viewer",
+    ("GET", "/subagents/models"): "viewer",
+    ("GET", "/subagents/swarm/status"): "viewer",
+    ("GET", "/model-presets"): "viewer",
+    ("GET", "/watches"): "viewer",
+    ("GET", "/brains"): "viewer",
+    ("GET", "/approvals/pending"): "viewer",
+    ("GET", "/autopilot/approvals"): "viewer",
+    ("GET", "/autopilot/runs"): "viewer",
+    ("GET", "/autopilot/runs/{run_id}"): "viewer",
+    ("GET", "/audit"): "viewer",
+    ("GET", "/project-brief"): "viewer",
+    ("GET", "/worklog"): "viewer",
+    ("GET", "/launches"): "viewer",
+    ("GET", "/launches/{launch_id}"): "viewer",
+    ("GET", "/launches/{launch_id}/wait"): "viewer",
+    ("GET", "/launches/{launch_id}/utilization"): "viewer",
+    ("GET", "/estimate"): "viewer",
+    ("GET", "/estimate/model-fit"): "viewer",
+    ("GET", "/spend/summary"): "viewer",
+    ("GET", "/spend/series"): "viewer",
+    ("GET", "/spend/breakdown"): "viewer",
+    ("GET", "/clusters"): "viewer",
+    ("GET", "/clusters/{cluster_id}"): "viewer",
+    ("GET", "/filesystems"): "viewer",
+    ("GET", "/storage/files"): "viewer",
+    ("GET", "/principals"): "viewer",
+    ("GET", "/v1/models"): "viewer",
+    # -- work ------------------------------------------------------------
+    ("POST", "/instances"): "operator",
+    ("POST", "/instances/{instance_id}/idle-timeout"): "operator",
+    ("POST", "/instances/{instance_id}/max-lifetime"): "operator",
+    ("POST", "/instances/{instance_id}/keep-alive"): "operator",
+    ("POST", "/instances/{instance_id}/name"): "operator",
+    ("DELETE", "/instances/{instance_id}"): "operator",
+    ("POST", "/instances/{instance_id}/sync"): "operator",
+    ("POST", "/instances/{instance_id}/rescue"): "operator",
+    ("POST", "/instances/{instance_id}/ide-attach"): "operator",
+    ("POST", "/instances/{instance_id}/run"): "operator",
+    ("POST", "/instances/{instance_id}/chat"): "operator",
+    ("WS", "/instances/{instance_id}/terminal"): "operator",
+    ("WS", "/local/terminal"): "operator",
+    ("POST", "/downloads/token"): "operator",
+    ("POST", "/instances/{instance_id}/files/upload"): "operator",
+    ("GET", "/instances/{instance_id}/files/download"): "operator",
+    ("GET", "/instances/{instance_id}/files/archive"): "operator",
+    ("DELETE", "/instances/{instance_id}/files"): "operator",
+    # diagnose is a GET that RUNS commands on the instance - work.
+    ("GET", "/instances/{instance_id}/sidecar/diagnose"): "operator",
+    ("POST", "/templates/custom"): "operator",
+    ("DELETE", "/templates/custom/{name}"): "operator",
+    ("POST", "/templates/{name}/render"): "operator",
+    ("POST", "/tasks"): "operator",
+    ("POST", "/tasks/{task_id}/cancel"): "operator",
+    ("DELETE", "/tasks/finished"): "operator",
+    ("DELETE", "/tasks/{task_id}"): "operator",
+    ("POST", "/subagents/dispatch"): "operator",
+    ("POST", "/watches"): "operator",
+    ("DELETE", "/watches/{watch_id}"): "operator",
+    ("POST", "/autopilot/runs"): "operator",
+    ("POST", "/autopilot/runs/{run_id}/cancel"): "operator",
+    # Approving a gated action IS the spend decision.
+    ("POST", "/approvals/{approval_id}"): "operator",
+    ("POST", "/autopilot/approvals/{approval_id}"): "operator",
+    ("POST", "/audit/agent"): "operator",
+    ("PUT", "/project-brief"): "operator",
+    ("POST", "/notifications/read"): "operator",
+    ("DELETE", "/notifications"): "operator",
+    ("POST", "/agent/handshake"): "operator",
+    ("POST", "/agent/context/{session_id}/update"): "operator",
+    ("POST", "/clusters/launch"): "operator",
+    ("POST", "/clusters/{cluster_id}/terminate"): "operator",
+    ("POST", "/filesystems"): "operator",
+    ("DELETE", "/filesystems/{name}"): "operator",
+    ("DELETE", "/storage/files/{key:path}"): "operator",
+    ("POST", "/v1/chat/completions"): "operator",
+    # -- govern ----------------------------------------------------------
+    ("POST", "/settings/lambda-key"): "admin",
+    ("POST", "/settings/gcp-config"): "admin",
+    ("POST", "/settings/s3-keys"): "admin",
+    ("PUT", "/preferences"): "admin",
+    ("POST", "/principals"): "admin",
+    ("DELETE", "/principals/{name}"): "admin",
+}
+
+
+class RoleTable:
+    """The classification above, compiled against the app's REAL routes.
+
+    build() walks app.routes and pairs each endpoint with its entry,
+    reusing Starlette's own compiled path_regex so middleware-time
+    matching agrees with the router. Any route without an entry aborts
+    startup: default-deny for the table itself, in the same spirit as the
+    exempt-path list."""
+
+    def __init__(self, entries):
+        self._entries = entries      # [(compiled_regex, method, role)]
+
+    @classmethod
+    def build(cls, app) -> "RoleTable":
+        from fastapi.routing import APIRoute
+        from starlette.routing import WebSocketRoute
+
+        entries, missing = [], []
+        for route in app.routes:
+            if isinstance(route, APIRoute):
+                for method in route.methods - {"HEAD", "OPTIONS"}:
+                    role = ROUTE_ROLES.get((method, route.path))
+                    if role is None:
+                        missing.append(f"{method} {route.path}")
+                    else:
+                        entries.append((route.path_regex, method, role))
+            elif isinstance(route, WebSocketRoute):
+                role = ROUTE_ROLES.get(("WS", route.path))
+                if role is None:
+                    missing.append(f"WS {route.path}")
+                else:
+                    entries.append((route.path_regex, "WS", role))
+            # Mounts (the static dashboard) carry no role: their paths are
+            # either exempt or 404 downstream.
+        if missing:
+            raise RuntimeError(
+                "routes with no role classification (add them to "
+                "auth.ROUTE_ROLES - deciding who may call an endpoint is "
+                "part of shipping it): " + ", ".join(sorted(missing)))
+        return cls(entries)
+
+    def role_for(self, path: str, method: str) -> str | None:
+        """Minimum role for a concrete request path, or None when no route
+        matches (the router will 404 it anyway)."""
+        for regex, entry_method, role in self._entries:
+            if entry_method == method and regex.match(path):
+                return role
+        return None
+
+
 class PrincipalResolver:
     """Token value -> principal name.
 
@@ -116,14 +313,16 @@ class PrincipalResolver:
         self._clock = clock
         self._last_touch: dict[str, float] = {}
 
-    def resolve(self, candidate: str) -> str | None:
+    def resolve(self, candidate: str) -> tuple[str, str] | None:
+        """(name, role) for a valid token, else None. Owner is always
+        admin (Phase 80); stored rows carry their minted role."""
         if self._owner_token and token_matches(candidate, self._owner_token):
-            return "owner"
+            return ("owner", "admin")
         row = self._db.principal_by_hash(hash_token(candidate))
         if row is None or row["revoked_at"]:
             return None
         self._touch(row["name"])
-        return row["name"]
+        return (row["name"], row.get("role") or "operator")
 
     def _touch(self, name: str) -> None:
         now = self._clock()
@@ -304,46 +503,85 @@ class TokenAuthMiddleware:
     """
 
     def __init__(self, app, resolver: PrincipalResolver, nonces: NonceStore,
-                 env_path: str = ""):
+                 env_path: str = "", roles: "RoleTable | None" = None):
         self.app = app
         self._resolver = resolver
         self._nonces = nonces
         self._env_path = env_path
+        # A RoleTable that may still be EMPTY at construction: Starlette
+        # builds the middleware stack lazily, but create_app finishes
+        # registering routes (and populates the table) before the first
+        # request can arrive.
+        self._roles = roles
 
     async def __call__(self, scope, receive, send):
         if scope["type"] == "http":
-            principal = (self._header_principal(scope)
-                         or self._nonce_principal(scope))
-            if is_exempt_path(scope["path"]) or principal:
-                await self._run_as(principal, scope, receive, send)
+            identity = self._header_identity(scope)
+            # Exempt paths pass through BEFORE any role check - /v1 in
+            # particular runs its own scheme with OpenAI-shaped errors,
+            # and a middleware 403 in FastAPI's {"detail"} shape would
+            # break SDK clients. A resolved identity still binds, so the
+            # proxy's audit rows carry the caller's name.
+            if is_exempt_path(scope["path"]):
+                name, role = identity or (None, None)
+                await self._run_as(name, role, scope, receive, send)
                 return
-            await self._reject_http(send)
+            if identity is None:
+                nonce_principal = self._nonce_principal(scope)
+                if nonce_principal:
+                    # The nonce IS the authorization: minting it already
+                    # passed the role check on POST /downloads/token.
+                    await self._run_as(nonce_principal, "operator",
+                                       scope, receive, send)
+                    return
+                await self._reject_http(send)
+                return
+            name, role = identity
+            needed = self._role_needed(scope, "http")
+            if needed and not role_allows(role, needed):
+                await self._reject_role_http(send, name, role, needed)
+                return
+            await self._run_as(name, role, scope, receive, send)
             return
         if scope["type"] == "websocket":
             # No exempt WebSocket routes. Header for non-browser clients;
             # ?token= because a browser WebSocket cannot set headers.
-            principal = (self._header_principal(scope)
-                         or self._query_principal(scope))
-            if principal:
-                await self._run_as(principal, scope, receive, send)
+            identity = (self._header_identity(scope)
+                        or self._query_identity(scope))
+            if identity is None:
+                await self._reject_websocket(receive, send, code=4401)
                 return
-            await self._reject_websocket(receive, send)
+            name, role = identity
+            needed = self._role_needed(scope, "websocket")
+            if needed and not role_allows(role, needed):
+                await self._reject_websocket(receive, send, code=4403)
+                return
+            await self._run_as(name, role, scope, receive, send)
             return
         await self.app(scope, receive, send)      # lifespan et al.
 
-    async def _run_as(self, principal: str | None, scope, receive, send):
-        """Run the app with the resolved principal on the request context.
+    def _role_needed(self, scope, kind: str) -> str | None:
+        if self._roles is None:
+            return None
+        method = scope.get("method", "") if kind == "http" else "WS"
+        return self._roles.role_for(scope["path"], method)
 
-        Exempt paths carry no principal (token = None) and read back as
-        the "api" fallback; that is fine, none of them audits or creates
-        attributed rows."""
-        token = _current_principal.set(principal or "")
+    async def _run_as(self, principal: str | None, role: str | None,
+                      scope, receive, send):
+        """Run the app with the resolved identity on the request context.
+
+        Exempt paths carry no identity and read back as the fallbacks
+        ("api"/"admin"); that is fine, none of them audits, creates
+        attributed rows, or checks a role downstream."""
+        p_token = _current_principal.set(principal or "")
+        r_token = _current_role.set(role or "")
         try:
             await self.app(scope, receive, send)
         finally:
-            _current_principal.reset(token)
+            _current_role.reset(r_token)
+            _current_principal.reset(p_token)
 
-    def _header_principal(self, scope) -> str | None:
+    def _header_identity(self, scope) -> tuple[str, str] | None:
         header = ""
         for name, value in scope.get("headers") or []:
             if name == b"authorization":
@@ -353,12 +591,12 @@ class TokenAuthMiddleware:
             return None
         return self._resolver.resolve(header[7:])
 
-    def _query_principal(self, scope) -> str | None:
+    def _query_identity(self, scope) -> tuple[str, str] | None:
         query = (scope.get("query_string") or b"").decode("latin-1")
         for candidate in parse_qs(query).get("token", []):
-            principal = self._resolver.resolve(candidate)
-            if principal:
-                return principal
+            identity = self._resolver.resolve(candidate)
+            if identity:
+                return identity
         return None
 
     def _nonce_principal(self, scope) -> str | None:
@@ -370,6 +608,29 @@ class TokenAuthMiddleware:
             if principal:
                 return principal
         return None
+
+    async def _reject_role_http(self, send, name: str, have: str,
+                                needed: str) -> None:
+        # 403, not 401: the credential is valid, the ROLE is short. Names
+        # both, so the fix (ask an admin to re-mint with the right role)
+        # is in the message.
+        body = json.dumps({
+            "detail": (
+                f"'{name}' has role '{have}', but this operation needs "
+                f"'{needed}'. Roles are set when a token is minted "
+                f"(Settings, API access); an admin can mint a new token "
+                f"with the role this caller actually needs."
+            )
+        }).encode()
+        await send({
+            "type": "http.response.start",
+            "status": 403,
+            "headers": [
+                (b"content-type", b"application/json"),
+                (b"content-length", str(len(body)).encode()),
+            ],
+        })
+        await send({"type": "http.response.body", "body": body})
 
     async def _reject_http(self, send) -> None:
         # Points at where the token LIVES, never what it is.
@@ -391,13 +652,14 @@ class TokenAuthMiddleware:
         })
         await send({"type": "http.response.body", "body": body})
 
-    async def _reject_websocket(self, receive, send) -> None:
+    async def _reject_websocket(self, receive, send, code: int = 4401) -> None:
         # Accept, THEN close with an application code. A pre-accept denial
         # surfaces in browser JS as an opaque handshake failure (a 403 the
-        # page cannot inspect); accept-then-close(4401) exposes close.code
-        # to any client that wants it. The dashboard deliberately does NOT
-        # key on 4401 (its handlers treat every failure generically), so
-        # the code is a courtesy to non-browser clients, not a contract.
+        # page cannot inspect); accept-then-close exposes close.code to
+        # any client that wants it (4401 no credential, 4403 role too
+        # low). The dashboard deliberately does NOT key on these (its
+        # handlers treat every failure generically), so the code is a
+        # courtesy to non-browser clients, not a contract.
         await receive()                    # the websocket.connect event
         await send({"type": "websocket.accept"})
-        await send({"type": "websocket.close", "code": 4401})
+        await send({"type": "websocket.close", "code": code})

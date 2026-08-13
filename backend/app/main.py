@@ -53,12 +53,16 @@ from .lambda_api import (
 )
 from .agent import Autopilot, find_serving_task
 from .auth import (
+    ROLES,
     NonceStore,
     PrincipalResolver,
+    RoleTable,
     TokenAuthMiddleware,
     current_principal,
+    current_role,
     ensure_api_token,
     hash_token,
+    role_allows,
     token_matches,
     valid_principal_name,
 )
@@ -222,6 +226,8 @@ class PrincipalRequest(BaseModel):
     # module globals - a closure-local model silently degrades to a query
     # parameter and every POST 422s.
     name: str
+    # Phase 80: viewer observes, operator works, admin governs.
+    role: str = "operator"
 
 
 class TaskRequest(BaseModel):
@@ -669,6 +675,21 @@ def create_app(
     # enforcement is off so the routes below exist consistently.
     principal_resolver = PrincipalResolver(settings.api_token, db)
 
+    # Phase 80: the role table is BUILT at the very end of create_app
+    # (RoleTable.build walks the finished route table and refuses to boot
+    # over an unclassified route). A mutable holder is handed to the
+    # middleware now; Starlette instantiates the stack lazily, so the
+    # table is populated before the first request can arrive.
+    role_table_holder: list = []
+
+    class _Roles:
+        """Deferred view over the holder, so the middleware can be
+        constructed before the routes exist."""
+        @staticmethod
+        def role_for(path: str, method: str) -> str | None:
+            return (role_table_holder[0].role_for(path, method)
+                    if role_table_holder else None)
+
     if settings.api_token:
         # Empty token = no middleware: mock mode and the test harness stay
         # a zero-credential demo. Added BEFORE CORS on purpose -
@@ -679,7 +700,7 @@ def create_app(
         # dashboard reads as a network error instead of the token gate.
         app.add_middleware(
             TokenAuthMiddleware, resolver=principal_resolver, nonces=nonces,
-            env_path=str(env_file),
+            env_path=str(env_file), roles=_Roles(),
         )
 
     # The dashboard (Phase 2) runs on localhost:3000 and is the only
@@ -1664,18 +1685,37 @@ def create_app(
             content={"error": {"message": message, "type": kind, "code": code}},
         )
 
-    def _proxy_auth_ok(request: Request) -> bool:
-        # The dedicated proxy key is THE credential when set; otherwise the
-        # global API token guards /v1 too. Neither set = open - that is the
-        # mock/test harness and an explicitly tokenless dev backend.
-        # Production always holds an api_token after first boot (generated
-        # in create_app), so a real backend is fail-closed here.
-        expected = settings.proxy_api_key or settings.api_token
-        if not expected:
-            return True
+    def _proxy_auth_error(request: Request, needed_role: str):
+        """None when the request may proceed, else the OpenAI-shaped
+        error response.
+
+        The dedicated proxy key is THE credential when set (no principal,
+        no role - it exists only to talk to models). Otherwise any valid
+        API credential works - the .env token or a minted principal's -
+        and since Phase 80 the principal's role must clear the route's
+        bar (chat completions drive a paid GPU: operator). Neither
+        configured = open - the mock/test harness and an explicitly
+        tokenless dev backend. Production always holds an api_token after
+        first boot, so a real backend is fail-closed here."""
+        if not settings.proxy_api_key and not settings.api_token:
+            return None
         header = request.headers.get("authorization", "")
         token = header[7:] if header.lower().startswith("bearer ") else ""
-        return token_matches(token, expected)
+        if settings.proxy_api_key and token_matches(token,
+                                                    settings.proxy_api_key):
+            return None
+        identity = principal_resolver.resolve(token) if token else None
+        if identity is None:
+            return _proxy_unauthorized()
+        name, role = identity
+        if not role_allows(role, needed_role):
+            return _openai_error(
+                403,
+                f"'{name}' has role '{role}', but this endpoint needs "
+                f"'{needed_role}'. An admin can mint a token with the "
+                f"right role on the Settings page.",
+                "insufficient_role", "permission_error")
+        return None
 
     def _proxy_unauthorized():
         # OpenAI envelope, kept: SDK clients parse {"error": {...}}. Points
@@ -1723,8 +1763,9 @@ def create_app(
 
     @app.get("/v1/models")
     async def openai_list_models(request: Request):
-        if not _proxy_auth_ok(request):
-            return _proxy_unauthorized()
+        denied = _proxy_auth_error(request, "viewer")
+        if denied is not None:
+            return denied
         # Only advertise models that actually answer — a client picking from
         # this list expects to be able to use it. Still-loading models are
         # simply not listed yet.
@@ -1748,8 +1789,9 @@ def create_app(
     async def openai_chat_completions(request: Request):
         import json
         from fastapi.responses import StreamingResponse
-        if not _proxy_auth_ok(request):
-            return _proxy_unauthorized()
+        denied = _proxy_auth_error(request, "operator")
+        if denied is not None:
+            return denied
         try:
             body = await request.json()
         except Exception:
@@ -1836,31 +1878,38 @@ def create_app(
 
     # -- api principals (Phase 79) -------------------------------------------------
 
-    def _require_owner() -> None:
-        """Principal management is owner-token-only.
+    def _require_credential_authority(target_role: str) -> None:
+        """Who may mint/revoke which credentials (Phase 80).
 
-        This is the one authorization rule that exists before RBAC
-        (Phase 80): without it, any minted token could mint more tokens,
-        and revoking a leaked credential would be a race against it
-        re-issuing itself. Roles will subsume this check; until then the
-        bootstrap credential is the only credential authority."""
+        The route itself is admin-only (ROUTE_ROLES), so anyone here
+        holds admin. One rule remains ABOVE that: only the owner token
+        touches ADMIN credentials. An admin principal minting another
+        admin would let a leaked admin token escalate laterally forever;
+        the .env token stays the sole authority over its own tier."""
         if not settings.api_token:
             raise HTTPException(
                 409, "API auth is not enabled (no MANIFOLD_API_TOKEN "
                      "configured), so there is nothing for a principal "
                      "to authenticate against.")
-        if current_principal() != "owner":
+        if target_role == "admin" and current_principal() != "owner":
             raise HTTPException(
                 403, "Only the owner token (the MANIFOLD_API_TOKEN in "
-                     ".env) may manage principals.")
+                     ".env) may mint or revoke admin credentials.")
 
     @app.post("/principals", status_code=201)
     async def create_principal(req: PrincipalRequest):
-        """Mint a named token. The value is in THIS response and nowhere
-        else - the database keeps only its hash. Name it after the caller
-        it is for (an agent, a coworker's laptop, a script), because the
-        name is what every launch, task, and audit row will carry."""
-        _require_owner()
+        """Mint a named token with a role. The value is in THIS response
+        and nowhere else - the database keeps only its hash. Name it
+        after the caller it is for (an agent, a coworker's laptop, a
+        script), because the name is what every launch, task, and audit
+        row will carry."""
+        role = req.role.strip().lower()
+        if role not in ROLES:
+            raise HTTPException(
+                422, f"Unknown role '{req.role}'. Roles: "
+                     f"{', '.join(ROLES)} (viewer observes, operator "
+                     f"works, admin governs).")
+        _require_credential_authority(role)
         name = req.name.strip().lower()
         if not valid_principal_name(name):
             raise HTTPException(
@@ -1874,9 +1923,10 @@ def create_app(
                      f"pick a new name).")
         token = secrets.token_urlsafe(32)
         db.create_principal(name=name, token_hash=hash_token(token),
-                            created_by=current_principal())
-        db.record_audit(current_principal(), "principal_created", name)
-        return {"name": name, "token": token,
+                            created_by=current_principal(), role=role)
+        db.record_audit(current_principal(), "principal_created",
+                        f"{name} ({role})")
+        return {"name": name, "role": role, "token": token,
                 "note": "Shown once. Store it now; only its hash is kept."}
 
     @app.get("/principals")
@@ -1887,10 +1937,10 @@ def create_app(
 
     @app.delete("/principals/{name}")
     async def revoke_principal(name: str):
-        _require_owner()
         row = db.principal_by_name(name)
         if row is None:
             raise HTTPException(404, f"No principal named '{name}'.")
+        _require_credential_authority(row.get("role") or "operator")
         if row["revoked_at"]:
             raise HTTPException(409, f"'{name}' is already revoked.")
         db.revoke_principal(name)
@@ -3192,6 +3242,12 @@ def create_app(
                 return response
 
         app.mount("/", ExportedUI(directory=str(ui_dir), html=True), name="ui")
+
+    # Phase 80: compile the role table against the FINISHED route set.
+    # Raises on any route missing from auth.ROUTE_ROLES, so an endpoint
+    # cannot exist without a decision about who may call it. Built even
+    # when auth is off, so the harness fails on unclassified routes too.
+    role_table_holder.append(RoleTable.build(app))
 
     return app
 

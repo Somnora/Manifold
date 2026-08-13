@@ -177,11 +177,11 @@ def test_resolver_touch_is_throttled(tmp_path, db):
 
 def test_resolver_rejects_unknown_and_revoked(tmp_path, db):
     resolver = PrincipalResolver("env-token", db)
-    assert resolver.resolve("env-token") == "owner"
+    assert resolver.resolve("env-token") == ("owner", "admin")
     assert resolver.resolve("nope") is None
     db.create_principal(name="a", token_hash=hash_token("tok"),
                         created_by="owner")
-    assert resolver.resolve("tok") == "a"
+    assert resolver.resolve("tok") == ("a", "operator")
     db.revoke_principal("a")
     assert resolver.resolve("tok") is None
 
