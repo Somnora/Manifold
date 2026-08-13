@@ -182,6 +182,9 @@ export type Principal = {
   created_by: string;
   last_used_at: string | null;
   revoked_at: string | null;
+  // Phase 81: enforced hourly ceiling on this principal's attributed
+  // burn. null = unlimited. A rate guard, not the advisory wallet.
+  max_hourly_spend_usd: number | null;
 };
 
 export type StoredFile = {
@@ -673,12 +676,20 @@ export const api = {
   principals: () =>
     request<{ principals: Principal[]; auth_enabled: boolean }>("/principals"),
 
-  createPrincipal: (name: string, role: PrincipalRole = "operator") =>
+  createPrincipal: (
+    name: string,
+    role: PrincipalRole = "operator",
+    maxHourlyUsd?: number,
+  ) =>
     request<{ name: string; role: PrincipalRole; token: string; note: string }>(
       "/principals",
       {
         method: "POST",
-        body: JSON.stringify({ name, role }),
+        body: JSON.stringify({
+          name,
+          role,
+          ...(maxHourlyUsd ? { max_hourly_spend_usd: maxHourlyUsd } : {}),
+        }),
       },
     ),
 

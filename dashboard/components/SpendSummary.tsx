@@ -234,6 +234,11 @@ export function SpendSummaryPanel() {
 // on its own slower cadence.
 function SpendTrend({ tzOffsetMinutes }: { tzOffsetMinutes: number }) {
   const [days, setDays] = useState(30);
+  // Phase 81: group by hardware or by principal. "created_by" answers
+  // the team question: whose work is the money.
+  const [groupBy, setGroupBy] = useState<"instance_type" | "created_by">(
+    "instance_type",
+  );
   const [series, setSeries] = useState<SpendBucket[] | null>(null);
   const [rows, setRows] = useState<SpendBreakdownRow[] | null>(null);
   const [failed, setFailed] = useState(false);
@@ -243,7 +248,7 @@ function SpendTrend({ tzOffsetMinutes }: { tzOffsetMinutes: number }) {
     setFailed(false);
     Promise.all([
       api.spendSeries(tzOffsetMinutes, "day", days),
-      api.spendBreakdown(tzOffsetMinutes, "instance_type", days),
+      api.spendBreakdown(tzOffsetMinutes, groupBy, days),
     ])
       .then(([s, b]) => {
         if (cancelled) return;
@@ -254,7 +259,7 @@ function SpendTrend({ tzOffsetMinutes }: { tzOffsetMinutes: number }) {
     return () => {
       cancelled = true;
     };
-  }, [tzOffsetMinutes, days]);
+  }, [tzOffsetMinutes, days, groupBy]);
 
   if (failed) {
     return (
@@ -289,9 +294,31 @@ function SpendTrend({ tzOffsetMinutes }: { tzOffsetMinutes: number }) {
 
       {rows.length > 0 && (
         <div className="rounded-lg border border-zinc-200 bg-white p-4">
-          <h3 className="text-sm font-semibold uppercase tracking-wide text-zinc-500">
-            Where it went
-          </h3>
+          <div className="flex items-center justify-between">
+            <h3 className="text-sm font-semibold uppercase tracking-wide text-zinc-500">
+              Where it went
+            </h3>
+            <div className="flex overflow-hidden rounded border border-zinc-300 text-xs">
+              {(
+                [
+                  ["instance_type", "by hardware"],
+                  ["created_by", "by principal"],
+                ] as const
+              ).map(([key, label]) => (
+                <button
+                  key={key}
+                  onClick={() => setGroupBy(key)}
+                  className={`px-2.5 py-1 ${
+                    groupBy === key
+                      ? "bg-zinc-900 text-white"
+                      : "text-zinc-600 hover:bg-zinc-50"
+                  }`}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+          </div>
           <ul className="mt-3 space-y-2">
             {rows.slice(0, 8).map((r) => (
               <li key={r.key} className="text-sm">
@@ -318,9 +345,13 @@ function SpendTrend({ tzOffsetMinutes }: { tzOffsetMinutes: number }) {
             ))}
           </ul>
           <p className="mt-3 text-[11px] text-zinc-400">
-            Grouped by instance type over the last {days} days. Launches whose
-            cost is unknown are counted here but contribute nothing to the
-            money, so a row can honestly read $0.00.
+            Grouped by{" "}
+            {groupBy === "instance_type"
+              ? "instance type"
+              : "the principal whose token caused the launch (jobs and watches count against whoever created them; older launches predate attribution and read as unattributed)"}{" "}
+            over the last {days} days. Launches whose cost is unknown are
+            counted here but contribute nothing to the money, so a row can
+            honestly read $0.00.
           </p>
         </div>
       )}

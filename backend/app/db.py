@@ -377,6 +377,13 @@ class Database:
         # but not manage credentials or policy).
         self._ensure_column("api_principals", "role",
                             "TEXT NOT NULL DEFAULT 'operator'")
+        # Phase 81: an ENFORCED per-principal hourly ceiling (NULL = none).
+        # Unlike the advisory monthly wallet, this is a rate guard in the
+        # orchestrator: a launch that would push this principal's
+        # attributed hourly burn past it is refused. Chain attribution
+        # makes it bind - auto-manage and watch launches count against
+        # whoever caused them.
+        self._ensure_column("api_principals", "max_hourly_spend_usd", "REAL")
         # Phase 36: runs whose spend actions pause for human approval.
         self._ensure_column("agent_runs", "require_approval",
                             "INTEGER NOT NULL DEFAULT 0")
@@ -514,6 +521,20 @@ class Database:
             """SELECT COALESCE(SUM(hourly_rate_cents), 0) AS c FROM launches
                 WHERE status IN ('launching', 'retrying')
                   AND lambda_instance_id IS NULL""",
+        ).fetchone()
+        return row["c"] or 0
+
+    def principal_pending_spend_cents(self, created_by: str) -> int:
+        """pending_launch_spend_cents, filtered to one principal's
+        admitted-but-not-yet-visible launches (Phase 81: the per-principal
+        ceiling needs the same double-admit protection as the global
+        budget guard)."""
+        row = self._execute(
+            """SELECT COALESCE(SUM(hourly_rate_cents), 0) AS c FROM launches
+                WHERE status IN ('launching', 'retrying')
+                  AND lambda_instance_id IS NULL
+                  AND created_by = ?""",
+            (created_by,),
         ).fetchone()
         return row["c"] or 0
 
@@ -696,13 +717,16 @@ class Database:
     # -- api principals (Phase 79) ---------------------------------------------
 
     def create_principal(self, *, name: str, token_hash: str,
-                         created_by: str, role: str = "operator") -> str:
+                         created_by: str, role: str = "operator",
+                         max_hourly_spend_usd: float | None = None) -> str:
         pid = uuid.uuid4().hex[:12]
         self._execute(
             """INSERT INTO api_principals
-               (id, name, token_hash, created_at, created_by, role)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (pid, name, token_hash, utcnow(), created_by, role),
+               (id, name, token_hash, created_at, created_by, role,
+                max_hourly_spend_usd)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (pid, name, token_hash, utcnow(), created_by, role,
+             max_hourly_spend_usd),
         )
         return pid
 
@@ -725,7 +749,7 @@ class Database:
         hash is still an offline-crackable fingerprint of a secret."""
         rows = self._execute(
             """SELECT id, name, role, created_at, created_by, last_used_at,
-                      revoked_at
+                      revoked_at, max_hourly_spend_usd
                  FROM api_principals ORDER BY created_at, id"""
         ).fetchall()
         return [dict(r) for r in rows]

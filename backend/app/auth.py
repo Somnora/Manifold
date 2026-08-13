@@ -484,6 +484,88 @@ class NonceStore:
             del self._pending[nonce]
 
 
+class NetworkGuardMiddleware:
+    """Refuse to serve a network the deployment is not ready for.
+
+    Installed UNCONDITIONALLY (unlike token auth, which only exists when
+    a token does), because its whole job is the case where auth is NOT
+    configured: a backend bound to 0.0.0.0 with no token must not answer
+    the LAN with a launch console. Judged per request on the interface
+    the connection actually arrived at (scope["server"], the listening
+    socket's own address), so it holds however uvicorn was started:
+
+    - non-loopback + no token configured -> 403, always;
+    - non-loopback + token + plain http  -> 403 unless
+      server.allow_plaintext_lan (a bearer token on a plaintext LAN hop
+      is a credential broadcast; the opt-in exists because a
+      Tailscale/WireGuard tailnet already encrypts below http).
+
+    A server host that is not an IP literal (e.g. Starlette's
+    "testserver") is treated as loopback: real uvicorn reports the
+    socket's numeric address, so a hostname here means a test client,
+    not a network."""
+
+    def __init__(self, app, *, token_configured: bool,
+                 allow_plaintext: bool):
+        self.app = app
+        self._token_configured = token_configured
+        self._allow_plaintext = allow_plaintext
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] not in ("http", "websocket"):
+            await self.app(scope, receive, send)
+            return
+        refusal = self._refusal(scope)
+        if refusal is None:
+            await self.app(scope, receive, send)
+            return
+        if scope["type"] == "websocket":
+            await receive()
+            await send({"type": "websocket.accept"})
+            await send({"type": "websocket.close", "code": 4403})
+            return
+        body = json.dumps({"detail": refusal}).encode()
+        await send({
+            "type": "http.response.start",
+            "status": 403,
+            "headers": [
+                (b"content-type", b"application/json"),
+                (b"content-length", str(len(body)).encode()),
+            ],
+        })
+        await send({"type": "http.response.body", "body": body})
+
+    def _refusal(self, scope) -> str | None:
+        server = scope.get("server")
+        if not server or not _is_nonloopback_ip(server[0]):
+            return None
+        if not self._token_configured:
+            return (
+                "This backend is reachable from the network but has no "
+                "API token configured, so it refuses to serve non-local "
+                "requests. Set MANIFOLD_API_TOKEN (or let a real-mode "
+                "boot generate one) before exposing it."
+            )
+        if scope.get("scheme") in ("http", "ws") and not self._allow_plaintext:
+            return (
+                "Plain-HTTP request on a network interface refused: a "
+                "bearer token on an unencrypted LAN hop is a credential "
+                "broadcast. Serve TLS (uvicorn --ssl-keyfile/--ssl-"
+                "certfile), or if the wire is already encrypted below "
+                "http (a Tailscale/WireGuard tailnet), set "
+                "server.allow_plaintext_lan: true in config.yaml."
+            )
+        return None
+
+
+def _is_nonloopback_ip(host: str) -> bool:
+    import ipaddress
+    try:
+        return not ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False    # hostname, not an address: a test client (see above)
+
+
 class TokenAuthMiddleware:
     """Require `Authorization: Bearer <api_token>` on every HTTP and
     WebSocket request that is not on the exempt list.

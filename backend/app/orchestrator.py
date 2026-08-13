@@ -502,6 +502,7 @@ class Orchestrator:
             instance_type=instance_type,
             unit_price_cents=price,
             added_count=1,
+            created_by=created_by,
         )
 
         # Fallback types must exist and independently fit the budget;
@@ -545,6 +546,7 @@ class Orchestrator:
         instance_type: str,
         unit_price_cents: int,
         added_count: int,
+        created_by: str | None = None,
     ) -> tuple[int, int]:
         """The concurrency and budget guards, shared by single launches
         (added_count=1) and whole clusters (added_count=N, judged atomically
@@ -618,6 +620,35 @@ class Orchestrator:
                     f"(Settings -> Spending guardrails)."
                 )
             raise LaunchRejected(409, detail, reason_code="budget")
+
+        # Phase 81: the per-principal ceiling, judged against the same live
+        # baseline as the global guards (and the same pending-launch
+        # double-admit protection, filtered to this principal). Attribution
+        # is the chain's origin, so an auto-managed job's launch counts
+        # against whoever enqueued the job. "owner" and legacy actors have
+        # no row and no ceiling; a row without a ceiling is unlimited.
+        if created_by:
+            row = self.db.principal_by_name(created_by)
+            ceiling_usd = (row or {}).get("max_hourly_spend_usd")
+            if ceiling_usd:
+                principal_spend = self.db.principal_pending_spend_cents(
+                    created_by)
+                for inst in running:
+                    launch = self.db.find_launch_by_instance(inst.id)
+                    if launch and launch.get("created_by") == created_by:
+                        principal_spend += inst.hourly_rate_cents
+                ceiling_cents = round(ceiling_usd * 100)
+                added_cents = added_count * unit_price_cents
+                if principal_spend + added_cents > ceiling_cents:
+                    raise LaunchRejected(
+                        409,
+                        f"Principal budget guard: '{created_by}' is burning "
+                        f"${principal_spend / 100:.2f}/hr and its ceiling is "
+                        f"${ceiling_cents / 100:.2f}/hr; this launch "
+                        f"(${added_cents / 100:.2f}/hr) would exceed it. "
+                        f"Terminate one of its instances, or have an admin "
+                        f"raise the ceiling (Settings -> API access).",
+                        reason_code="principal_budget")
         return current_spend, budget_cents
 
     async def create_filesystem(self, name: str, region: str) -> dict:
@@ -661,8 +692,13 @@ class Orchestrator:
         ssh_key_name: str | None = None,
         name: str = "",
         provider: str = "lambda",
+        created_by: str | None = None,
     ) -> dict:
-        """Launch a multi-node GPU cluster with head and worker nodes."""
+        """Launch a multi-node GPU cluster with head and worker nodes.
+
+        created_by (Phase 81; missed in 79's threading): the whole cluster
+        is attributed to one principal, judged atomically against their
+        ceiling here and stamped on every node's launch row below."""
         if node_count < 1:
             raise LaunchRejected(400, "Cluster must have at least 1 node.")
         if node_count > 16:
@@ -690,6 +726,7 @@ class Orchestrator:
             instance_type=instance_type,
             unit_price_cents=types[instance_type].price_cents_per_hour,
             added_count=node_count,
+            created_by=created_by,
         )
 
         cluster_id = uuid.uuid4().hex[:12]
@@ -716,6 +753,7 @@ class Orchestrator:
                 ssh_key_name=ssh_key_name,
                 name=head_name,
                 provider=provider,
+                created_by=created_by,
             )
             self.db.add_cluster_node(
                 cluster_id=cluster_id,
@@ -737,6 +775,7 @@ class Orchestrator:
                     ssh_key_name=ssh_key_name,
                     name=worker_name,
                     provider=provider,
+                    created_by=created_by,
                 )
                 self.db.add_cluster_node(
                     cluster_id=cluster_id,

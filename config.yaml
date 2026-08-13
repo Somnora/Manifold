@@ -228,6 +228,14 @@ telemetry:
   # sidecar over the existing managed connection, never the launch path.
   sample_seconds: 30
 
+server:
+  # Team mode (see docs/team-mode.md). The backend always REFUSES to serve
+  # non-loopback requests when no API token is configured, and refuses
+  # plain http from the network unless this is true. Set true only when
+  # the wire is already encrypted below http - a Tailscale/WireGuard
+  # tailnet is the canonical case. TLS via uvicorn --ssl-* needs no opt-in.
+  allow_plaintext_lan: false
+
 idle_spend:
   # Report-only accounting: how much of an instance's bill ran with its GPUs
   # essentially unused. It never terminates anything and never blocks

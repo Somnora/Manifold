@@ -54,6 +54,7 @@ from .lambda_api import (
 from .agent import Autopilot, find_serving_task
 from .auth import (
     ROLES,
+    NetworkGuardMiddleware,
     NonceStore,
     PrincipalResolver,
     RoleTable,
@@ -228,6 +229,9 @@ class PrincipalRequest(BaseModel):
     name: str
     # Phase 80: viewer observes, operator works, admin governs.
     role: str = "operator"
+    # Phase 81: ENFORCED hourly ceiling on this principal's attributed
+    # burn (None = unlimited). A rate guard, not the advisory wallet.
+    max_hourly_spend_usd: float | None = None
 
 
 class TaskRequest(BaseModel):
@@ -710,6 +714,15 @@ def create_app(
         allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
         allow_methods=["*"],
         allow_headers=["*"],
+    )
+
+    # Phase 81: added LAST = OUTERMOST, and unconditionally. The network
+    # policy is judged before any credential conversation: an unauthorized
+    # transport gets a refusal, not a 401 inviting it to try a token.
+    app.add_middleware(
+        NetworkGuardMiddleware,
+        token_configured=bool(settings.api_token),
+        allow_plaintext=settings.server.allow_plaintext_lan,
     )
 
     @app.exception_handler(LaunchRejected)
@@ -1921,12 +1934,21 @@ def create_app(
                 409, f"A principal named '{name}' already exists "
                      f"(revoked names are kept for attribution history; "
                      f"pick a new name).")
+        ceiling = req.max_hourly_spend_usd
+        if ceiling is not None and (ceiling != ceiling or ceiling <= 0):
+            raise HTTPException(
+                422, "max_hourly_spend_usd must be a positive number of "
+                     "dollars per hour, or omitted for no ceiling.")
         token = secrets.token_urlsafe(32)
         db.create_principal(name=name, token_hash=hash_token(token),
-                            created_by=current_principal(), role=role)
-        db.record_audit(current_principal(), "principal_created",
-                        f"{name} ({role})")
+                            created_by=current_principal(), role=role,
+                            max_hourly_spend_usd=ceiling)
+        db.record_audit(
+            current_principal(), "principal_created",
+            f"{name} ({role})"
+            + (f" ceiling ${ceiling:.2f}/hr" if ceiling else ""))
         return {"name": name, "role": role, "token": token,
+                "max_hourly_spend_usd": ceiling,
                 "note": "Shown once. Store it now; only its hash is kept."}
 
     @app.get("/principals")
@@ -3101,6 +3123,7 @@ def create_app(
                 ssh_key_name=req.ssh_key_name,
                 name=req.name,
                 provider=req.provider,
+                created_by=current_principal(),
             )
         except LaunchRejected as e:
             raise HTTPException(e.status_code, str(e))

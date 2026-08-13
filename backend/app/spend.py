@@ -104,6 +104,9 @@ _BREAKDOWN_KEYS = {
     "region": lambda row: row.get("region") or "unknown",
     "provider": lambda row: row.get("provider") or "lambda",
     "status": lambda row: row.get("status") or "unknown",
+    # Phase 81: spend by principal. Pre-79 rows have no attribution and
+    # group under "unattributed" - a true statement, never a guess.
+    "created_by": lambda row: row.get("created_by") or "unattributed",
 }
 
 _BUCKETS = ("day", "week", "month")

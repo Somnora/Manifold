@@ -209,6 +209,16 @@ class TelemetrySettings:
 
 
 @dataclass(frozen=True)
+class ServerSettings:
+    # Phase 81 (team mode): whether requests arriving on a NON-loopback
+    # interface may ride plain http. Default no: a bearer token on a
+    # plaintext LAN hop is a credential broadcast. Set true only when the
+    # wire is already encrypted below http - a Tailscale/WireGuard tailnet
+    # is the canonical case. TLS (uvicorn --ssl-*) needs no opt-in.
+    allow_plaintext_lan: bool = False
+
+
+@dataclass(frozen=True)
 class IdleSpendSettings:
     """Idle-spend accounting: how much of a bill ran with the GPUs unused.
 
@@ -283,6 +293,7 @@ class Settings:
     autopilot: AutopilotSettings = field(default_factory=AutopilotSettings)
     hub: HubSettings = field(default_factory=HubSettings)
     telemetry: TelemetrySettings = field(default_factory=TelemetrySettings)
+    server: ServerSettings = field(default_factory=ServerSettings)
     idle_spend: IdleSpendSettings = field(default_factory=IdleSpendSettings)
     auto_manage: AutoManageSettings = field(default_factory=AutoManageSettings)
     gcp: GCPSettings = field(default_factory=GCPSettings)
@@ -389,6 +400,7 @@ def load_settings(
     autopilot = raw.get("autopilot", {})
     hub = raw.get("hub", {})
     telemetry = raw.get("telemetry", {})
+    server = raw.get("server", {})
     idle_spend = raw.get("idle_spend", {})
     auto_manage = raw.get("auto_manage", {})
     gcp = raw.get("gcp", {})
@@ -475,6 +487,10 @@ def load_settings(
         ),
         telemetry=TelemetrySettings(
             sample_seconds=float(telemetry.get("sample_seconds", 30)),
+        ),
+        server=ServerSettings(
+            allow_plaintext_lan=bool(server.get("allow_plaintext_lan",
+                                                False)),
         ),
         idle_spend=IdleSpendSettings(
             util_pct=float(idle_spend.get("util_pct", 5)),

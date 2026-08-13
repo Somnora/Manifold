@@ -26,6 +26,7 @@ export function PrincipalsPanel() {
   const [authEnabled, setAuthEnabled] = useState<boolean | null>(null);
   const [name, setName] = useState("");
   const [role, setRole] = useState<PrincipalRole>("operator");
+  const [ceiling, setCeiling] = useState("");
   const [minted, setMinted] = useState<{ name: string; token: string } | null>(
     null,
   );
@@ -49,7 +50,12 @@ export function PrincipalsPanel() {
     setError("");
     setMinted(null);
     try {
-      const r = await api.createPrincipal(name.trim().toLowerCase(), role);
+      const usd = parseFloat(ceiling);
+      const r = await api.createPrincipal(
+        name.trim().toLowerCase(),
+        role,
+        Number.isFinite(usd) && usd > 0 ? usd : undefined,
+      );
       setMinted({ name: r.name, token: r.token });
       setCopied(false);
       setName("");
@@ -115,6 +121,13 @@ export function PrincipalsPanel() {
               <option value="operator">operator</option>
               <option value="admin">admin</option>
             </select>
+            <input
+              value={ceiling}
+              onChange={(e) => setCeiling(e.target.value)}
+              placeholder="$/hr cap"
+              title="Enforced hourly ceiling on this principal's attributed spend. A launch that would exceed it is refused. Leave empty for no ceiling."
+              className="w-20 rounded border border-zinc-300 px-2 py-1.5 text-sm"
+            />
             <button
               onClick={mint}
               disabled={busy || name.trim().length < 2}
@@ -170,6 +183,14 @@ export function PrincipalsPanel() {
               >
                 {p.role}
               </span>
+              {p.max_hourly_spend_usd != null && (
+                <span
+                  className="rounded bg-zinc-100 px-1.5 py-0.5 font-mono text-[11px] text-zinc-600"
+                  title="Enforced ceiling: launches pushing this principal's attributed burn past it are refused."
+                >
+                  ≤ ${p.max_hourly_spend_usd.toFixed(2)}/hr
+                </span>
+              )}
               {p.revoked_at ? (
                 <span className="rounded bg-zinc-100 px-1.5 py-0.5 text-[11px] text-zinc-500">
                   revoked {formatDate(p.revoked_at)}

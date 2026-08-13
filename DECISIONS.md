@@ -3690,3 +3690,61 @@ refusing an unclassified route; open mode unaffected. Full suite 806
 passing; dashboard builds clean; live probe walked the ladder on a running
 backend (viewer 200-read/403-launch, operator 202-launch/403-govern,
 /v1 permission_error envelope), repo .env untouched.
+
+## Phase 81 — Team mode: two walls, a ledger, and a database decision (2026-08-13)
+
+- **The network policy is judged per request, not per boot.** The backend
+  cannot know how uvicorn was started, but every connection knows the
+  interface it arrived on (scope["server"], the listening socket's own
+  address). NetworkGuardMiddleware - installed UNCONDITIONALLY, outermost,
+  because its whole job is the case where auth is NOT configured - refuses
+  non-loopback requests when no token exists, and refuses plaintext
+  non-loopback requests without the explicit `server.allow_plaintext_lan`
+  opt-in (a bearer token on an unencrypted LAN hop is a credential
+  broadcast; the opt-in exists because a Tailscale/WireGuard tailnet
+  already encrypts below http). A non-IP server host ("testserver") reads
+  as local: real uvicorn reports numeric socket addresses, so a hostname
+  means a test client. **Alternative:** a boot-time bind check - rejected,
+  the app never reliably sees its bind; per-request judgment holds under
+  any launcher, reverse proxy, or multi-interface host.
+
+- **The per-principal ceiling is a real guard in the orchestrator, judged
+  against the same live baseline as the global guards.** Same
+  pending-launch double-admit protection, filtered to the principal; chain
+  attribution makes it bind (an auto-managed job's launch counts against
+  whoever enqueued the job). The refusal names the principal, its current
+  burn, its ceiling, and the fix. "owner" and legacy actors have no row
+  and no ceiling; a row without a ceiling is unlimited; the advisory
+  monthly wallet stays global and advisory - one enforced RATE ceiling
+  per principal is legible, a per-principal monthly wallet would be four
+  more numbers explaining themselves.
+
+- **Phase 79 missed cluster attribution; 81 needed it and fixed it.**
+  launch_cluster never took created_by, so cluster nodes were
+  unattributed - which would have made the ceiling trivially evadable by
+  launching clusters. The whole cluster is now attributed to one
+  principal and judged atomically against their ceiling.
+
+- **SQLite stays, deliberately.** Team mode is one shared backend process,
+  not N backends sharing a database: behind one process, WAL-mode SQLite
+  covers a small team's write rate, and every guard remains an in-process
+  transaction. What would force Postgres is backend REPLICAS - which would
+  also need distributed guard state, a different product. The
+  Database/TaskQueue interfaces remain the swap point; deciding now, in
+  writing, beats deciding implicitly by never thinking about it.
+
+- **Spend gains the team grouping.** breakdown by="created_by", with
+  pre-attribution rows reading "unattributed" - a true statement, never a
+  guess - and the dashboard's "Where it went" toggles hardware/principal.
+
+**Test coverage:** `tests/test_team_mode.py` - ASGI-level network guard
+(loopback always passes; no-token network refusal; plaintext refusal
+naming the opt-in; opt-in honored; TLS needs none; WS closes 4403; the
+IP classifier), the ceiling refusing the crossing launch with the numbers
+in the message, per-principal isolation (global guards still bind above
+everyone), owner/uncapped unlimited, pending launches counting against
+the ceiling, 422 on nonpositive ceilings, breakdown by principal. Full
+suite 818 passing; dashboard builds clean; live probe on a REAL 0.0.0.0
+bind through the machine's LAN address confirmed both walls, the opt-in,
+the ceiling refusal with exact numbers, and by-principal spend; repo
+.env untouched.
