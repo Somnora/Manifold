@@ -265,6 +265,11 @@ class Settings:
     # Optional: if set, the OpenAI-compatible /v1 proxy requires this as a
     # bearer token. Empty = open (fine for localhost-only single-user use).
     proxy_api_key: str = ""
+    # The local API token: when set, every HTTP/WebSocket request must send
+    # `Authorization: Bearer <this>` (see auth.py). Empty = no enforcement,
+    # which is what mock mode and the test harness rely on; create_app's
+    # real path generates one when missing, so production is never open.
+    api_token: str = ""
     # Optional HuggingFace token: lets the model-fit preflight read exact
     # sizes for gated repos whose license this account has accepted.
     hf_token: str = ""
@@ -402,6 +407,7 @@ def load_settings(
         s3_secret_access_key=os.environ.get("S3_SECRET_ACCESS_KEY", ""),
         tailscale_authkey=os.environ.get("TAILSCALE_AUTHKEY", ""),
         proxy_api_key=os.environ.get("MANIFOLD_PROXY_KEY", ""),
+        api_token=os.environ.get("MANIFOLD_API_TOKEN", ""),
         hf_token=os.environ.get("HF_TOKEN", ""),
         guardrails=Guardrails(
             max_concurrent_instances=int(guard.get("max_concurrent_instances", 1)),

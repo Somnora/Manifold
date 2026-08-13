@@ -15,6 +15,27 @@ or mock mode with `MANIFOLD_MOCK=1`). The MCP server is a thin bridge to
 it; if the backend is down, every tool returns a clear "backend
 unreachable" error.
 
+## Authentication (MANIFOLD_API_TOKEN)
+
+A real-mode backend requires its API token on every request. The bridge
+sends it when the `MANIFOLD_API_TOKEN` env var is set; without it, every
+tool against a real backend returns a 401 naming the `.env` to copy it
+from.
+
+- **Installed app** (`manifold-backend --mcp`): nothing to do. The bridge
+  reads the token from the app's own `.env` (the same file the backend
+  generated it into), so the configs below work as-is.
+- **Dev checkout** (`uv run manifold-mcp`): the bridge does not load
+  `.env` itself. Add the token to the MCP config's env block, copied from
+  the repo root `.env`:
+
+```json
+"env": {"MANIFOLD_API_TOKEN": "<the value from .env>"}
+```
+
+Mock mode enforces nothing, so the variable is optional there. If you
+rotate the token in `.env`, update it in any MCP config that carries it.
+
 ## From the installed desktop app (no dev checkout)
 
 The app's bundled backend binary doubles as the MCP server: run it with

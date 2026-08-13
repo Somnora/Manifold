@@ -93,11 +93,22 @@ async def test_active_ide_session_prevents_idle():
     
     dispatcher.touch_activity.assert_called_once_with("inst-1")
 
-def test_attach_on_non_active_instance():
-    # Test attach_ide in main.py via TestClient
+def test_attach_on_non_active_instance(tmp_path):
+    # Test attach_ide in main.py via TestClient. Harness wiring, NOT
+    # create_default_app: since Phase 78 a production-wired app generates
+    # an API token into the real DATA_ROOT/.env on construction, and a
+    # test must never write the developer's .env (this one did, once).
     from fastapi.testclient import TestClient
-    from app.main import create_default_app
-    app = create_default_app()
+    from app.lambda_api import MockLambdaClient
+    from app.main import create_app
+    from tests.conftest import make_settings, mock_connect_fn
+    app = create_app(
+        make_settings(tmp_path),
+        lambda_client=MockLambdaClient(),
+        connect_fn=mock_connect_fn,
+        env_path=tmp_path / ".env",
+        custom_templates_dir=tmp_path / "custom-templates",
+    )
     client = TestClient(app)
 
     res = client.post("/instances/inst-unknown/ide-attach")

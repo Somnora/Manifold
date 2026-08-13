@@ -60,6 +60,19 @@ def run_mcp() -> None:
     listening on MANIFOLD_PORT - normally the running desktop app.
     """
     os.environ.setdefault("MANIFOLD_API_URL", f"http://{HOST}:{PORT}")
+    # The bridge authenticates like every other client (Phase 78). MCP
+    # clients spawn this binary with a clean env, so when the token is not
+    # already provided, read it from the app's own .env - the file the
+    # backend generated it into on first real-mode boot - instead of
+    # requiring every MCP config to carry the secret by hand.
+    if not os.environ.get("MANIFOLD_API_TOKEN"):
+        from dotenv import dotenv_values
+
+        from app.config import DATA_ROOT
+        token = (dotenv_values(DATA_ROOT / ".env") or {}).get(
+            "MANIFOLD_API_TOKEN") or ""
+        if token:
+            os.environ["MANIFOLD_API_TOKEN"] = token
     from app import mcp_server
     mcp_server.main()
 

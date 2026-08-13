@@ -2,6 +2,7 @@
 // consumer: no business logic here, just fetch + types + error surfacing.
 
 import { API_BASE } from "./backend";
+import { authHeaders, notifyUnauthorized } from "./token";
 
 export class ApiError extends Error {
   status: number;
@@ -29,7 +30,11 @@ async function request<T>(
     resp = await fetch(`${API_BASE}${path}`, {
       ...init,
       signal: ctrl.signal,
-      headers: { "content-type": "application/json", ...init?.headers },
+      headers: {
+        "content-type": "application/json",
+        ...authHeaders(),
+        ...init?.headers,
+      },
     });
   } catch {
     if (ctrl.signal.aborted) {
@@ -48,6 +53,9 @@ async function request<T>(
   }
   const body = await resp.json().catch(() => ({}));
   if (!resp.ok) {
+    // 401 means the backend enforces its API token and this browser does
+    // not hold it (or holds a stale one): raise the TokenGate.
+    if (resp.status === 401) notifyUnauthorized();
     const err = new ApiError(
       resp.status,
       body.detail ?? `HTTP ${resp.status}`,
@@ -685,6 +693,8 @@ export const api = {
       s3_configured: boolean;
       gcp_configured: boolean;
       tailscale_available: boolean;
+      // Presence only: IS a token enforced, never the token itself.
+      auth_required: boolean;
       env_path: string;
       // Bounds for the max-lifetime ceiling, so the launch form can state
       // the real minimum instead of letting the user discover it as a 400.
@@ -903,6 +913,7 @@ export const api = {
       resp = await fetch(`${API_BASE}/instances/${instanceId}/files/upload`, {
         method: "POST",
         body: form,
+        headers: authHeaders(), // multipart sets its own content-type
         signal: ctrl.signal,
       });
     } catch {
@@ -919,6 +930,7 @@ export const api = {
     }
     const body = await resp.json().catch(() => ({}));
     if (!resp.ok) {
+      if (resp.status === 401) notifyUnauthorized();
       throw new ApiError(resp.status, body.detail ?? `HTTP ${resp.status}`);
     }
     return body as { path: string; bytes: number };
@@ -926,6 +938,20 @@ export const api = {
 
   downloadUrl: (instanceId: string, absolutePath: string) =>
     `${API_BASE}/instances/${instanceId}/files/download?path=${encodeURIComponent(absolutePath)}`,
+
+  // Browser downloads are plain <a>/location navigations that cannot carry
+  // the Authorization header, and the long-lived token must stay out of
+  // query strings (the backend's access log records the request line). So
+  // a download click first mints a single-use ~60s nonce over the authed
+  // channel, then navigates to the nonce URL. Against an open backend the
+  // nonce is minted but never checked - one code path either way.
+  startDownload: async (url: string) => {
+    const { nonce } = await request<{
+      nonce: string;
+      expires_in_seconds: number;
+    }>("/downloads/token", { method: "POST" });
+    window.location.assign(`${url}&nonce=${encodeURIComponent(nonce)}`);
+  },
 
   recentFiles: (instanceId: string, hours = 24, limit = 50) =>
     request<{

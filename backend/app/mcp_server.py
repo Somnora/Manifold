@@ -12,7 +12,9 @@ call is recorded in the backend audit log (tool, args, note, result) and
 shown on the dashboard's Agent Activity page.
 
 Run: `uv run manifold-mcp` from backend/ (stdio transport).
-Config: MANIFOLD_API_URL (default http://localhost:8000).
+Config: MANIFOLD_API_URL (default http://localhost:8000), and
+MANIFOLD_API_TOKEN when the backend enforces its API token (real mode
+does; see docs/mcp-setup.md).
 """
 
 from __future__ import annotations
@@ -25,6 +27,10 @@ import httpx
 from mcp.server.fastmcp import FastMCP
 
 API_URL = os.environ.get("MANIFOLD_API_URL", "http://localhost:8000")
+# The backend's API token (Phase 78). Empty is fine against a mock or
+# open backend; against a real one every call would come back 401 with
+# the .env path to copy it from.
+API_TOKEN = os.environ.get("MANIFOLD_API_TOKEN", "")
 
 mcp = FastMCP(
     "manifold",
@@ -56,7 +62,11 @@ _client: httpx.AsyncClient | None = None
 def _http() -> httpx.AsyncClient:
     global _client
     if _client is None:
-        _client = httpx.AsyncClient(base_url=API_URL, timeout=60.0)
+        _client = httpx.AsyncClient(
+            base_url=API_URL, timeout=60.0,
+            headers=({"Authorization": f"Bearer {API_TOKEN}"}
+                     if API_TOKEN else {}),
+        )
     return _client
 
 

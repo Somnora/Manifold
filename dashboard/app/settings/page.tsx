@@ -61,6 +61,15 @@ export default function SettingsPage() {
               badLabel="not set"
               badTone="zinc"
             />
+            {/* Presence only, like every credential here: protected or
+                open, never the token itself. */}
+            <StatusItem
+              label="API auth"
+              ok={status.auth_required}
+              okLabel="token required"
+              badLabel="open (localhost)"
+              badTone="zinc"
+            />
           </dl>
           {status.mock && (
             <p className="mt-3 text-xs text-amber-700">

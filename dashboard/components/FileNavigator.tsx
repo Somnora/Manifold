@@ -83,6 +83,18 @@ export function FileNavigator({ instanceId }: { instanceId: string }) {
     }
   }
 
+  // Downloads mint a single-use nonce first (api.startDownload): a plain
+  // href cannot carry the Authorization header, and the long-lived token
+  // must never appear in a URL.
+  async function download(url: string) {
+    setError("");
+    try {
+      await api.startDownload(url);
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : String(err));
+    }
+  }
+
   useEffect(() => {
     load();
   }, [load]);
@@ -212,13 +224,12 @@ export function FileNavigator({ instanceId }: { instanceId: string }) {
             {uploading ? "Uploading..." : "Upload here"}
           </button>
           {path && (
-            <a
-              href={api.archiveUrl(instanceId, absolute())}
+            <button
+              onClick={() => download(api.archiveUrl(instanceId, absolute()))}
               className="rounded bg-zinc-900 px-2 py-1 text-xs font-medium text-white hover:bg-zinc-700"
-              download
             >
               Download folder (.tar.gz)
-            </a>
+            </button>
           )}
         </div>
       </div>
@@ -287,22 +298,28 @@ export function FileNavigator({ instanceId }: { instanceId: string }) {
                           Copy path
                         </button>
                         {!entry.is_dir && (
-                          <a
-                            href={api.downloadUrl(instanceId, absolute(entry.name))}
+                          <button
+                            onClick={() =>
+                              download(
+                                api.downloadUrl(instanceId, absolute(entry.name)),
+                              )
+                            }
                             className="rounded border border-zinc-300 px-1.5 py-0.5 text-zinc-600 hover:bg-zinc-100"
-                            download
                           >
                             Download
-                          </a>
+                          </button>
                         )}
                         {entry.is_dir && (
-                          <a
-                            href={api.archiveUrl(instanceId, absolute(entry.name))}
+                          <button
+                            onClick={() =>
+                              download(
+                                api.archiveUrl(instanceId, absolute(entry.name)),
+                              )
+                            }
                             className="rounded border border-zinc-300 px-1.5 py-0.5 text-zinc-600 hover:bg-zinc-100"
-                            download
                           >
                             .tar.gz
-                          </a>
+                          </button>
                         )}
                         <button
                           onClick={() => setConfirmDelete(entry)}

@@ -51,6 +51,12 @@ from .lambda_api import (
     capacity_error,
 )
 from .agent import Autopilot, find_serving_task
+from .auth import (
+    NonceStore,
+    TokenAuthMiddleware,
+    ensure_api_token,
+    token_matches,
+)
 from .dispatcher import Dispatcher, ParameterError, coerce_parameters
 from .model_client import MockModelClient, ModelClientError
 from .notifications import NotificationCenter, os_notify
@@ -387,6 +393,14 @@ def create_app(
     if hf_lookup_fn is None and not mock and lambda_client is None:
         from .hf_lookup import lookup_weights_gb
         hf_lookup_fn = lookup_weights_gb
+    # API-token generation, gated on the SAME production-wiring test as the
+    # image checker above: only a real backend with no injected client mints
+    # one. Tests (injected client) and mock mode never generate and never
+    # write a .env - they stay open, zero-credential. Real mode is therefore
+    # never open: no token means mint-and-persist now, or refuse to boot
+    # (ensure_api_token raises SystemExit if .env cannot be written).
+    if not mock and lambda_client is None and not settings.api_token:
+        settings = replace(settings, api_token=ensure_api_token(env_file))
 
     if mock:
         shared_sidecar = None
@@ -629,6 +643,26 @@ def create_app(
     app.state.brains = brains
     app.state.autopilot = autopilot
 
+    # Single-use download credentials (auth.NonceStore): browser <a>
+    # downloads cannot send the Authorization header, and the long-lived
+    # token must never ride a query string (uvicorn's access log records
+    # the request line, secret and all).
+    nonces = NonceStore()
+    app.state.download_nonces = nonces
+
+    if settings.api_token:
+        # Empty token = no middleware: mock mode and the test harness stay
+        # a zero-credential demo. Added BEFORE CORS on purpose -
+        # add_middleware prepends, so CORS (added last) wraps auth. The
+        # other way around, the browser preflight OPTIONS (which never
+        # carries Authorization) would 401 before CORS could answer it, and
+        # 401s would lack Access-Control-Allow-Origin, which the :3000 dev
+        # dashboard reads as a network error instead of the token gate.
+        app.add_middleware(
+            TokenAuthMiddleware, token=settings.api_token, nonces=nonces,
+            env_path=str(env_file),
+        )
+
     # The dashboard (Phase 2) runs on localhost:3000 and is the only
     # expected browser client; the backend itself binds to localhost.
     app.add_middleware(
@@ -700,6 +734,9 @@ def create_app(
             ),
             "tailscale_available": bool(settings.tailscale_authkey),
             "proxy_protected": bool(settings.proxy_api_key),
+            # Presence only, like everything above: IS a token enforced,
+            # never what it is.
+            "auth_required": bool(settings.api_token),
             "env_path": str(env_file),
             # The max-lifetime ceiling's bounds, so the launch form can state
             # the real minimum instead of letting the user discover it as a
@@ -1298,8 +1335,16 @@ def create_app(
                 if model:
                     os.environ["OPENAI_BASE_URL"] = proxy_base
                     os.environ["OPENAI_API_BASE"] = proxy_base  # older SDKs
+                    # The credential /v1 actually accepts: the dedicated
+                    # proxy key when set, else the API token (real mode
+                    # always has one). The old hardcoded "manifold" literal
+                    # died with the open proxy - it would now be a wrong
+                    # key baked into every shell. When neither is set the
+                    # proxy is open and the placeholder only satisfies
+                    # SDKs that refuse an empty key string.
                     os.environ["OPENAI_API_KEY"] = (
-                        settings.proxy_api_key or "manifold")
+                        settings.proxy_api_key or settings.api_token
+                        or "unused")
                     os.environ["MANIFOLD_MODEL"] = model
                 os.execvp(shell, [shell, "-l"])
             except BaseException:
@@ -1600,11 +1645,27 @@ def create_app(
         )
 
     def _proxy_auth_ok(request: Request) -> bool:
-        if not settings.proxy_api_key:
-            return True   # open: fine for localhost-only single-user use
+        # The dedicated proxy key is THE credential when set; otherwise the
+        # global API token guards /v1 too. Neither set = open - that is the
+        # mock/test harness and an explicitly tokenless dev backend.
+        # Production always holds an api_token after first boot (generated
+        # in create_app), so a real backend is fail-closed here.
+        expected = settings.proxy_api_key or settings.api_token
+        if not expected:
+            return True
         header = request.headers.get("authorization", "")
         token = header[7:] if header.lower().startswith("bearer ") else ""
-        return token == settings.proxy_api_key
+        return token_matches(token, expected)
+
+    def _proxy_unauthorized():
+        # OpenAI envelope, kept: SDK clients parse {"error": {...}}. Points
+        # at where the credential lives, never its value.
+        return _openai_error(
+            401,
+            "Invalid API key. Use MANIFOLD_PROXY_KEY (or, if that is "
+            f"unset, MANIFOLD_API_TOKEN) from Manifold's .env "
+            f"({env_file}); see docs/openai-proxy.md.",
+            "invalid_api_key", "authentication_error")
 
     def _serving_endpoints() -> list[dict]:
         """Every running model server on a CONNECTED instance."""
@@ -1643,8 +1704,7 @@ def create_app(
     @app.get("/v1/models")
     async def openai_list_models(request: Request):
         if not _proxy_auth_ok(request):
-            return _openai_error(401, "Invalid API key.", "invalid_api_key",
-                                 "authentication_error")
+            return _proxy_unauthorized()
         # Only advertise models that actually answer — a client picking from
         # this list expects to be able to use it. Still-loading models are
         # simply not listed yet.
@@ -1669,8 +1729,7 @@ def create_app(
         import json
         from fastapi.responses import StreamingResponse
         if not _proxy_auth_ok(request):
-            return _openai_error(401, "Invalid API key.", "invalid_api_key",
-                                 "authentication_error")
+            return _proxy_unauthorized()
         try:
             body = await request.json()
         except Exception:
@@ -1742,6 +1801,18 @@ def create_app(
         )
 
     # -- file bridge (upload/download over the managed SSH connection) -------------
+
+    @app.post("/downloads/token")
+    async def mint_download_token():
+        """Mint a single-use, short-lived nonce for the two browser
+        download links (file download and folder archive). Minting itself
+        requires the normal auth - this route is NOT exempt - and the
+        nonce then stands in for the token on exactly one GET, so the
+        long-lived secret never appears in a query string or the access
+        log. When no token is enforced the nonce is minted but never
+        checked, which keeps the dashboard on a single code path."""
+        return {"nonce": nonces.mint(),
+                "expires_in_seconds": nonces.ttl_seconds}
 
     ALLOWED_FILE_ROOTS = ("/lambda/nfs/", "/workspace/ephemeral/")
 

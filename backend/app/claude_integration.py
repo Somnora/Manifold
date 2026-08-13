@@ -9,15 +9,21 @@ CLAUDE_MCP_CONFIG_PATH = os.path.expanduser("~/.claude/mcp.json")
 
 def generate_mcp_config(manifold_api_url: str = "http://localhost:8000", backend_dir: str = "") -> Dict[str, Any]:
     """Generates Claude Code MCP configuration for Manifold."""
+    env = {"MANIFOLD_API_URL": manifold_api_url}
+    # Deliberate secret sprawl (see DECISIONS.md, Phase 78): mcp.json gets
+    # a plaintext copy of the API token, because the MCP client spawns the
+    # bridge with only this env block. Rotating the token in .env means
+    # re-running this setup so the copy follows.
+    token = os.environ.get("MANIFOLD_API_TOKEN", "")
+    if token:
+        env["MANIFOLD_API_TOKEN"] = token
     return {
         "mcpServers": {
             "manifold": {
                 "command": "uv",
                 "args": ["run", "manifold-mcp"],
                 "cwd": backend_dir,
-                "env": {
-                    "MANIFOLD_API_URL": manifold_api_url
-                }
+                "env": env
             }
         }
     }

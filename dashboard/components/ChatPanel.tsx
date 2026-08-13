@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "@/lib/api";
 import { API_BASE } from "@/lib/backend";
+import { authHeaders } from "@/lib/token";
 import { usePolling } from "@/lib/usePolling";
 
 
@@ -86,9 +87,11 @@ export function ChatPanel({ instanceId }: { instanceId: string }) {
     const abort = new AbortController();
     abortRef.current = abort;
     try {
+      // Raw fetch (request() cannot stream SSE), so the auth header rides
+      // here explicitly like every other escape from request().
       const resp = await fetch(`${API_BASE}/instances/${instanceId}/chat`, {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: { "content-type": "application/json", ...authHeaders() },
         body: JSON.stringify({ messages: apiHistory(history), tools }),
         signal: abort.signal,
       });

@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import { api, ApiError, type SidecarDiagnosis } from "@/lib/api";
 import { wsBase } from "@/lib/backend";
+import { getToken } from "@/lib/token";
 
 type GpuSample = {
   name: string;
@@ -50,7 +51,12 @@ export function TelemetryChart({ instanceId }: { instanceId: string }) {
     setDiagErr("");
 
     let closed = false;
-    const ws = new WebSocket(`${wsBase()}/instances/${instanceId}/metrics/stream`);
+    // Browser WebSockets cannot set headers; the API token rides as ?token=.
+    const token = getToken();
+    const qs = token ? `?token=${encodeURIComponent(token)}` : "";
+    const ws = new WebSocket(
+      `${wsBase()}/instances/${instanceId}/metrics/stream${qs}`,
+    );
     wsRef.current = ws;
 
     ws.onmessage = (event) => {

@@ -5,6 +5,7 @@ import { Nav } from "@/components/Nav";
 import { BurnChip } from "@/components/BurnChip";
 import { McpChip } from "@/components/McpChip";
 import { NotificationBell } from "@/components/NotificationBell";
+import { TokenGate } from "@/components/TokenGate";
 import {
   TerminalDockProvider,
   TerminalDockToggle,
@@ -35,6 +36,9 @@ export default function RootLayout({
   return (
     <html lang="en" className={`${grotesk.variable} ${mono.variable}`}>
       <body className="min-h-screen bg-zinc-50 text-zinc-900 antialiased">
+        {/* At the layout level so ANY page can recover from a 401: stores
+            the Tauri handoff token and asks for a paste otherwise. */}
+        <TokenGate />
         {/* The dock provider wraps everything so any page (instance cards
             included) can dock a shell, and sessions survive navigation. */}
         <TerminalDockProvider>

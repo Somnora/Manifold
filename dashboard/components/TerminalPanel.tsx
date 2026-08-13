@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import "@xterm/xterm/css/xterm.css";
 import { wsBase } from "@/lib/backend";
+import { getToken } from "@/lib/token";
 
 
 // A real shell in the dashboard: xterm.js <-> backend WS. Two flavors of
@@ -269,6 +270,10 @@ export function TerminalPanel({
       const params = new URLSearchParams();
       if (sessionId) params.set("session", sessionId);
       if (model) params.set("model", model);
+      // Browser WebSockets cannot set headers, so the API token rides as
+      // ?token= (the backend accepts either spelling on WS routes).
+      const token = getToken();
+      if (token) params.set("token", token);
       const qs = params.size > 0 ? `?${params.toString()}` : "";
       const ws = new WebSocket(`${wsBase()}${path}${qs}`);
 

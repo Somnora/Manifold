@@ -48,6 +48,18 @@ export function RecentFiles({ instanceId }: { instanceId: string }) {
       : `/lambda/nfs/${f.path}`;
   }
 
+  // Downloads mint a single-use nonce first (api.startDownload): a plain
+  // href cannot carry the Authorization header, and the long-lived token
+  // must never appear in a URL.
+  async function download(url: string) {
+    setUploadError("");
+    try {
+      await api.startDownload(url);
+    } catch (err) {
+      setUploadError(err instanceof ApiError ? err.message : String(err));
+    }
+  }
+
   if (error && !data) {
     return <p className="mt-3 text-xs text-amber-700">Files: {error}</p>;
   }
@@ -108,13 +120,14 @@ export function RecentFiles({ instanceId }: { instanceId: string }) {
                 <span>
                   {formatBytes(f.size_bytes)} · {formatDate(f.modified)}
                 </span>
-                <a
-                  href={api.downloadUrl(instanceId, absolutePath(f))}
+                <button
+                  onClick={() =>
+                    download(api.downloadUrl(instanceId, absolutePath(f)))
+                  }
                   className="rounded border border-zinc-300 bg-white px-1.5 py-0.5 text-zinc-600 hover:bg-zinc-100"
-                  download
                 >
                   Download
-                </a>
+                </button>
               </span>
             </li>
           ))}

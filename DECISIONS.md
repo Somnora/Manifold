@@ -3467,3 +3467,106 @@ pipeline over HTTP (ordered by timestamps; cancelled root skips the chain
 with the skip in the event trail). Full suite 745 passing; dashboard builds
 clean; live probe against a running mock backend confirmed the 422s, the 409
 guard, the transitive cascade, and A-before-B ordering on a real dispatch.
+
+## Phase 78 — A local API token: loopback is not authorization (2026-08-12)
+
+- **Enforcement is conditional on a token existing; generation is gated on
+  production wiring.** `Settings.api_token` comes from `MANIFOLD_API_TOKEN`
+  in .env. Empty means no middleware at all — which is what keeps mock mode
+  a zero-credential demo and every existing TestClient app green untouched.
+  create_app mints a token ONLY on the same production test the image
+  checker already uses (not mock, no injected client), persists it via
+  update_env_file, and REFUSES TO BOOT (SystemExit) if the write fails: a
+  real backend is never silently open, and a memory-only token would strand
+  every client at the next restart. **Alternative:** enforce always and
+  seed tests with a token — rejected as ~100 fixture edits for no security
+  gain, and mock mode would stop being zero-setup.
+
+- **A .env we create is chmod 600.** The generated token (and, later, the
+  Lambda key the Settings page writes into the same file) should not be
+  world-readable. Only on creation: an existing .env's permissions are the
+  user's own business to tighten or not.
+
+- **Pure ASGI middleware, installed inside CORS.** BaseHTTPMiddleware never
+  sees WebSocket scopes (they would sail past auth) and shims streaming
+  responses. Ordering is load-bearing twice: CORS must answer the browser
+  preflight OPTIONS (which never carries Authorization) before auth can
+  401 it, and a 401 must pass out through CORS to gain
+  Access-Control-Allow-Origin — without it the :3000 dashboard reads the
+  401 as a network error and the token gate never appears. Both directions
+  are pinned by tests.
+
+- **Exact-path exemptions, default deny.** The dashboard's page routes,
+  their .html/.txt export spellings, /icon.svg, and the /_next/ asset
+  prefix are open so the shell can render and ask for the token; every
+  API route 401s, including /settings/lambda-key and /storage/files which
+  live UNDER exempt page paths — the reason the list is exact matches and
+  not prefixes. A route-table walk in test_auth.py asserts every non-pinned
+  route refuses unauthenticated, so adding a route without thinking about
+  auth fails the suite.
+
+- **WebSockets: accept, then close(4401).** A pre-accept denial surfaces in
+  browser JS as an opaque handshake failure; accepting first exposes
+  close.code to clients that want it. The dashboard deliberately does not
+  key on 4401 — the code is a courtesy, not a contract. Browser WS cannot
+  set headers, so ?token= is accepted on WebSocket routes only; on HTTP the
+  master token NEVER rides a query string (uvicorn's access log records the
+  request line).
+
+- **Downloads use single-use nonces, not the token in the URL.** The two
+  <a>-style download escapes mint a ~60s single-use nonce over the authed
+  channel (POST /downloads/token) and pass it as ?nonce= — the only
+  query-string credential, valid for exactly those two GETs. In-memory
+  store, expire on use and TTL. Deliberately NOT bound to a specific path
+  this phase (boring first); binding nonce→path is the obvious tightening
+  if it ever matters.
+
+- **/v1 keeps its own scheme: proxy key if set, else the API token, open
+  only when neither exists.** The OpenAI error envelope stays (SDKs parse
+  {"error": {...}}). "Open when neither" preserves
+  test_openai_proxy.py::test_proxy_open_when_no_key AS-IS in the harness,
+  while production — which always holds a token after first boot — is
+  fail-closed. The old hardcoded "manifold" OPENAI_API_KEY injected into
+  hub shells died with the open proxy; shells now get the active
+  credential ("unused" only when the proxy is genuinely open, purely to
+  satisfy SDKs that refuse empty strings).
+
+- **The Tauri shell hands the token over as /?token=... .** It reads the
+  packaged app's data-dir .env (the same file the backend generates into,
+  which exists before the port answers) and navigates once; the dashboard
+  stores the token and scrubs the URL via history.replaceState. No control
+  protocol, no second handshake file — a second plaintext copy with its own
+  lifecycle for zero benefit. The dev-reuse branch (port already serving
+  from a checkout) navigates bare and the paste gate covers it.
+
+- **mcp.json gets a plaintext copy of the token — deliberate secret
+  sprawl.** MCP clients spawn the bridge with only the config's env block,
+  so claude_integration emits MANIFOLD_API_TOKEN into it when set. The
+  caveat is rotation: changing the token in .env does NOT update mcp.json;
+  re-run the setup. The desktop `manifold-backend --mcp` avoids the copy
+  entirely by reading the app's own .env at startup. The AGY skill format
+  has no credential field at all, so it now says so loudly in the emitted
+  YAML (mock mode or an explicitly empty token required) instead of
+  breaking silently.
+
+- **Two existing tests had to change, both because they built production
+  apps.** test_ide_attach built create_default_app() inside the suite —
+  under Phase 78 that GENERATES A TOKEN INTO THE DEVELOPER'S REAL .env
+  (caught live when the repo .env changed checksum mid-run; restored
+  byte-identically). It now uses harness wiring. test_desktop_mcp's
+  default-mode test stubs the factory for the same reason, and its
+  run_mcp tests pre-set MANIFOLD_API_TOKEN so the bridge's .env fallback
+  never reads the developer's file.
+
+**Test coverage:** `tests/test_auth.py` — 401/success on a spend route
+(with the launch never reaching the cloud), constant-time comparison
+pinned to source, WS refusal (4401) and acceptance via header and
+?token=, exact-vs-prefix exemptions, the CORS preflight/readable-401
+pair, the full route-table drift guard, the nonce lifecycle (mint needs
+auth, single use, TTL expiry, not a general credential), /v1 dual
+credential with the OpenAI envelope, mock mode open with zero .env
+writes, harness apps writing nothing, real-mode generate+persist+chmod
+600, preset token respected, SystemExit on persist failure, and
+presence-only /settings/status. Full suite 769 passing; dashboard builds
+clean; live uvicorn probe confirmed enforcement end to end (see phase
+report).

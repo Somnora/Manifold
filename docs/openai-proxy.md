@@ -31,7 +31,9 @@ budget and concurrency guards). It is a router, not a spender.
 ```python
 from openai import OpenAI
 
-client = OpenAI(base_url="http://localhost:8000/v1", api_key="unused")
+# api_key: MANIFOLD_PROXY_KEY if you set one, else MANIFOLD_API_TOKEN
+# (both live in Manifold's .env). Any value works in mock mode.
+client = OpenAI(base_url="http://localhost:8000/v1", api_key="<from .env>")
 
 # See what's available
 print([m.id for m in client.models.list().data])
@@ -56,7 +58,7 @@ Or point OpenClaw / any OpenAI-compatible tool at:
 
 ```
 base_url: http://localhost:8000/v1
-api_key:  (any value, unless you set MANIFOLD_PROXY_KEY)
+api_key:  (MANIFOLD_PROXY_KEY if set, else MANIFOLD_API_TOKEN from .env)
 model:    <the model id from GET /v1/models>
 ```
 
@@ -75,18 +77,29 @@ The `model` field is resolved in this order:
 If nothing is served you get a `503` with a clear message; if you name a
 model that isn't served (and more than one is), a `404` listing what is.
 
-## Optional authentication
+## Authentication
 
-By default the proxy is open, which is fine because the backend listens on
-localhost only. If you expose it (a tunnel, another machine), set a token in
-`.env`:
+The proxy accepts one of two credentials from `.env`, in this order:
 
-```
-MANIFOLD_PROXY_KEY=your-long-random-token
-```
+1. `MANIFOLD_PROXY_KEY`, if you set one - a key you can hand to /v1
+   clients without giving them the full Manifold API.
+2. Otherwise `MANIFOLD_API_TOKEN`, the backend's own API token. Real mode
+   generates this on first start and writes it to `.env`, so a real
+   backend's proxy is protected by default.
 
-Then every `/v1` request must send `Authorization: Bearer your-long-random-token`,
-and clients set that as their `api_key`.
+Clients set the active credential as their `api_key` (it is sent as
+`Authorization: Bearer <value>`).
+
+**Migration note:** before the API token existed, a proxy with no
+`MANIFOLD_PROXY_KEY` was open. Since the token landed, a previously-open
+proxy now requires it: copy `MANIFOLD_API_TOKEN` from `.env` (the repo
+root in development; the app's data folder, e.g.
+`~/Library/Application Support/Manifold`, for the desktop app) into your
+client's `api_key`. Shells opened from the Hub page with a model attached
+get the right key injected automatically.
+
+The proxy is only open when NEITHER value is set, which happens in mock
+mode (`MANIFOLD_MOCK=1`) or if you empty `MANIFOLD_API_TOKEN` yourself.
 
 ## Notes and limits
 
