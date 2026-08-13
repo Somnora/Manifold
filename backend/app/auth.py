@@ -17,6 +17,8 @@ list, and the download-nonce store all live here.
 
 from __future__ import annotations
 
+import contextvars
+import hashlib
 import hmac
 import json
 import logging
@@ -37,6 +39,98 @@ def token_matches(candidate: str, expected: str) -> bool:
     wrong byte, which leaks the token one byte at a time through response
     timing to anything that can hammer the port."""
     return hmac.compare_digest(candidate.encode(), expected.encode())
+
+
+def hash_token(value: str) -> str:
+    """sha256 hex of a token value - what the api_principals table stores.
+
+    A stolen database row is a fingerprint, not a credential: the token
+    itself is 256 bits of token_urlsafe, far beyond offline guessing."""
+    return hashlib.sha256(value.encode()).hexdigest()
+
+
+# -- who is asking (Phase 79) ----------------------------------------------
+
+# The resolved principal for the CURRENT request. Set by the middleware,
+# read anywhere downstream (routes, and helpers they call) without
+# threading a parameter through every signature. Context propagates into
+# FastAPI's threadpool for sync handlers and into asyncio tasks created
+# during the request, so a launch pipeline spawned mid-request still knows
+# who started it. Background loops (dispatcher, watches) never pass
+# through the middleware and keep attributing explicitly.
+_current_principal: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "manifold_principal", default="")
+
+# Names no principal may take: the built-in actors that appear in the
+# audit log with meanings of their own. "owner" is the .env token's name.
+RESERVED_PRINCIPALS = frozenset(
+    {"owner", "backend", "autopilot", "api", "anonymous"})
+
+_PRINCIPAL_NAME = re.compile(r"^[a-z0-9][a-z0-9-]{1,31}$")
+
+
+def valid_principal_name(name: str) -> bool:
+    """Lowercase slug, 2-32 chars: it lands in audit rows, created_by
+    columns, and UI chips, so it must be boring and unambiguous."""
+    return bool(_PRINCIPAL_NAME.match(name)) and name not in RESERVED_PRINCIPALS
+
+
+def current_principal() -> str:
+    """The principal behind the current request.
+
+    Falls back to "api" when no principal was resolved - an open backend
+    (mock mode, harness, no token configured), where every caller is
+    equally anonymous and the pre-79 actor name keeps audit history
+    consistent."""
+    return _current_principal.get() or "api"
+
+
+def bind_principal(name: str | None) -> None:
+    """Bind the principal for a long-lived background task acting on
+    someone's behalf (an autopilot run loop). asyncio tasks inherit the
+    request context they were created in, but a loop that persists its
+    principal (the run row's created_by) and rebinds explicitly does not
+    depend on WHERE it was created - which is exactly the property that
+    breaks silently otherwise."""
+    _current_principal.set(name or "")
+
+
+class PrincipalResolver:
+    """Token value -> principal name.
+
+    The .env token resolves to "owner" (constant-time compare; it is the
+    bootstrap credential and cannot be revoked through the API - revoking
+    the recovery path locks you out of the lock). Everything else is a
+    sha256 lookup in api_principals; revoked rows resolve to nothing.
+
+    last_used_at is throttled to one write per principal per minute:
+    the dashboard polls every few seconds, and a timestamp whose purpose
+    is "is this credential dead or alive" does not need 20 writes a
+    minute to answer that."""
+
+    TOUCH_SECONDS = 60.0
+
+    def __init__(self, owner_token: str, db, *, clock=time.monotonic):
+        self._owner_token = owner_token
+        self._db = db
+        self._clock = clock
+        self._last_touch: dict[str, float] = {}
+
+    def resolve(self, candidate: str) -> str | None:
+        if self._owner_token and token_matches(candidate, self._owner_token):
+            return "owner"
+        row = self._db.principal_by_hash(hash_token(candidate))
+        if row is None or row["revoked_at"]:
+            return None
+        self._touch(row["name"])
+        return row["name"]
+
+    def _touch(self, name: str) -> None:
+        now = self._clock()
+        last = self._last_touch.get(name)
+        if last is None or now - last >= self.TOUCH_SECONDS:
+            self._last_touch[name] = now
+            self._db.touch_principal(name)
 
 
 def ensure_api_token(env_file: Path) -> str:
@@ -166,23 +260,29 @@ class NonceStore:
     def __init__(self, ttl_seconds: float = 60.0, clock=time.monotonic):
         self.ttl_seconds = ttl_seconds
         self._clock = clock
-        self._expiry: dict[str, float] = {}
+        # nonce -> (expiry, principal who minted it). The principal rides
+        # along so the download itself is attributed to whoever asked for
+        # it, not to a generic "api" (Phase 79).
+        self._pending: dict[str, tuple[float, str]] = {}
 
-    def mint(self) -> str:
+    def mint(self, principal: str = "api") -> str:
         self._prune()
         nonce = secrets.token_urlsafe(16)
-        self._expiry[nonce] = self._clock() + self.ttl_seconds
+        self._pending[nonce] = (self._clock() + self.ttl_seconds, principal)
         return nonce
 
-    def redeem(self, nonce: str) -> bool:
-        """True exactly once per minted, unexpired nonce."""
+    def redeem(self, nonce: str) -> str | None:
+        """The minting principal, exactly once per unexpired nonce; None
+        for anything else. Truthy on success (principal names are
+        non-empty), so boolean call sites keep working."""
         self._prune()
-        return self._expiry.pop(nonce, None) is not None
+        entry = self._pending.pop(nonce, None)
+        return entry[1] if entry else None
 
     def _prune(self) -> None:
         now = self._clock()
-        for nonce in [n for n, exp in self._expiry.items() if exp <= now]:
-            del self._expiry[nonce]
+        for nonce in [n for n, (exp, _) in self._pending.items() if exp <= now]:
+            del self._pending[nonce]
 
 
 class TokenAuthMiddleware:
@@ -203,52 +303,73 @@ class TokenAuthMiddleware:
     network error (status 0) and the token gate never shows.
     """
 
-    def __init__(self, app, token: str, nonces: NonceStore,
+    def __init__(self, app, resolver: PrincipalResolver, nonces: NonceStore,
                  env_path: str = ""):
         self.app = app
-        self._token = token
+        self._resolver = resolver
         self._nonces = nonces
         self._env_path = env_path
 
     async def __call__(self, scope, receive, send):
         if scope["type"] == "http":
-            if (is_exempt_path(scope["path"]) or self._header_ok(scope)
-                    or self._nonce_ok(scope)):
-                await self.app(scope, receive, send)
+            principal = (self._header_principal(scope)
+                         or self._nonce_principal(scope))
+            if is_exempt_path(scope["path"]) or principal:
+                await self._run_as(principal, scope, receive, send)
                 return
             await self._reject_http(send)
             return
         if scope["type"] == "websocket":
             # No exempt WebSocket routes. Header for non-browser clients;
             # ?token= because a browser WebSocket cannot set headers.
-            if self._header_ok(scope) or self._query_token_ok(scope):
-                await self.app(scope, receive, send)
+            principal = (self._header_principal(scope)
+                         or self._query_principal(scope))
+            if principal:
+                await self._run_as(principal, scope, receive, send)
                 return
             await self._reject_websocket(receive, send)
             return
         await self.app(scope, receive, send)      # lifespan et al.
 
-    def _header_ok(self, scope) -> bool:
+    async def _run_as(self, principal: str | None, scope, receive, send):
+        """Run the app with the resolved principal on the request context.
+
+        Exempt paths carry no principal (token = None) and read back as
+        the "api" fallback; that is fine, none of them audits or creates
+        attributed rows."""
+        token = _current_principal.set(principal or "")
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            _current_principal.reset(token)
+
+    def _header_principal(self, scope) -> str | None:
         header = ""
         for name, value in scope.get("headers") or []:
             if name == b"authorization":
                 header = value.decode("latin-1")
                 break
         if not header.lower().startswith("bearer "):
-            return False
-        return token_matches(header[7:], self._token)
+            return None
+        return self._resolver.resolve(header[7:])
 
-    def _query_token_ok(self, scope) -> bool:
+    def _query_principal(self, scope) -> str | None:
         query = (scope.get("query_string") or b"").decode("latin-1")
-        return any(token_matches(candidate, self._token)
-                   for candidate in parse_qs(query).get("token", []))
+        for candidate in parse_qs(query).get("token", []):
+            principal = self._resolver.resolve(candidate)
+            if principal:
+                return principal
+        return None
 
-    def _nonce_ok(self, scope) -> bool:
+    def _nonce_principal(self, scope) -> str | None:
         if not is_nonce_path(scope.get("method", ""), scope["path"]):
-            return False
+            return None
         query = (scope.get("query_string") or b"").decode("latin-1")
-        return any(self._nonces.redeem(candidate)
-                   for candidate in parse_qs(query).get("nonce", []))
+        for candidate in parse_qs(query).get("nonce", []):
+            principal = self._nonces.redeem(candidate)
+            if principal:
+                return principal
+        return None
 
     async def _reject_http(self, send) -> None:
         # Points at where the token LIVES, never what it is.

@@ -30,6 +30,7 @@ import json
 import logging
 from typing import Any
 
+from .auth import bind_principal, current_principal
 from .config import Settings
 from .db import Database, utcnow
 from .dispatcher import ParameterError, coerce_parameters
@@ -162,7 +163,8 @@ class Autopilot:
     def start_run(self, *, goal: str, brain_ref: str,
                   brain_model: str, brain_port: int, max_steps: int,
                   client_fn=None,
-                  gated_actions: frozenset[str] = frozenset()) -> str:
+                  gated_actions: frozenset[str] = frozenset(),
+                  created_by: str | None = None) -> str:
         """client_fn() -> chat client for the brain, resolved per turn (an
         instance brain's connection can be replaced mid-run). None keeps
         the legacy instance resolution via the orchestrator.
@@ -177,6 +179,7 @@ class Autopilot:
             goal=goal, brain_instance_id=brain_ref,
             brain_model=brain_model, max_steps=max_steps,
             gated_actions=tuple(gated),
+            created_by=created_by,
         )
         self.db.record_audit(
             "autopilot", "run_start",
@@ -192,7 +195,8 @@ class Autopilot:
             client_fn = lambda: self.orchestrator.model_client_for(instance_id)  # noqa: E731
         task = asyncio.create_task(
             self._run_loop(run_id, goal, client_fn, brain_model,
-                           brain_port, max_steps, gated)
+                           brain_port, max_steps, gated,
+                           created_by=created_by)
         )
         self.tasks[run_id] = task
         # Settled runs drop out of the registry; without this, a long-lived
@@ -224,7 +228,15 @@ class Autopilot:
 
     async def _run_loop(self, run_id: str, goal: str, client_fn,
                         brain_model: str, brain_port: int,
-                        max_steps: int, gated: frozenset[str]) -> None:
+                        max_steps: int, gated: frozenset[str],
+                        created_by: str | None = None) -> None:
+        # Phase 79: everything this run creates (launches, jobs) is
+        # attributed to whoever STARTED it. Rebound explicitly rather than
+        # inherited from the request context, so attribution does not
+        # depend on where the task object happened to be created. The
+        # audit actor for run events stays "autopilot" - what acted vs.
+        # who it acted for.
+        bind_principal(created_by)
         # The project brief (Autopilot page) frames every run: the goal
         # reads as one step in the user's project, not an isolated command.
         # Read at run start, so editing the brief never shifts a live run.
@@ -524,6 +536,7 @@ class Autopilot:
             instance_type=str(args["instance_type"]),
             region=str(args["region"]),
             filesystem=str(args["filesystem"]),
+            created_by=current_principal(),   # the run starter (see _run_loop)
         )
         return {"launch": {k: launch[k] for k in ("id", "status")}}
 
@@ -559,7 +572,8 @@ class Autopilot:
             coerce_parameters(template, parameters)
         except ParameterError as exc:
             return {"error": str(exc)}
-        task_id = self.queue.enqueue(template=name, parameters=parameters)
+        task_id = self.queue.enqueue(template=name, parameters=parameters,
+                                     created_by=current_principal())
         return {"task": {"id": task_id, "status": "queued"}}
 
     async def _act_save_template(self, args: dict) -> dict:

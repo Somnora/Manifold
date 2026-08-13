@@ -79,9 +79,25 @@ CREATE TABLE IF NOT EXISTS launches (
 CREATE TABLE IF NOT EXISTS audit_log (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     at          TEXT NOT NULL,
-    actor       TEXT NOT NULL,      -- "dashboard" | "mcp" | ...
+    actor       TEXT NOT NULL,      -- a principal name, or "backend"/"autopilot"
     action      TEXT NOT NULL,
     detail      TEXT
+);
+
+-- Phase 79: named API principals. The row holds a HASH of the token, never
+-- the token: the value is shown exactly once at mint time and cannot be
+-- recovered from this table (secrets stay in .env / in the caller's hands,
+-- the database stores only enough to recognize one). Revoked rows are kept,
+-- not deleted - created_by columns elsewhere point at these names, and
+-- attribution history must survive the credential it came from.
+CREATE TABLE IF NOT EXISTS api_principals (
+    id           TEXT PRIMARY KEY,
+    name         TEXT NOT NULL UNIQUE,
+    token_hash   TEXT NOT NULL UNIQUE,  -- sha256 hex of the token value
+    created_at   TEXT NOT NULL,
+    created_by   TEXT NOT NULL,          -- which principal minted this one
+    last_used_at TEXT,
+    revoked_at   TEXT
 );
 
 CREATE TABLE IF NOT EXISTS tasks (
@@ -348,6 +364,14 @@ class Database:
         # deps were frozen before this one existed). NULL = no dependencies,
         # so every historical row keeps its exact old behavior.
         self._ensure_column("tasks", "depends_on", "TEXT")
+        # Phase 79: who caused this row. A principal name; NULL on every
+        # historical row (rendered as unattributed, never guessed). Launches
+        # inherit through the chain: an auto-managed job's launch carries the
+        # job creator's name, a watch's auto-launch the watch creator's.
+        self._ensure_column("launches", "created_by", "TEXT")
+        self._ensure_column("tasks", "created_by", "TEXT")
+        self._ensure_column("watches", "created_by", "TEXT")
+        self._ensure_column("agent_runs", "created_by", "TEXT")
         # Phase 36: runs whose spend actions pause for human approval.
         self._ensure_column("agent_runs", "require_approval",
                             "INTEGER NOT NULL DEFAULT 0")
@@ -401,6 +425,7 @@ class Database:
         provider: str = "lambda",
         launch_id: str | None = None,
         created_at: str | None = None,
+        created_by: str | None = None,
     ) -> str:
         """Insert a launch row and return its id.
 
@@ -418,11 +443,11 @@ class Database:
             """INSERT INTO launches
                (id, provider, created_at, requested_type, region, filesystem,
                 connection_mode, hourly_rate_cents, status,
-                idle_timeout_seconds, max_lifetime_seconds)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'launching', ?, ?)""",
+                idle_timeout_seconds, max_lifetime_seconds, created_by)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'launching', ?, ?, ?)""",
             (launch_id, provider, created_at or utcnow(), requested_type,
              region, filesystem, connection_mode, hourly_rate_cents,
-             idle_timeout_seconds, max_lifetime_seconds),
+             idle_timeout_seconds, max_lifetime_seconds, created_by),
         )
         return launch_id
 
@@ -663,6 +688,58 @@ class Database:
 
     # -- audit log -----------------------------------------------------------
 
+    # -- api principals (Phase 79) ---------------------------------------------
+
+    def create_principal(self, *, name: str, token_hash: str,
+                         created_by: str) -> str:
+        pid = uuid.uuid4().hex[:12]
+        self._execute(
+            """INSERT INTO api_principals
+               (id, name, token_hash, created_at, created_by)
+               VALUES (?, ?, ?, ?, ?)""",
+            (pid, name, token_hash, utcnow(), created_by),
+        )
+        return pid
+
+    def principal_by_hash(self, token_hash: str) -> dict | None:
+        """The principal a presented token resolves to, or None. The caller
+        hashes; this table never sees a token value."""
+        row = self._execute(
+            "SELECT * FROM api_principals WHERE token_hash = ?", (token_hash,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def principal_by_name(self, name: str) -> dict | None:
+        row = self._execute(
+            "SELECT * FROM api_principals WHERE name = ?", (name,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def list_principals(self) -> list[dict]:
+        """All principals WITHOUT their hashes: this feeds the API, and a
+        hash is still an offline-crackable fingerprint of a secret."""
+        rows = self._execute(
+            """SELECT id, name, created_at, created_by, last_used_at,
+                      revoked_at
+                 FROM api_principals ORDER BY created_at, id"""
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def touch_principal(self, name: str) -> None:
+        self._execute(
+            "UPDATE api_principals SET last_used_at = ? WHERE name = ?",
+            (utcnow(), name),
+        )
+
+    def revoke_principal(self, name: str) -> None:
+        """Revoke, never delete: created_by columns across the database
+        point at this name, and history outlives credentials."""
+        self._execute(
+            """UPDATE api_principals SET revoked_at = ?
+                WHERE name = ? AND revoked_at IS NULL""",
+            (utcnow(), name),
+        )
+
     def record_audit(self, actor: str, action: str, detail: str = "") -> None:
         self._execute(
             "INSERT INTO audit_log (at, actor, action, detail) VALUES (?, ?, ?, ?)",
@@ -688,7 +765,8 @@ class Database:
                     region: str | None = None,
                     filesystem: str | None = None,
                     target_instance_id: str | None = None,
-                    depends_on: list[str] | None = None) -> str:
+                    depends_on: list[str] | None = None,
+                    created_by: str | None = None) -> str:
         task_id = uuid.uuid4().hex[:12]
         # Auto-managed jobs start in lifecycle 'queued' with a first event
         # stamp; manual jobs leave lifecycle NULL (the field is unused for
@@ -699,12 +777,13 @@ class Database:
             """INSERT INTO tasks
                (id, created_at, template, parameters, status,
                 auto_manage, gpu_type, region, filesystem,
-                lifecycle, lifecycle_events, target_instance_id, depends_on)
-               VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?)""",
+                lifecycle, lifecycle_events, target_instance_id, depends_on,
+                created_by)
+               VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (task_id, utcnow(), template, json.dumps(parameters),
              1 if auto_manage else 0, gpu_type, region, filesystem,
              lifecycle, events, target_instance_id,
-             json.dumps(depends_on) if depends_on else None),
+             json.dumps(depends_on) if depends_on else None, created_by),
         )
         return task_id
 
@@ -971,16 +1050,18 @@ class Database:
 
     def create_agent_run(self, *, goal: str, brain_instance_id: str,
                          brain_model: str, max_steps: int,
-                         gated_actions: tuple[str, ...] = ()) -> str:
+                         gated_actions: tuple[str, ...] = (),
+                         created_by: str | None = None) -> str:
         run_id = uuid.uuid4().hex[:12]
         self._execute(
             """INSERT INTO agent_runs
                (id, created_at, goal, brain_instance_id, brain_model,
-                status, max_steps, require_approval, approval_policy)
-               VALUES (?, ?, ?, ?, ?, 'running', ?, ?, ?)""",
+                status, max_steps, require_approval, approval_policy,
+                created_by)
+               VALUES (?, ?, ?, ?, ?, 'running', ?, ?, ?, ?)""",
             (run_id, utcnow(), goal, brain_instance_id, brain_model,
              max_steps, 1 if gated_actions else 0,
-             json.dumps(sorted(gated_actions))),
+             json.dumps(sorted(gated_actions)), created_by),
         )
         return run_id
 
@@ -1222,15 +1303,16 @@ class Database:
     # -- capacity watches -----------------------------------------------------------
 
     def create_watch(self, *, instance_type: str, region: str,
-                     filesystem: str | None, auto_launch: bool) -> str:
+                     filesystem: str | None, auto_launch: bool,
+                     created_by: str | None = None) -> str:
         watch_id = uuid.uuid4().hex[:12]
         self._execute(
             """INSERT INTO watches
                (id, created_at, instance_type, region, filesystem,
-                auto_launch, status)
-               VALUES (?, ?, ?, ?, ?, ?, 'watching')""",
+                auto_launch, status, created_by)
+               VALUES (?, ?, ?, ?, ?, ?, 'watching', ?)""",
             (watch_id, utcnow(), instance_type, region, filesystem,
-             int(auto_launch)),
+             int(auto_launch), created_by),
         )
         return watch_id
 

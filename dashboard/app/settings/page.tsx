@@ -5,6 +5,7 @@ import { api, ApiError } from "@/lib/api";
 import { usePolling } from "@/lib/usePolling";
 import { Badge } from "@/components/Badge";
 import { PolicySettings } from "@/components/PolicySettings";
+import { PrincipalsPanel } from "@/components/PrincipalsPanel";
 
 // First-run setup. Secrets are pasted here once, validated against Lambda,
 // and written to .env on the machine running the backend. They are never
@@ -87,6 +88,8 @@ export default function SettingsPage() {
       <LambdaKeyForm onSaved={refresh} />
       <GcpConfigForm onSaved={refresh} />
       <S3KeysForm onSaved={refresh} />
+
+      <PrincipalsPanel />
 
       <PolicySettings />
 

@@ -29,6 +29,7 @@ import shlex
 import time
 from datetime import datetime, timezone
 
+from .auth import current_principal
 from .config import Settings
 from .connections import ConnectionState, ManagedConnection
 from .db import Database, utcnow
@@ -561,7 +562,9 @@ class Dispatcher:
         if enabled and launch and launch.get("max_lifetime_seconds") is not None:
             detail += (f" (its {float(launch['max_lifetime_seconds']):.0f}s "
                        f"max-lifetime ceiling still applies)")
-        self.db.record_audit("dashboard", "keep_alive", detail)
+        # current_principal, not "dashboard": any client can flip this
+        # switch, and since Phase 79 the audit row says which one did.
+        self.db.record_audit(current_principal(), "keep_alive", detail)
         return {"instance_id": instance_id, "keep_alive": enabled}
 
     def _protect_external_instances(self) -> None:
@@ -1692,7 +1695,10 @@ class Dispatcher:
         try:
             launch = await self.orchestrator.request_launch(
                 instance_type=job["gpu_type"], region=job["region"],
-                filesystem=job["filesystem"])
+                filesystem=job["filesystem"],
+                # Chain attribution (Phase 79): the loop launches, but the
+                # PERSON is whoever enqueued the job.
+                created_by=job.get("created_by"))
         except LaunchRejected as exc:
             if exc.reason_code == "concurrency":
                 # The single slot is busy (a manual/external instance is up).
@@ -2171,6 +2177,9 @@ class Dispatcher:
                         instance_type=watch["instance_type"],
                         region=watch["region"],
                         filesystem=watch["filesystem"],
+                        # Phase 79: the watch fires, but the launch belongs
+                        # to whoever set the watch.
+                        created_by=watch.get("created_by"),
                     )
                     self.db.update_watch(watch["id"], status="launched")
                     self.db.record_audit(

@@ -252,14 +252,16 @@ def test_nonce_is_not_general_query_auth(auth_client):
 
 
 def test_nonce_store_ttl_and_single_use():
+    # Since Phase 79 redeem() returns the minting principal (truthy) or
+    # None, so the nonce attributes the download it authorizes.
     now = [0.0]
     store = NonceStore(ttl_seconds=60.0, clock=lambda: now[0])
     stale = store.mint()
     now[0] = 61.0
-    assert store.redeem(stale) is False        # expired unused
-    fresh = store.mint()
-    assert store.redeem(fresh) is True         # single use...
-    assert store.redeem(fresh) is False        # ...and only once
+    assert store.redeem(stale) is None         # expired unused
+    fresh = store.mint("someone")
+    assert store.redeem(fresh) == "someone"    # single use...
+    assert store.redeem(fresh) is None         # ...and only once
 
 
 # -- /v1 dual credential -------------------------------------------------------------

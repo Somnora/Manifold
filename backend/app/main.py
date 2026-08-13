@@ -16,6 +16,7 @@ import asyncio
 import codecs
 import logging
 import os
+import secrets
 import shlex
 from contextlib import asynccontextmanager
 from dataclasses import replace
@@ -53,9 +54,13 @@ from .lambda_api import (
 from .agent import Autopilot, find_serving_task
 from .auth import (
     NonceStore,
+    PrincipalResolver,
     TokenAuthMiddleware,
+    current_principal,
     ensure_api_token,
+    hash_token,
     token_matches,
+    valid_principal_name,
 )
 from .dispatcher import Dispatcher, ParameterError, coerce_parameters
 from .model_client import MockModelClient, ModelClientError
@@ -209,6 +214,14 @@ class IdleTimeoutRequest(BaseModel):
 
 class MaxLifetimeRequest(BaseModel):
     max_lifetime_seconds: float | None = None
+
+
+class PrincipalRequest(BaseModel):
+    # Module level, not nested in create_app: `from __future__ import
+    # annotations` turns hints into strings that FastAPI resolves against
+    # module globals - a closure-local model silently degrades to a query
+    # parameter and every POST 422s.
+    name: str
 
 
 class TaskRequest(BaseModel):
@@ -650,6 +663,12 @@ def create_app(
     nonces = NonceStore()
     app.state.download_nonces = nonces
 
+    # Phase 79: tokens resolve to NAMED principals. The .env token is
+    # "owner"; additional tokens are minted through /principals and land
+    # in api_principals as hashes. The resolver is built even when
+    # enforcement is off so the routes below exist consistently.
+    principal_resolver = PrincipalResolver(settings.api_token, db)
+
     if settings.api_token:
         # Empty token = no middleware: mock mode and the test harness stay
         # a zero-credential demo. Added BEFORE CORS on purpose -
@@ -659,7 +678,7 @@ def create_app(
         # 401s would lack Access-Control-Allow-Origin, which the :3000 dev
         # dashboard reads as a network error instead of the token gate.
         app.add_middleware(
-            TokenAuthMiddleware, token=settings.api_token, nonces=nonces,
+            TokenAuthMiddleware, resolver=principal_resolver, nonces=nonces,
             env_path=str(env_file),
         )
 
@@ -778,7 +797,7 @@ def create_app(
             # for the next real-mode start.
             await candidate.close()
         db.record_audit(
-            "api", "settings_lambda_key",
+            current_principal(), "settings_lambda_key",
             f"Lambda API key validated ({len(types)} instance types visible) "
             f"and saved to .env",
         )
@@ -801,7 +820,7 @@ def create_app(
         # Assuming providers.register handles hot-swapping if we implemented it,
         # but for now we just save to .env
         db.record_audit(
-            "api", "settings_gcp_config",
+            current_principal(), "settings_gcp_config",
             "GCP configuration saved to .env",
         )
         return {"valid": True, "applied_live": False}
@@ -845,7 +864,7 @@ def create_app(
         dispatcher.settings = settings
         storage_cache.clear()   # rebuild storage clients with the new keys
         db.record_audit(
-            "api", "settings_s3_keys",
+            current_principal(), "settings_s3_keys",
             f"S3 adapter keys saved to .env "
             f"({'validated against a filesystem' if validated else 'not validated: no filesystem visible'})",
         )
@@ -876,7 +895,7 @@ def create_app(
     async def update_preferences(patch: PreferencesPatch):
         updated = prefs.update(patch.model_dump(exclude_none=True))
         db.record_audit(
-            "dashboard", "preferences_update",
+            current_principal(), "preferences_update",
             f"approvals={sorted(updated.approvals.gated_actions())} "
             f"data_safety.to_local={updated.data_safety.to_local} "
             f"data_safety.if_unsaveable={updated.data_safety.if_unsaveable}",
@@ -990,7 +1009,8 @@ def create_app(
             name=req.name,
             idle_timeout_seconds=req.idle_timeout_seconds,
             max_lifetime_seconds=req.max_lifetime_seconds,
-        provider=req.provider,
+            provider=req.provider,
+            created_by=current_principal(),
         )
         return {"launch": launch}
 
@@ -1010,9 +1030,9 @@ def create_app(
         
         db.update_launch(launch["id"], idle_timeout_seconds=value)
         if value is not None:
-            db.record_audit("backend", "idle_timeout_update", f"{instance_id} timeout set to {value}s")
+            db.record_audit(current_principal(), "idle_timeout_update", f"{instance_id} timeout set to {value}s")
         else:
-            db.record_audit("backend", "idle_timeout_update", f"{instance_id} timeout restored to default")
+            db.record_audit(current_principal(), "idle_timeout_update", f"{instance_id} timeout restored to default")
             
         return {"idle_timeout_seconds": value}
 
@@ -1030,7 +1050,7 @@ def create_app(
         value = validate_max_lifetime(settings, req.max_lifetime_seconds)
         db.update_launch(launch["id"], max_lifetime_seconds=value)
         db.record_audit(
-            "dashboard", "max_lifetime_update",
+            current_principal(), "max_lifetime_update",
             f"{instance_id} max lifetime "
             + (f"set to {value:.0f}s (from launch acceptance, boot included)"
                if value is not None else "removed; no ceiling"))
@@ -1076,7 +1096,7 @@ def create_app(
         fixes the real name at launch, so this is a local overlay; an empty
         name restores Lambda's."""
         db.set_instance_name(instance_id, req.name.strip())
-        db.record_audit("dashboard", "instance_renamed",
+        db.record_audit(current_principal(), "instance_renamed",
                         f"{instance_id} -> {req.name.strip()!r}")
         return {"instance_id": instance_id, "name": req.name.strip()}
 
@@ -1117,7 +1137,7 @@ def create_app(
             host_keys_file_path=host_keys_path,
         )
 
-        db.record_audit("api", "ide_attach", f"Generated SSH config block for instance {instance_id}")
+        db.record_audit(current_principal(), "ide_attach", f"Generated SSH config block for instance {instance_id}")
         return get_ide_urls(instance_id)
 
     @app.post("/instances/{instance_id}/run")
@@ -1142,7 +1162,7 @@ def create_app(
         except ConnectionError as exc:
             raise HTTPException(409, str(exc))
         db.record_audit(
-            "api", "instance_command",
+            current_principal(), "instance_command",
             f"{instance_id}: {req.command[:200]!r} -> exit {exit_code}",
         )
         cap = 64 * 1024
@@ -1411,7 +1431,7 @@ def create_app(
             _end_shell_group(
                 pid, label=shell,
                 on_escalation=lambda: db.record_audit(
-                    "dashboard", "terminal_sigkill_escalation",
+                    current_principal(), "terminal_sigkill_escalation",
                     f"{shell} pgid {pid} ignored SIGHUP; last output: "
                     f"{session.tail_text()!r}"))
 
@@ -1469,7 +1489,7 @@ def create_app(
                 f"\r\n[manifold] any OpenAI-compatible CLI started here "
                 f"talks to it, e.g.: aider --model openai/$MANIFOLD_MODEL"
                 f"\r\n\r\n")
-        db.record_audit("dashboard", "local_terminal_open",
+        db.record_audit(current_principal(), "local_terminal_open",
                         f"{shell} (model env: {model})" if model else shell)
         await _drive_terminal(ws, session, persistent=bool(sid))
 
@@ -1532,7 +1552,7 @@ def create_app(
             )
 
         db.record_audit(
-            "api", "chat",
+            current_principal(), "chat",
             f"{instance_id}: {len(req.messages)} message(s) -> "
             f"{task['model_id']}" + (" [tools]" if req.tools else ""),
         )
@@ -1771,7 +1791,7 @@ def create_app(
         payload.pop("stream", None)
         stream = bool(body.get("stream"))
         dispatcher.touch_activity(instance_id)
-        db.record_audit("api", "openai_proxy",
+        db.record_audit(current_principal(), "openai_proxy",
                         f"{instance_id}: {endpoint['model_id']} stream={stream}")
 
         if not stream:
@@ -1811,8 +1831,71 @@ def create_app(
         long-lived secret never appears in a query string or the access
         log. When no token is enforced the nonce is minted but never
         checked, which keeps the dashboard on a single code path."""
-        return {"nonce": nonces.mint(),
+        return {"nonce": nonces.mint(current_principal()),
                 "expires_in_seconds": nonces.ttl_seconds}
+
+    # -- api principals (Phase 79) -------------------------------------------------
+
+    def _require_owner() -> None:
+        """Principal management is owner-token-only.
+
+        This is the one authorization rule that exists before RBAC
+        (Phase 80): without it, any minted token could mint more tokens,
+        and revoking a leaked credential would be a race against it
+        re-issuing itself. Roles will subsume this check; until then the
+        bootstrap credential is the only credential authority."""
+        if not settings.api_token:
+            raise HTTPException(
+                409, "API auth is not enabled (no MANIFOLD_API_TOKEN "
+                     "configured), so there is nothing for a principal "
+                     "to authenticate against.")
+        if current_principal() != "owner":
+            raise HTTPException(
+                403, "Only the owner token (the MANIFOLD_API_TOKEN in "
+                     ".env) may manage principals.")
+
+    @app.post("/principals", status_code=201)
+    async def create_principal(req: PrincipalRequest):
+        """Mint a named token. The value is in THIS response and nowhere
+        else - the database keeps only its hash. Name it after the caller
+        it is for (an agent, a coworker's laptop, a script), because the
+        name is what every launch, task, and audit row will carry."""
+        _require_owner()
+        name = req.name.strip().lower()
+        if not valid_principal_name(name):
+            raise HTTPException(
+                422, "Principal names are 2-32 chars of [a-z0-9-], and "
+                     "the built-in actor names (owner, backend, autopilot, "
+                     "api, anonymous) are reserved.")
+        if db.principal_by_name(name) is not None:
+            raise HTTPException(
+                409, f"A principal named '{name}' already exists "
+                     f"(revoked names are kept for attribution history; "
+                     f"pick a new name).")
+        token = secrets.token_urlsafe(32)
+        db.create_principal(name=name, token_hash=hash_token(token),
+                            created_by=current_principal())
+        db.record_audit(current_principal(), "principal_created", name)
+        return {"name": name, "token": token,
+                "note": "Shown once. Store it now; only its hash is kept."}
+
+    @app.get("/principals")
+    async def list_principals():
+        """Names and liveness only - never token values, never hashes."""
+        return {"principals": db.list_principals(),
+                "auth_enabled": bool(settings.api_token)}
+
+    @app.delete("/principals/{name}")
+    async def revoke_principal(name: str):
+        _require_owner()
+        row = db.principal_by_name(name)
+        if row is None:
+            raise HTTPException(404, f"No principal named '{name}'.")
+        if row["revoked_at"]:
+            raise HTTPException(409, f"'{name}' is already revoked.")
+        db.revoke_principal(name)
+        db.record_audit(current_principal(), "principal_revoked", name)
+        return {"revoked": name}
 
     ALLOWED_FILE_ROOTS = ("/lambda/nfs/", "/workspace/ephemeral/")
 
@@ -1879,7 +1962,7 @@ def create_app(
             raise HTTPException(502, f"upload failed: {exc}")
         dispatcher.touch_activity(instance_id)
         db.record_audit(
-            "api", "file_upload",
+            current_principal(), "file_upload",
             f"{file.filename} -> {instance_id}:{remote} ({written} bytes)",
         )
         return {"path": remote, "bytes": written}
@@ -1931,7 +2014,7 @@ def create_app(
             raise HTTPException(502, f"download failed: {exc}")
 
         dispatcher.touch_activity(instance_id)
-        db.record_audit("api", "file_download", f"{instance_id}:{remote}")
+        db.record_audit(current_principal(), "file_download", f"{instance_id}:{remote}")
 
         async def stream():
             if first:
@@ -1997,7 +2080,7 @@ def create_app(
             raise _sidecar_error_to_http(exc)
         dispatcher.touch_activity(instance_id)
         db.record_audit(
-            "api", "file_delete",
+            current_principal(), "file_delete",
             f"{instance_id} {root_name}:{path}"
             + (" (recursive)" if recursive else ""),
         )
@@ -2029,7 +2112,7 @@ def create_app(
             raise HTTPException(
                 502, f"tar failed (exit {exit_status}): {stderr[:200]}")
         dispatcher.touch_activity(instance_id)
-        db.record_audit("api", "file_archive", f"{instance_id}:{remote}")
+        db.record_audit(current_principal(), "file_archive", f"{instance_id}:{remote}")
 
         async def stream():
             try:
@@ -2129,7 +2212,7 @@ def create_app(
         except Exception as exc:
             raise HTTPException(422, f"template rejected: {exc}")
         db.record_audit(
-            "api", "template_saved",
+            current_principal(), "template_saved",
             f"custom template '{template.name}' "
             f"({'overrides bundled' if (bundled_dir / (template.name + '.yaml')).exists() else 'new'})",
         )
@@ -2151,7 +2234,7 @@ def create_app(
             )
         (custom_dir / f"{name}.yaml").unlink(missing_ok=True)
         reload_templates()
-        db.record_audit("api", "template_deleted", f"custom template '{name}'")
+        db.record_audit(current_principal(), "template_deleted", f"custom template '{name}'")
         return {"deleted": name, "restored_bundled": name in templates}
 
     @app.post("/templates/{name}/render")
@@ -2204,9 +2287,10 @@ def create_app(
             task_id = queue.enqueue(
                 template=req.template, parameters=req.parameters,
                 auto_manage=True, gpu_type=req.gpu_type, region=req.region,
-                filesystem=req.filesystem, depends_on=depends_on)
+                filesystem=req.filesystem, depends_on=depends_on,
+                created_by=current_principal())
             db.record_audit(
-                "api", "task_enqueue_auto",
+                current_principal(), "task_enqueue_auto",
                 f"{task_id} ({req.template}) auto-manage "
                 f"{req.gpu_type}/{req.region}/{req.filesystem}"
                 + (f" after {', '.join(depends_on)}" if depends_on else ""))
@@ -2214,9 +2298,10 @@ def create_app(
             task_id = queue.enqueue(template=req.template,
                                     parameters=req.parameters,
                                     target_instance_id=req.target_instance_id,
-                                    depends_on=depends_on)
+                                    depends_on=depends_on,
+                                    created_by=current_principal())
             db.record_audit(
-                "api", "task_enqueue",
+                current_principal(), "task_enqueue",
                 f"{task_id} ({req.template})"
                 + (f" -> {req.target_instance_id}"
                    if req.target_instance_id else "")
@@ -2508,9 +2593,10 @@ def create_app(
         watch_id = db.create_watch(
             instance_type=req.instance_type, region=req.region,
             filesystem=req.filesystem, auto_launch=req.auto_launch,
+            created_by=current_principal(),
         )
         db.record_audit(
-            "api", "watch_create",
+            current_principal(), "watch_create",
             f"{watch_id}: {req.instance_type} in {req.region}"
             f"{' (auto-launch)' if req.auto_launch else ''}",
         )
@@ -2607,6 +2693,7 @@ def create_app(
             max_steps=max_steps,
             client_fn=client_fn,
             gated_actions=gated,
+            created_by=current_principal(),
         )
         return {"run": db.get_agent_run(run_id)}
 
@@ -2638,7 +2725,7 @@ def create_app(
         if not db.decide_approval(approval_id, status):
             raise HTTPException(
                 409, "already decided (or expired) - the run has moved on")
-        db.record_audit("dashboard", f"approval_{status}",
+        db.record_audit(current_principal(), f"approval_{status}",
                         f"approval {approval_id}")
         return {"approval": db.get_approval(approval_id)}
 
@@ -2691,7 +2778,7 @@ def create_app(
     async def set_project_brief(req: ProjectBriefRequest):
         db.set_project_brief(req.content.strip())
         db.record_audit(
-            "dashboard", "project_brief_updated",
+            current_principal(), "project_brief_updated",
             f"{len(req.content.strip())} chars")
         return db.get_project_brief()
 

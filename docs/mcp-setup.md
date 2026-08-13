@@ -33,6 +33,13 @@ from.
 "env": {"MANIFOLD_API_TOKEN": "<the value from .env>"}
 ```
 
+**Better: give the agent its own token.** On the Settings page (API
+access), mint a principal named for the agent, e.g. `claude-mcp`, and put
+THAT token in the config instead of the owner token. Every launch, job,
+and audit row the agent causes then carries its name instead of yours,
+and revoking the agent's access is one click that does not touch your own
+credential.
+
 Mock mode enforces nothing, so the variable is optional there. If you
 rotate the token in `.env`, update it in any MCP config that carries it.
 

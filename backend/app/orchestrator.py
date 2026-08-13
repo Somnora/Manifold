@@ -402,12 +402,20 @@ class Orchestrator:
         idle_timeout_seconds: float | None = None,
         max_lifetime_seconds: float | None = None,
         provider: str = 'lambda',
+        created_by: str | None = None,
     ) -> dict:
         """Validate and admit a launch; returns the persisted launch row.
 
         Raises LaunchRejected (with an HTTP status) on any validation or
         guardrail failure. On success the retry/boot/connect pipeline runs
         as a background task; poll GET /launches/{id} for progress.
+
+        created_by (Phase 79) is the principal this launch is attributed
+        to. Passed EXPLICITLY rather than read from the request context
+        here, because half this function's callers are background loops
+        (auto-manage, capacity watches, autopilot) that never saw a
+        request and attribute through a chain: the job's creator, the
+        watch's creator, the run's creator.
         """
         mode = connection_mode or self.settings.default_connection_mode
         self._validate_mode(mode)
@@ -514,6 +522,7 @@ class Orchestrator:
             idle_timeout_seconds=idle_timeout_seconds,
             max_lifetime_seconds=max_lifetime_seconds,
             provider=provider,
+            created_by=created_by,
         )
         plan = LaunchPlan(
             launch_id=launch_id,

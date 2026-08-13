@@ -163,6 +163,20 @@ export type Launch = {
   boot_elapsed_seconds?: number;
   boot_timeout_seconds?: number;
   boot_remaining_seconds?: number;
+  // Phase 79: the principal this launch is attributed to. Null on rows
+  // from before attribution existed - shown as unattributed, not guessed.
+  created_by?: string | null;
+};
+
+// Phase 79: a named API credential. The token value exists only in the
+// mint response; list rows carry liveness, never secrets.
+export type Principal = {
+  id: string;
+  name: string;
+  created_at: string;
+  created_by: string;
+  last_used_at: string | null;
+  revoked_at: string | null;
 };
 
 export type StoredFile = {
@@ -262,6 +276,8 @@ export type Task = {
   // than the list call) - treat undefined as [].
   depends_on: string[];
   deps?: TaskDep[];
+  // Phase 79: who enqueued this job (null on pre-attribution rows).
+  created_by?: string | null;
 };
 
 export type AutoManageConfig = {
@@ -646,6 +662,20 @@ export const api = {
 
   clearFinishedTasks: () =>
     request<{ cleared: number }>("/tasks/finished", { method: "DELETE" }),
+
+  // -- api principals (Phase 79) ---------------------------------------------
+
+  principals: () =>
+    request<{ principals: Principal[]; auth_enabled: boolean }>("/principals"),
+
+  createPrincipal: (name: string) =>
+    request<{ name: string; token: string; note: string }>("/principals", {
+      method: "POST",
+      body: JSON.stringify({ name }),
+    }),
+
+  revokePrincipal: (name: string) =>
+    request<{ revoked: string }>(`/principals/${name}`, { method: "DELETE" }),
 
   modelPresets: () =>
     request<{ presets: ModelPreset[] }>("/model-presets").then(

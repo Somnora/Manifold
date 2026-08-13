@@ -60,7 +60,8 @@ class TaskQueue(abc.ABC):
                 region: str | None = None,
                 filesystem: str | None = None,
                 target_instance_id: str | None = None,
-                depends_on: list[str] | None = None) -> str:
+                depends_on: list[str] | None = None,
+                created_by: str | None = None) -> str:
         """Add a task; returns its id.
 
         When auto_manage is set, the dispatcher owns the instance lifecycle
@@ -120,11 +121,13 @@ class SQLiteTaskQueue(TaskQueue):
                 region: str | None = None,
                 filesystem: str | None = None,
                 target_instance_id: str | None = None,
-                depends_on: list[str] | None = None) -> str:
+                depends_on: list[str] | None = None,
+                created_by: str | None = None) -> str:
         task_id = self._db.create_task(
             template=template, parameters=parameters, auto_manage=auto_manage,
             gpu_type=gpu_type, region=region, filesystem=filesystem,
-            target_instance_id=target_instance_id, depends_on=depends_on)
+            target_instance_id=target_instance_id, depends_on=depends_on,
+            created_by=created_by)
         self._db.record_task_event(
             task_id, "queued",
             detail=f"after {', '.join(depends_on)}" if depends_on else None)

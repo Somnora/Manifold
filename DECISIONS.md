@@ -3570,3 +3570,67 @@ writes, harness apps writing nothing, real-mode generate+persist+chmod
 presence-only /settings/status. Full suite 769 passing; dashboard builds
 clean; live uvicorn probe confirmed enforcement end to end (see phase
 report).
+
+## Phase 79 — Principals: who did what, before anyone asks who may (2026-08-12)
+
+- **Attribution before authorization.** RBAC (Phase 80) decides what a caller
+  may do; that is meaningless until rows record who DID things. So this phase
+  is names, threaded everywhere money moves: launches, tasks, watches, agent
+  runs each carry `created_by`, and every request-driven audit row's actor is
+  the resolved principal instead of a hardcoded "api"/"dashboard" guess
+  (which recorded the client kind someone assumed at write time, not the
+  caller - any client can hit any route).
+
+- **Tokens resolve to names; the database stores hashes.** `api_principals`
+  keeps sha256(token), never the value: the mint response is the only place
+  the token exists, and a stolen table is a set of fingerprints, not
+  credentials. The .env token resolves to "owner" without a row - it is the
+  bootstrap credential and deliberately cannot be revoked through the API
+  (revoking the recovery path locks you out of the lock). Revocation keeps
+  the row: created_by columns point at names, and history outlives the
+  credential it came from. Revoked names stay taken for the same reason.
+
+- **One authorization rule ships a phase early: only "owner" manages
+  principals.** Without it, any minted token could mint more, and revoking a
+  leaked credential would race against it re-issuing itself. This is
+  explicitly the seed of Phase 80, not scope creep: roles will subsume the
+  check.
+
+- **Chain attribution, explicitly threaded.** The auto-manage loop, capacity
+  watches, and autopilot runs launch GPUs from background tasks that never
+  saw a request, so `request_launch` takes `created_by` as a parameter and
+  each loop passes the chain's origin: the job's creator, the watch's
+  creator, the run starter's name (rebound via `bind_principal` at run-loop
+  start, so a run's attribution survives however the task object was
+  created). The request context (`current_principal()`, a contextvar set by
+  the auth middleware) is only trusted at request boundaries. Audit actors
+  for loop EVENTS stay "backend"/"autopilot": what acted vs. who it acted
+  for are different columns on purpose.
+
+- **Historical rows read as unattributed, never guessed.** `created_by` is
+  NULL on every pre-79 row and on anything created while auth is off; the UI
+  shows nothing rather than inventing an owner. `current_principal()` falls
+  back to "api" only for audit actors, keeping open-mode history consistent
+  with what those rows always said.
+
+- **Download nonces carry their minting principal**, so the one authenticated
+  GET that cannot send a header still attributes to the person who clicked.
+
+- **A closure-local Pydantic model silently becomes a query parameter.**
+  `PrincipalRequest` defined inside create_app 422'd every POST: with
+  `from __future__ import annotations`, FastAPI resolves the string hint
+  against module globals and a closure-local class is not there. The model
+  moved to module level with the comment; the failure mode is recorded here
+  because it looks exactly like a client bug and diagnoses as one.
+
+**Test coverage:** `tests/test_principals.py` - hash-only storage and the
+show-once mint; minted tokens authenticating, attributing tasks/launches, and
+naming their audit rows; the owner-only management rule (403 for minted
+tokens, list still open); instant revocation (401 on next request, name kept,
+409 on re-revoke and on name reuse); reserved/malformed names; management as
+409 when auth is off; resolver unit behavior (owner without a row,
+unknown/revoked rejection, throttled last_used_at); nonce-principal
+round-trip; auto-manage chain attribution at the dispatcher level; NULL on
+pre-attribution rows. Full suite 792 passing; dashboard builds clean; live
+probe confirmed 401/200/403 behavior, named audit actors, chain attribution,
+and instant revocation against a running backend, repo .env untouched.

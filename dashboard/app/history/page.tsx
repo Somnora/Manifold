@@ -163,6 +163,14 @@ function LaunchRow({ launch: l }: { launch: Launch }) {
           {fellBack && (
             <span className="text-zinc-500"> (launched {l.launched_type})</span>
           )}
+          {l.created_by && (
+            <span
+              className="ml-1.5 rounded bg-zinc-100 px-1.5 py-0.5 text-[11px] text-zinc-500"
+              title="The API principal this launch is attributed to. A job's launch carries the job creator's name; a watch's launch the watch creator's. Older rows predate attribution."
+            >
+              by {l.created_by}
+            </span>
+          )}
         </td>
         <td className="px-4 py-2 text-zinc-600">{l.region}</td>
         <td className="px-4 py-2 text-zinc-600">{l.connection_mode}</td>
