@@ -174,6 +174,22 @@ export type Launch = {
 // admin governs. The .env token is always admin.
 export type PrincipalRole = "viewer" | "operator" | "admin";
 
+// Phase 82: one block of launch-policy rules; empty lists / zeros mean
+// no opinion.
+export type PolicyRules = {
+  allowed_instance_types: string[];
+  allowed_regions: string[];
+  max_hourly_rate_usd: number;
+  require_max_lifetime: boolean;
+};
+
+export type PolicyDoc = {
+  active: boolean;
+  source: string;
+  launch: PolicyRules;
+  roles: Record<string, PolicyRules>;
+};
+
 export type Principal = {
   id: string;
   name: string;
@@ -696,6 +712,10 @@ export const api = {
   revokePrincipal: (name: string) =>
     request<{ revoked: string }>(`/principals/${name}`, { method: "DELETE" }),
 
+  // Phase 82: the launch policy as ENFORCED. Read-only by design; the
+  // policy changes by editing policy.yaml and restarting.
+  policy: () => request<PolicyDoc>("/policy"),
+
   modelPresets: () =>
     request<{ presets: ModelPreset[] }>("/model-presets").then(
       (r) => r.presets,
@@ -744,6 +764,8 @@ export const api = {
       tailscale_available: boolean;
       // Presence only: IS a token enforced, never the token itself.
       auth_required: boolean;
+      // Phase 82: is a policy.yaml loaded and enforcing.
+      policy_active: boolean;
       env_path: string;
       // Bounds for the max-lifetime ceiling, so the launch form can state
       // the real minimum instead of letting the user discover it as a 400.

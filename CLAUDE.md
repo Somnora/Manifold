@@ -43,6 +43,7 @@ npm run dev     # then open http://localhost:3000
   - `agent.py` — Autopilot: agent loop driven by any brain; fixed action allowlist; per-action human approval gates on spend actions
   - `brains.py` — brain registry: instance-served models, local Ollama/LM Studio (auto-detected), frontier APIs (key-gated)
   - `preferences.py` — the Settings-page policies (approval gates, notification toggles, data safety). config.yaml holds the DEFAULTS; the user's choices live in SQLite and override them. Never secrets.
+  - `policy.py` — the launch policy (policy.yaml): reviewable allowlists/caps per role, enforced in the orchestrator, binding everyone incl. the owner. Missing = permissive; invalid = refuses to boot.
   - `notifications.py` — `NotificationCenter`: in-app bell rows + an OS ping (macOS/Linux). Sender is injected, so tests and mock mode stay silent.
   - `data_safety.py` — pure rescue decisions: what is in scope, what fits the transfer budget, path confinement. No I/O; the transport lives in the orchestrator.
   - `db.py` — SQLite schema and queries

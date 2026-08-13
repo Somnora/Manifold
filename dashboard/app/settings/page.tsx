@@ -4,6 +4,7 @@ import { useState } from "react";
 import { api, ApiError } from "@/lib/api";
 import { usePolling } from "@/lib/usePolling";
 import { Badge } from "@/components/Badge";
+import { PolicyCard } from "@/components/PolicyCard";
 import { PolicySettings } from "@/components/PolicySettings";
 import { PrincipalsPanel } from "@/components/PrincipalsPanel";
 
@@ -90,6 +91,8 @@ export default function SettingsPage() {
       <S3KeysForm onSaved={refresh} />
 
       <PrincipalsPanel />
+
+      <PolicyCard />
 
       <PolicySettings />
 

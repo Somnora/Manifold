@@ -332,7 +332,10 @@ class Orchestrator:
         model_client_factory: Callable[[ManagedConnection], "ModelClient"] | None = None,
         prefs=None,          # PreferenceStore: the data-safety policy
         notifier=None,       # NotificationCenter: pings on rescue/blocked
+        policy=None,         # policy.Policy: the reviewable launch policy
     ):
+        from .policy import PERMISSIVE
+        self.policy = policy or PERMISSIVE
         self.settings = settings
         if not isinstance(providers, ProviderRegistry):
             from .providers import CloudProvider, LambdaProvider
@@ -497,6 +500,24 @@ class Orchestrator:
             )
 
         price = types[instance_type].price_cents_per_hour
+        # Phase 82: the reviewable policy, checked before any money-side
+        # guard (a denial costs nothing and names its rule). Binds every
+        # principal INCLUDING the owner: the way around policy.yaml is a
+        # commit to policy.yaml, not a credential.
+        role = self._role_of(created_by)
+        denial = self.policy.allows_launch(
+            instance_type=instance_type, region=region,
+            hourly_rate_usd=price / 100.0,
+            max_lifetime_seconds=max_lifetime_seconds, role=role)
+        if denial is not None:
+            self.db.record_audit(
+                created_by or "api", "policy_denied",
+                f"launch {instance_type} in {region}: {denial}")
+            raise LaunchRejected(
+                403, f"Launch denied by policy: {denial}. The policy file "
+                     f"is {self.policy.source}; changing it is a reviewed "
+                     f"edit, not a setting.",
+                reason_code="policy")
         current_spend, budget_cents = await self._guard_capacity(
             cloud_provider=cloud_provider,
             instance_type=instance_type,
@@ -505,14 +526,22 @@ class Orchestrator:
             created_by=created_by,
         )
 
-        # Fallback types must exist and independently fit the budget;
-        # ones that don't are skipped rather than failing the launch.
+        # Fallback types must exist, independently fit the budget, AND
+        # pass the same policy the requested type passed; ones that don't
+        # are skipped rather than failing the launch.
         candidates = [instance_type]
         for fb in self.settings.launch.fallback_instance_types:
             if fb == instance_type or fb in candidates or fb not in types:
                 continue
-            if current_spend + types[fb].price_cents_per_hour <= budget_cents:
-                candidates.append(fb)
+            if current_spend + types[fb].price_cents_per_hour > budget_cents:
+                continue
+            if self.policy.allows_launch(
+                    instance_type=fb, region=region,
+                    hourly_rate_usd=types[fb].price_cents_per_hour / 100.0,
+                    max_lifetime_seconds=max_lifetime_seconds,
+                    role=role) is not None:
+                continue
+            candidates.append(fb)
 
         launch_id = self.db.create_launch(
             requested_type=instance_type,
@@ -538,6 +567,18 @@ class Orchestrator:
         )
         self._launch_tasks[launch_id] = asyncio.create_task(self._run_launch(plan))
         return self.db.get_launch(launch_id)
+
+    def _role_of(self, created_by: str | None) -> str | None:
+        """The role a launch is policied under. Owner is admin by
+        definition; minted principals carry their row's role; legacy
+        actors and open mode have none and are bound by the global
+        policy block alone."""
+        if not created_by:
+            return None
+        if created_by == "owner":
+            return "admin"
+        row = self.db.principal_by_name(created_by)
+        return (row.get("role") or "operator") if row else None
 
     async def _guard_capacity(
         self,
@@ -721,6 +762,23 @@ class Orchestrator:
                 f"Unknown instance type '{instance_type}'. "
                 f"Valid types: {', '.join(sorted(types))}",
             )
+        # Phase 82: policy first, like the single-launch path - a denied
+        # cluster must leave no ghost row and cost no guard work. Judged
+        # once for the whole cluster (every node shares type and region).
+        denial = self.policy.allows_launch(
+            instance_type=instance_type, region=region,
+            hourly_rate_usd=types[instance_type].price_cents_per_hour / 100.0,
+            max_lifetime_seconds=None,
+            role=self._role_of(created_by))
+        if denial is not None:
+            self.db.record_audit(
+                created_by or "api", "policy_denied",
+                f"cluster {node_count}x {instance_type} in {region}: "
+                f"{denial}")
+            raise LaunchRejected(
+                403, f"Cluster denied by policy: {denial}. The policy file "
+                     f"is {self.policy.source}.",
+                reason_code="policy")
         await self._guard_capacity(
             cloud_provider=cloud_provider,
             instance_type=instance_type,

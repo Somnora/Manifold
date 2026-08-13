@@ -73,6 +73,24 @@ Activity page's "Where it went" groups spend **by principal**.
 - **Mock mode** stays a zero-credential local demo; the no-token wall
   applies to it too, so a demo backend does not serve the LAN.
 
+## The policy file: guardrails you review like code
+
+`policy.yaml` (next to `config.yaml` in the data dir) constrains WHICH
+launches are possible - instance-type and region allowlists, a
+per-instance rate cap, a required max lifetime - globally and per role,
+binding every principal **including the owner**. Role blocks tighten the
+global block; they can never widen it. The repo-root `policy.yaml`
+template documents every rule.
+
+It is deliberately not editable from the dashboard: the file loads at
+boot, `GET /policy` (and the Settings page) shows exactly what is
+enforced, and changing it means editing the file and restarting - so in
+a team repo, every guardrail change is a reviewed commit with an author.
+
+Missing file = fully permissive. Invalid file = the backend **refuses to
+start**, unknown keys included: a typo that silently constrained nothing
+would be a hole shaped exactly like a guard.
+
 ## The database stays SQLite (a decision, not a default)
 
 Team mode is one shared backend process, not N backends sharing a

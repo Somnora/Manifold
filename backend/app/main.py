@@ -396,8 +396,11 @@ def create_app(
     custom_templates_dir=None,     # user-authored templates (DATA_ROOT/custom-templates)
     mock: bool = False,
     mock_seed_days: int = 0,       # mock mode only: days of fabricated demo history
+    policy=None,                   # policy.Policy; None = permissive (tests, mock)
 ) -> FastAPI:
     settings = settings or load_settings()
+    from .policy import PERMISSIVE
+    policy = policy or PERMISSIVE
     lambda_client_factory = lambda_client_factory or RealLambdaClient
     from .config import DATA_ROOT, RESOURCE_ROOT
     env_file = env_path if env_path is not None else DATA_ROOT / ".env"
@@ -562,7 +565,7 @@ def create_app(
         settings, providers, db,
         connect_fn=connect_fn, sidecar_factory=sidecar_factory,
         model_client_factory=model_client_factory,
-        prefs=prefs, notifier=notifier,
+        prefs=prefs, notifier=notifier, policy=policy,
     )
     storage_cache: dict[str, StorageClient] = {}
 
@@ -787,6 +790,7 @@ def create_app(
             ),
             "tailscale_available": bool(settings.tailscale_authkey),
             "proxy_protected": bool(settings.proxy_api_key),
+            "policy_active": policy.active,
             # Presence only, like everything above: IS a token enforced,
             # never what it is.
             "auth_required": bool(settings.api_token),
@@ -1956,6 +1960,15 @@ def create_app(
         """Names and liveness only - never token values, never hashes."""
         return {"principals": db.list_principals(),
                 "auth_enabled": bool(settings.api_token)}
+
+    @app.get("/policy")
+    async def get_policy():
+        """The launch policy as ENFORCED right now: which file, which
+        rules, per role. Read-only by design - the policy changes by
+        editing policy.yaml and restarting, so the change is a reviewed
+        commit, not a click."""
+        from .policy import describe
+        return describe(policy)
 
     @app.delete("/principals/{name}")
     async def revoke_principal(name: str):
@@ -3340,5 +3353,17 @@ def create_default_app() -> FastAPI:
             lambda_client = MockLambdaClient(
                 scripted_launch_errors=[capacity_error() for _ in range(failures)]
             )
+    # Phase 82: the launch policy, loaded strictly. Missing = permissive;
+    # invalid = refuse to boot. A guard that fails open because of a typo
+    # is a hole shaped exactly like a guard, so PolicyError is fatal here
+    # (the same posture as a token that cannot be persisted).
+    from .config import DATA_ROOT
+    from .policy import PolicyError, load_policy
+    try:
+        policy = load_policy(DATA_ROOT / "policy.yaml")
+    except PolicyError as exc:
+        raise SystemExit(f"manifold: refusing to start: {exc}") from exc
+
     return create_app(mock=mock, lambda_client=lambda_client,
-                      mock_seed_days=seed_days if mock else 0)
+                      mock_seed_days=seed_days if mock else 0,
+                      policy=policy)

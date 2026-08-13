@@ -183,6 +183,7 @@ ROUTE_ROLES: dict[tuple[str, str], str] = {
     ("GET", "/filesystems"): "viewer",
     ("GET", "/storage/files"): "viewer",
     ("GET", "/principals"): "viewer",
+    ("GET", "/policy"): "viewer",
     ("GET", "/v1/models"): "viewer",
     # -- work ------------------------------------------------------------
     ("POST", "/instances"): "operator",

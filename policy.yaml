@@ -1,0 +1,35 @@
+# Manifold launch policy (Phase 82). Versioned, reviewable, enforced.
+#
+# This file is the half of the guardrails a TEAM reviews: which instance
+# types, which regions, at what per-instance rate, with what lifetime
+# discipline - per role, binding every principal including the owner.
+# The numeric dials (concurrency, total hourly budget) stay in
+# config.yaml; this file is the one you put in a pull request.
+#
+# It is read from the data dir at boot (next to config.yaml). Missing =
+# fully permissive. Present but INVALID = the backend refuses to start:
+# a typo that silently constrained nothing would be a hole shaped like a
+# guard, so unknown keys are errors, not no-ops.
+#
+# Everything below is commented out - this default constrains nothing.
+
+version: 1
+
+launch:
+  # Patterns are shell-style globs against instance type names.
+  # allowed_instance_types: [gpu_1x_*, gpu_2x_a100*]
+  # allowed_regions: [us-east-1, us-west-2]
+  # Per-INSTANCE rate cap in dollars/hour (the total across instances is
+  # config.yaml's max_hourly_spend_usd).
+  # max_hourly_rate_usd: 3.00
+  # Require every launch to carry a max-lifetime ceiling (the value is
+  # still validated against config.yaml's floor and cap).
+  # require_max_lifetime: true
+
+# Per-role blocks TIGHTEN the launch block above; they can never widen
+# it. Both must pass; the rate cap is the smaller of the two.
+roles: {}
+  # operator:
+  #   allowed_instance_types: [gpu_1x_*]
+  #   max_hourly_rate_usd: 1.50
+  #   require_max_lifetime: true
