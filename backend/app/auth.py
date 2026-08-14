@@ -368,9 +368,9 @@ def ensure_api_token(env_file: Path) -> str:
             f"real mode; fix the file or set MANIFOLD_API_TOKEN in the "
             f"environment."
         ) from exc
-    # Mirror what load_dotenv does on every LATER boot, so first-boot code
-    # that reads the environment (claude_integration's mcp.json emitter)
-    # sees the token now instead of after the next restart.
+    # Mirror what load_dotenv does on every LATER boot, so anything reading
+    # the environment during THIS first boot sees the token now instead of
+    # after the next restart.
     os.environ["MANIFOLD_API_TOKEN"] = token
     # warning, not info: uvicorn's default log config drops app-level INFO,
     # and this one-time breadcrumb is how a headless install learns where

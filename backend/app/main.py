@@ -739,9 +739,20 @@ def create_app(
             return (role_table_holder[0].role_for(path, method)
                     if role_table_holder else None)
 
-    if settings.api_token:
+    if settings.api_token and not mock:
         # Empty token = no middleware: mock mode and the test harness stay
-        # a zero-credential demo. Added BEFORE CORS on purpose -
+        # a zero-credential demo.
+        #
+        # `and not mock` because the token OUTLIVES the mode. Real mode mints
+        # one and persists it to .env; every later MOCK start then read it
+        # back and demanded it, so a single accidental real-mode start
+        # permanently gated the "Try it in 90 seconds, no credentials" demo
+        # behind a credential. Mock mode has nothing to protect - a mock
+        # client, no cloud, no spend - and NetworkGuardMiddleware is
+        # installed unconditionally, so an untokened backend still refuses
+        # any non-loopback caller. Found by the 2026-08-14 pre-launch audit.
+        #
+        # Added BEFORE CORS on purpose -
         # add_middleware prepends, so CORS (added last) wraps auth. The
         # other way around, the browser preflight OPTIONS (which never
         # carries Authorization) would 401 before CORS could answer it, and

@@ -45,3 +45,8 @@ manifold-worklog.md
 # never be committable. The packaged app puts them in the platform app-data
 # dir instead.
 /models/
+
+# CLI-brain scratch dir: a frontier CLI runs with cwd set here, and in
+# development DATA_ROOT is the repo root, so anything it drops would
+# otherwise show up as untracked churn in the user's clone.
+/hub-scratch/

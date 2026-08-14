@@ -278,6 +278,15 @@ def load_templates(directory: Path) -> tuple[dict[str, JobTemplate], dict[str, s
     errors: dict[str, str] = {}
     if not directory.exists():
         return templates, errors
+    # Collected, then summarised in ONE line. Emitted per template, these are
+    # eleven consecutive WARNINGs before the first INFO - the first thing a
+    # new user ever sees from the product, and they read like a broken
+    # install during the 90-second demo the README promises. The condition is
+    # real and worth stating (a floating tag can change under a reproduced
+    # run), but it is a standing property of the bundled recipes, not news
+    # about this boot. The detail stays at DEBUG for whoever is chasing a
+    # drifted image.
+    floating: list[str] = []
     for path in sorted(directory.glob("*.yaml")):
         try:
             template = parse_template(path.read_text(), source=path.name)
@@ -286,10 +295,17 @@ def load_templates(directory: Path) -> tuple[dict[str, JobTemplate], dict[str, s
                     f"duplicate template name '{template.name}' in {path.name}"
                 )
             for w in template.warnings:
-                logger.warning("template '%s': %s", template.name, w)
+                floating.append(template.name)
+                logger.debug("template '%s': %s", template.name, w)
             templates[template.name] = template
         except (TemplateError, yaml.YAMLError) as exc:
             errors[path.name] = str(exc)
+    if floating:
+        logger.info(
+            "%d of %d job templates use a floating image tag (%s); a rerun "
+            "may not get the image the last run got. Pin a digest in the "
+            "template to freeze one.",
+            len(floating), len(templates), ", ".join(sorted(set(floating))))
     return templates, errors
 
 def render_template(template: JobTemplate, parameters: dict, filesystem: str = "<filesystem>") -> dict:

@@ -4417,3 +4417,42 @@ OS-ping counts while the app's background loops are live under
 this visible rather than causing it - but on a public repo it now means an
 occasional red build, so it needs a real fix (making the test deterministic
 rather than loosening the assertion, since the exact count IS the property).
+
+## 2026-08-14 — Removing what the AI agents made up
+
+**Three vendor-integration modules were deleted: `agy_integration.py`
+(Google Antigravity handshake), `openclaw_adapter.py` ("OpenClaw & Hermes
+Agent Protocol"), `claude_integration.py`.** 222 lines. Nothing in
+`backend/app/` imported any of them - the single apparent reference in
+`auth.py` was a COMMENT naming an emitter that never ran. The only tests
+were three that imported a module and asserted it returned its own
+hardcoded values; they exercised nothing about Manifold and were deleted
+with it. `claude_integration.py` wrote `~/.claude/mcp.json`, a path Claude
+Code does not read.
+
+These are the kind of thing an agent produces when asked to "integrate"
+with something it has only heard of. Keeping them was the worst possible
+choice for this repo specifically: the project's public claim is that AI
+agents wrote much of it and the roadmap came from auditing their work, so
+inert invented integrations sitting in `backend/app/` are the first thing
+a sceptic finds and the strongest available argument that the audit was
+rhetoric. The five real tests in `test_agent_handshake.py` - the
+`/agent/handshake` routes and the context manager's TTL and eviction -
+stay.
+
+**Eleven startup WARNINGs became one INFO.** Every bundled template with a
+floating image tag logged its own warning line at load, so the first thing
+anyone saw from the product was eleven consecutive WARNINGs before the
+first INFO - during the 90-second demo the README promises, that reads as
+a broken install. The condition is real and still reported (one line
+naming all eleven templates); the per-template detail moved to DEBUG.
+
+**Mock mode no longer demands a credential it invented.** Token auth was
+installed whenever a token existed, and real mode MINTS one and persists it
+to `.env` - so a single accidental real-mode start permanently gated the
+zero-credential demo for that clone. Now keyed on `not mock`. This is safe
+by construction rather than by assertion: mock mode has no cloud client, no
+spend and no secrets to protect, and `NetworkGuardMiddleware` is installed
+unconditionally, so an untokened backend still refuses every non-loopback
+caller. Both halves are pinned by tests - mock with a token set stays open,
+real mode with a token still 401s.

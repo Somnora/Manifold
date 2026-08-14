@@ -86,3 +86,42 @@ def test_listings_are_self_identifying(tmp_path, monkeypatch):
 
 def test_real_mode_listings_say_not_mock(client):
     assert client.get("/instances").json()["mock"] is False
+
+
+def test_mock_stays_open_even_after_real_mode_minted_a_token(tmp_path):
+    """The token outlives the mode; the zero-credential demo must not.
+
+    Real mode mints a token and persists it to .env. Every later MOCK start
+    then read it back and enforced it, so one accidental real-mode start
+    permanently gated the README's "Try it in 90 seconds, no credentials"
+    behind a credential the reader does not have. Mock mode has nothing to
+    protect - mock client, no cloud, no spend - and NetworkGuardMiddleware
+    still refuses any non-loopback caller regardless. Found by the
+    2026-08-14 pre-launch audit.
+    """
+    from dataclasses import replace
+
+    settings = replace(make_settings(tmp_path), api_token="a-real-mode-token")
+    app = create_app(settings, mock=True)
+    with TestClient(app) as client:
+        # No Authorization header anywhere.
+        assert client.get("/health").json()["mock"] is True
+        assert client.get("/instances").status_code == 200
+        assert client.get("/templates").status_code == 200
+
+
+def test_a_token_is_still_enforced_outside_mock(tmp_path):
+    """The other half of the rule: real mode with a token stays closed."""
+    from dataclasses import replace
+
+    from app.lambda_api import MockLambdaClient
+
+    settings = replace(make_settings(tmp_path), api_token="a-real-mode-token")
+    # lambda_client injected so no live calls; mock=False is the point.
+    app = create_app(settings, lambda_client=MockLambdaClient())
+    with TestClient(app) as client:
+        assert client.get("/instances").status_code == 401
+        assert client.get(
+            "/instances",
+            headers={"Authorization": "Bearer a-real-mode-token"},
+        ).status_code == 200
