@@ -4361,3 +4361,59 @@ is green, but publishing one is the owner's call. The dispatch-too-early GPU
 race is still open (the readiness probe checks `nvidia-container-cli`, not
 `docker --gpus`). The single-shot file-download route touches activity once
 before streaming and so shares the pull's old shape for very large files.
+
+## 2026-08-14 — Pre-launch audit, second pass: the claims and the last mile
+
+**A false claim in the honesty paragraph.** The launch draft said "GCP
+support is experimental". `backend/app/providers/gcp_provider.py:109`
+describes a provider "whose live API is not wired up yet": the catalog
+degrades to empty, liveness raises ProviderUnavailable, and every write
+raises ProviderError. "Experimental" implies something a reader could try.
+It launches nothing, and saying so belongs in the one paragraph where a
+reader extends trust in exchange for candour.
+
+**The README's 90-second quickstart began with a command most readers do
+not have.** `uv sync` was step one, and the file contained no install link,
+no prerequisite section and no Node version anywhere. Two auditors
+independently reproduced `sh: uv: command not found`, exit 127, from a
+fresh clone - the most likely first-run stumble for an arrival from a link,
+landing before they see anything work.
+
+**`/releases/latest` is a 404 and `docs/desktop-build.md` told you to share
+exactly that URL**, asserting it "always resolves to the newest tag". It
+resolves to the newest NON-prerelease release, and this repo's only release
+is a prerelease, so the documented link is dead. Corrected with the caveat
+rather than the assertion.
+
+**Stale under-claims, all in tracked public files.** README said "430+
+tests", CONTRIBUTING said "480+"; the suite is 973. These are UNDER-claims,
+so there was no honesty exposure - but a project whose pitch is rigour
+should not be casually wrong about its own strongest credential.
+
+**`sftp_read` was latency-bound, not bandwidth-bound.** It requested 64 KiB
+per round trip, and asyncssh only pipelines a read LARGER than the
+negotiated block size (261120 against OpenSSH). So every chunk was one full
+round trip: 0.6-0.7 MB/s measured against a real instance, which is what
+made a 379 MB pull take nine minutes. Raised to 4 MiB, where asyncssh
+parallelises; an auditor measured ~9.7 MB/s on the same path and proved the
+ranged-download contract byte-identical (same request count, matching
+sha256), which matters because the MCP `download_file` tool depends on it.
+Memory stays bounded at one chunk per transfer: every consumer writes each
+chunk out before asking for the next.
+
+**estimates.DEFAULT_MINUTES was missing 7 of 19 templates**, including
+lerobot-act and nanogpt-pretrain - the two the docs headline - all silently
+costing out at the 15-minute fallback. This is the identical defect the
+Phase 84 verifier fixed for llm-judge/llm-eval, reintroduced for Phase 83's
+and 85's templates. Cluster templates get None (they run until stopped)
+rather than a number nobody can stand behind.
+
+**KNOWN FLAKE, pre-existing and now visible.**
+`test_blocked_termination_notifies_once_until_the_files_change` (Phase 76b,
+untouched since a5aa626) fails roughly one full-suite run in three, and
+passes every time in isolation and in small groups. The test asserts exact
+OS-ping counts while the app's background loops are live under
+`TestClient`'s lifespan, so it is racing something. Adding CI today made
+this visible rather than causing it - but on a public repo it now means an
+occasional red build, so it needs a real fix (making the test deterministic
+rather than loosening the assertion, since the exact count IS the property).

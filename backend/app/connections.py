@@ -300,7 +300,21 @@ class ManagedConnection:
         finally:
             sftp.exit()
 
-    async def sftp_read(self, remote_path: str, chunk_size: int = 65536,
+    # 4 MiB, not 64 KiB. asyncssh issues parallel SFTP requests only for a
+    # read LARGER than the negotiated block size (261120 against OpenSSH);
+    # a 64 KiB read is one request-response round trip, so throughput was
+    # bound by latency rather than bandwidth - measured at 0.6-0.7 MB/s
+    # against a real Lambda instance, which made a 379 MB model pull take
+    # nine minutes and a 7B student impossible. Above that threshold
+    # asyncssh pipelines, and the same transfer measures ~9.7 MB/s.
+    #
+    # Memory is bounded by one chunk per in-flight transfer: every consumer
+    # (the pull route, the download stream) writes each chunk out before
+    # asking for the next.
+    SFTP_CHUNK_BYTES = 4 * 1024 * 1024
+
+    async def sftp_read(self, remote_path: str,
+                        chunk_size: int = SFTP_CHUNK_BYTES,
                         *, offset: int = 0, max_bytes: int | None = None):
         """Async iterator over a remote file's bytes.
 

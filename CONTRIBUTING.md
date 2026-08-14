@@ -64,7 +64,7 @@ The authoritative copy of these lives in `CLAUDE.md`.
 - **Branch from `main`**, named for what you are doing (`fix-idle-timer-race`,
   `phase-N-...` for maintainer phase work).
 - **Add tests.** Every behavioral change needs coverage in `backend/tests/`.
-  The suite is 480+ tests and all of it runs on mocks; match that.
+  The suite is 970+ tests and all of it runs on mocks; match that.
 - **Run the checks** before you push:
   ```bash
   cd backend && uv run pytest -q

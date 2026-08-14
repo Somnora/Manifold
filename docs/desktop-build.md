@@ -73,9 +73,13 @@ git push origin v0.1.0
 ```
 
 That's it - the `release` job in the workflow waits for both platform
-builds, then publishes them together as one release. Share the
-`/releases/latest` URL (it always resolves to the newest tag) or the
-specific `/releases/tag/v0.1.0` link.
+builds, then publishes them together as one release. Share the `/releases/latest` URL or the specific
+`/releases/tag/v0.1.0` link.
+
+> `/releases/latest` resolves to the newest NON-prerelease release, and
+> 404s when every release is marked prerelease. If you publish a
+> prerelease, share the `/releases/tag/<tag>` link instead - otherwise you
+> are handing people a dead URL.
 
 Since the repo is public and the bundles are unsigned (below), anyone
 downloading will see a Gatekeeper/SmartScreen warning - the release notes

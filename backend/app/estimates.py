@@ -37,6 +37,18 @@ DEFAULT_MINUTES: dict[str, float | None] = {
     # them as 15-minute jobs. Found by the Phase 84 verifier, 2026-08-14.
     "llm-judge": 15,
     "llm-eval": 40,
+    # The same omission, one phase later: Phase 83's and 85's templates were
+    # added without entries and silently costed out at the 15-minute
+    # fallback - including lerobot-act and nanogpt-pretrain, the two the
+    # docs headline. Cluster templates are servers in all but name (they
+    # run until stopped), so they get None rather than a guess.
+    "lerobot-act": 45,
+    "smolvla-finetune": 60,
+    "nanogpt-pretrain": 45,
+    "gguf-quantize": 10,
+    "deepspeed-cluster": None,
+    "ray-cluster": None,
+    "vllm-cluster": None,
     "axolotl-finetune": 120,
     "lora-merge": 10,
     "tao-train": 120,

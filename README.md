@@ -12,6 +12,16 @@ are all thin clients of it.
 Mock mode runs the entire product against a simulated Lambda cloud: full
 catalog, launches, jobs, terminals, telemetry. Zero spend, no API key.
 
+You need [uv](https://docs.astral.sh/uv/getting-started/installation/) for
+the Python side and [Node](https://nodejs.org/) 20+ for the dashboard.
+Neither ships with macOS or Linux by default:
+
+```bash
+# macOS / Linux
+curl -LsSf https://astral.sh/uv/install.sh | sh    # or: brew install uv
+node --version                                     # need v20 or newer
+```
+
 ```bash
 # terminal 1: backend (from backend/)
 uv sync
@@ -110,7 +120,7 @@ Build instructions: `docs/desktop-build.md`.
 ```bash
 cd backend
 uv sync
-uv run pytest          # 430+ tests, all against mocks; no live spend
+uv run pytest          # 970+ tests, all against mocks; no live spend
 ```
 
 Hard rules: no live spend in tests, all guards live in the backend, clients
