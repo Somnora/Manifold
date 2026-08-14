@@ -4513,3 +4513,46 @@ Loosening the ASSERTION was rejected outright - the exact count is the
 property under test (one ping per distinct unsaved set), and a test allowed
 to drift proves nothing. Quarantining a test while saying so is honest;
 weakening one until it passes is not.
+
+## 2026-08-14 — Phase 86: the hardware ladder (know your hardware)
+
+**What:** `GET /gpu-guide` and a disclosure inside the launch form, right
+under the GPU picker: every GPU type the provider offers, from a single
+A10 to the 8x B200 node, each with what it is FOR, when to step up, what
+fits on it, and the live price. Picking a rung fills the form field, so
+learning and acting are one motion.
+
+**The two rules it is built on**, both scar tissue from this same day:
+
+*Data comes from the provider, words come from here.* Every number in the
+guide is either passed through from the same catalog call /instance-types
+serves (price, VRAM parsed from the provider's own description string,
+capacity) or labelled arithmetic on those numbers. There is no price
+literal in gpu_guide.py for a price change to strand - and a test enforces
+that at the source level by refusing any dollar literal in the module. The
+test caught its own module's docstring quoting the old cluster-screen bug
+by amount; the docstring now tells the story without the number, which is
+the rule working.
+
+*Arithmetic is labelled as arithmetic.* "Serves ~30B at 4-bit" is VRAM
+math, not a measurement, so every response carries the exact formula in
+`fits_basis` and the UI prints it. The honesty rule for money (exact or
+labelled) extends to capability claims.
+
+**Alternatives rejected:** a static docs page (goes stale, and it is not
+where the decision happens); putting the prose in the dashboard (then the
+MCP/API surface never sees it, and prose in TSX is untestable); deriving
+good-for text from model-fit calls per model (right tool for "does THIS
+model fit", wrong shape for "what is this card for").
+
+**Curated families:** A10, RTX 6000, A6000, V100, A100 40/80, GH200 (with
+the ARM-host warning - the templates' images are x86), H100, B200. A card
+the file has never met still gets true numbers: price passthrough, VRAM
+parsed, fits arithmetic, and an honest "no curated notes yet" - never
+another family's prose, never a dropped row. Multi-GPU rungs all carry the
+one-box truth: tensor parallel for serving, and Manifold clusters
+coordinate separate machines, not distributed training.
+
+Also in this change: hn-post.md's stale counts corrected against measured
+reality (over 970 tests, 37 MCP tools, ~50k tracked lines - the old "13k"
+undercounted by 4x), and a README paragraph pointing at the guide.

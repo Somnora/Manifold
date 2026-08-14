@@ -160,6 +160,8 @@ ROUTE_ROLES: dict[tuple[str, str], str] = {
     ("GET", "/subagents/models"): "viewer",
     ("GET", "/subagents/swarm/status"): "viewer",
     ("GET", "/model-presets"): "viewer",
+    # Phase 86: the hardware ladder is reading the menu, nothing more.
+    ("GET", "/gpu-guide"): "viewer",
     ("GET", "/student-presets"): "viewer",
     ("GET", "/watches"): "viewer",
     ("GET", "/brains"): "viewer",

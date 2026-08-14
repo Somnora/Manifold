@@ -1051,6 +1051,29 @@ def create_app(
             for name, t in sorted(types.items())
         }
 
+    @app.get("/gpu-guide")
+    async def gpu_guide_route():
+        """The hardware ladder: curated notes joined to live catalog numbers.
+
+        Words from gpu_guide.py, numbers from the provider via the SAME
+        catalog call /instance-types serves - so a price shown here can
+        never disagree with the launch form beside it, and there is no
+        second price path to go stale.
+        """
+        from . import gpu_guide
+        types = await lambda_client.list_instance_types()
+        serialized = {
+            name: {
+                "description": t.description,
+                "gpu_description": t.gpu_description,
+                "price_usd_per_hour": t.price_cents_per_hour / 100,
+                "specs": t.specs,
+                "regions_with_capacity": t.regions_with_capacity,
+            }
+            for name, t in types.items()
+        }
+        return gpu_guide.build_guide(serialized)
+
     @app.get("/launch-options")
     async def launch_options_route():
         """Launchable (type, region, filesystem) targets that Lambda can

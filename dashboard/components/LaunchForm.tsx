@@ -9,6 +9,7 @@ import {
   type Region,
 } from "@/lib/api";
 import { formatMoney } from "@/lib/format";
+import { HardwareGuide } from "@/components/HardwareGuide";
 
 // Guided order of operations, mirroring Lambda's own console:
 //   1. Pick a GPU — available types first, cheapest to priciest; the ones
@@ -218,6 +219,10 @@ export function LaunchForm({ onLaunched }: { onLaunched: () => void }) {
             </option>
           ))}
         </select>
+        <HardwareGuide
+          current={instanceType}
+          onPick={(t) => setInstanceType(t)}
+        />
       </label>
 
       <div className="mt-3 grid grid-cols-2 gap-3 md:grid-cols-4">
