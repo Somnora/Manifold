@@ -1,0 +1,51 @@
+# Pretrain a GPT from ZERO - random weights, your compute, a real
+# generating model in minutes. The default config is nanoGPT's char-level
+# Shakespeare: small on purpose, so the first from-scratch model costs
+# well under a dollar on an A10. The final step samples from the model
+# you just trained, so the proof of life is generated text sitting right
+# in the job log.
+#
+# The serious multi-hour pretrain recipes (larger configs, 8x boxes) are
+# documented in docs/train-your-own-model.md as script-run recipes: a
+# bundled template's DEFAULT should be the cheap path, never a $100 run.
+#
+# The image is a pinned PyTorch tag (no drift warning); the nanoGPT clone
+# rides master, which the doc notes plainly. --compile=False skips
+# torch.compile warmup that would dominate a short run.
+name: nanogpt-pretrain
+description: Pretrain a small GPT from scratch (nanoGPT Shakespeare) and sample from it
+image: pytorch/pytorch:2.4.0-cuda12.1-cudnn9-runtime
+
+command: >
+  bash -c "apt-get update -qq && apt-get install -y -qq git > /dev/null
+  && git clone --depth 1 https://github.com/karpathy/nanoGPT /tmp/nanoGPT
+  && cd /tmp/nanoGPT && pip install -q requests tiktoken
+  && python data/shakespeare_char/prepare.py
+  && python train.py config/train_shakespeare_char.py
+  --max_iters={{max_iters}} --eval_interval={{eval_interval}}
+  --out_dir=/data/output/{{run_name}} --compile=False
+  && python sample.py --out_dir=/data/output/{{run_name}}
+  --num_samples=2 --max_new_tokens=300"
+
+parameters:
+  - name: run_name
+    type: string
+    default: nanogpt-run
+    description: Output directory name, created under <filesystem>/outputs
+  - name: max_iters
+    type: integer
+    default: 2000
+    description: Training iterations (2000 makes coherent-ish Shakespeare in minutes)
+  - name: eval_interval
+    type: integer
+    default: 500
+    description: Evaluate and checkpoint every N iterations
+
+volumes:
+  - host: "{persistent}/outputs"
+    container: /data/output
+
+gpu:
+  min_vram_gib: 8
+  recommended_types:
+    - gpu_1x_a10

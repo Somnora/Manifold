@@ -1,0 +1,60 @@
+# Fine-tune SmolVLA (~450M, public, no token needed) on your recorded
+# episodes - the language-conditioned step up from lerobot-act: the same
+# dataset teaches a policy that follows instructions like "clear the desk"
+# instead of one fixed behavior.
+#
+# Same dataset convention as lerobot-act (<filesystem>/datasets/<name>,
+# LeRobot format); the base model downloads once into the shared HF cache
+# on the persistent filesystem and is free on every later run. Gated bases
+# are deliberately out of scope: this template only ever pulls
+# lerobot/smolvla_base, which is public.
+name: smolvla-finetune
+description: Fine-tune SmolVLA on your episodes for language-conditioned control
+image: huggingface/lerobot-gpu:latest
+
+command: >
+  python -m lerobot.scripts.train
+  --policy.path=lerobot/smolvla_base --policy.device=cuda
+  --dataset.repo_id={{dataset}} --dataset.root=/data/datasets/{{dataset}}
+  --steps={{steps}} --batch_size={{batch_size}} --save_freq={{save_freq}}
+  --output_dir=/data/output/{{run_name}}
+  --wandb.enable=false
+
+parameters:
+  - name: dataset
+    type: string
+    description: Dataset directory name under <filesystem>/datasets (LeRobot format)
+  - name: run_name
+    type: string
+    default: smolvla-run
+    description: Output directory name, created under <filesystem>/outputs
+  - name: steps
+    type: integer
+    default: 20000
+    description: Fine-tune steps (20k is the documented SmolVLA baseline)
+  - name: batch_size
+    type: integer
+    default: 4
+    description: Batch size (4 keeps the 450M base within an A10)
+  - name: save_freq
+    type: integer
+    default: 5000
+    description: Checkpoint every N steps
+
+volumes:
+  - host: "{persistent}/datasets"
+    container: /data/datasets
+    read_only: true
+  - host: "{persistent}/outputs"
+    container: /data/output
+  - host: "{persistent}/cache/huggingface"
+    container: /root/.cache/huggingface
+
+env:
+  HF_HOME: /root/.cache/huggingface
+
+gpu:
+  min_vram_gib: 16
+  recommended_types:
+    - gpu_1x_a10
+    - gpu_1x_a100_sxm4

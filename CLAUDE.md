@@ -53,8 +53,8 @@ npm run dev     # then open http://localhost:3000
 - `desktop/` — Tauri v2 shell (.dmg/.msi): spawns the frozen backend as a sidecar, navigates a native window to it (see docs/desktop-build.md)
 - `backend/tests/` — pytest; everything runs against mocks
 - `sidecar/manifold_sidecar.py` — runs ON the instance, 127.0.0.1 only; embedded into cloud-init (metrics, unpersisted/recent files, fs browse/usage/delete)
-- `templates/*.yaml` — bundled job templates (vllm-serve, sglang-serve, whisper-batch, axolotl-finetune, tao-train, sdxl-generate, script-run, llm-synthesize, gpu-smoke); user-authored templates live in `custom-templates/` under the data dir, same loader and mount jail, editable from the Jobs page or via MCP `save_template`
-- `docs/` — user-facing guides (agent-on-gpu.md, mcp-setup.md, openai-proxy.md, data-pipeline.md, distill-your-own-model.md, desktop-build.md, local-hub.md, team-mode.md)
+- `templates/*.yaml` — bundled job templates (vllm-serve, sglang-serve, whisper-batch, axolotl-finetune, tao-train, sdxl-generate, script-run, llm-synthesize, gpu-smoke, and the Foundry trio: lerobot-act, smolvla-finetune, nanogpt-pretrain); user-authored templates live in `custom-templates/` under the data dir, same loader and mount jail, editable from the Jobs page or via MCP `save_template`
+- `docs/` — user-facing guides (agent-on-gpu.md, mcp-setup.md, openai-proxy.md, data-pipeline.md, distill-your-own-model.md, train-your-own-model.md, desktop-build.md, local-hub.md, team-mode.md)
 - `config.yaml` — guardrails, retry policy, SSH settings, telemetry sample interval
 - `.env` — secrets only (gitignored; template in `.env.example`)
 - `DECISIONS.md` — every non-obvious choice gets an entry (what/alternatives/why)

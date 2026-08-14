@@ -3796,3 +3796,53 @@ with no row left behind), GET /policy and the settings flag. Full suite
 839 passing; dashboard builds clean; live probe confirmed the owner
 denial naming the file, the operator lifetime rule, a compliant 202,
 and a typo'd policy refusing to boot with the unknown key named.
+
+## Phase 83 — The Foundry: recipes, not platform (2026-08-14)
+
+- **The whole phase is three YAML files and a doc, on purpose.** Everything
+  "train your own model" needs was already built by earlier phases:
+  auto-manage rents-trains-syncs-terminates, depends_on chains
+  fetch-then-train, the rescue saves checkpoints from a dying box, the
+  ceiling/policy/budget stack binds training runs identically, and the
+  estimator honestly reports no history until the first real run seeds it.
+  Adding a "training platform" module would have duplicated all of it.
+  **Alternative:** a dedicated training API/UI — rejected until the Forge
+  wizard (planned Phase 85) proves recipes alone are insufficient.
+
+- **The robot-arm story leads because it is the honest from-scratch.** A
+  desk-cleaning arm needs a policy network (~50-80M params) trained from
+  random weights on the user's own demonstrations — genuinely "from
+  scratch," hours on one A10, a few dollars. An LLM is the wrong tool and
+  the doc says so. The walkthrough is executable by someone with NO robot
+  (public pusht dataset), because a doc that requires hardware to follow
+  is an ad.
+
+- **Defaults are the cheap path.** nanogpt-pretrain's default run costs
+  under a dollar and ends by SAMPLING from the model it trained — proof of
+  life as generated text in the job log. The serious multi-hour pretrains
+  are documented script-run recipes, not bundled defaults: a template whose
+  default costs $100 is a trap, not a recipe. Same instinct: the doc leads
+  with a steps=2000 proof run (~$0.30) before the full 100k.
+
+- **Public bases only; version drift stated, not hidden.** smolvla-finetune
+  pulls only the public lerobot/smolvla_base, so no secret-injection
+  plumbing was built for gated models (script-run's .env convention already
+  exists for those). The LeRobot image tag floats and its CLI moves: the
+  loader's drift warning stays on both lerobot templates, the pinned
+  pytorch tag keeps nanogpt warning-free, wandb is disabled explicitly (an
+  unattended job must never sit waiting on a login prompt), and the doc
+  tells users exactly where a flag-rename failure will surface and how to
+  fix it. Exact CLI flags get re-verified against the image at each
+  real-run gate; the golden render tests pin whatever the gate proves.
+
+**Test coverage:** `tests/test_foundry_templates.py` — all three load
+through the mount jail with no ports and no network; dataset templates
+require exactly one parameter (nanogpt requires zero: the cheap path needs
+no decisions); golden renders (from-scratch ACT invocation with wandb off,
+smolvla pulling the public base, nanogpt cloning-training-sampling with
+the pinned image); the drift warnings present on exactly the floating
+images; and the walkthrough's pipeline shape over HTTP — gpu-smoke chained
+to lerobot-act via depends_on against a mock instance, held-then-ordered,
+rendered command and declared outputs verified in the job log. Real-GPU
+gate pending (one A10, pusht, steps=2000, ~$0.50): it doubles as the
+phase-74 subagent smoke test and the auth-stack shakeout.

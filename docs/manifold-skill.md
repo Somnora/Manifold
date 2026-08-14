@@ -97,6 +97,19 @@ desktop app or a dev backend must be running). GET /health confirms it.
 - Outputs you care about belong on the persistent filesystem. Check
   `sync_outputs` before terminating if anything lives in scratch.
 
+### Train a model from scratch (the Foundry)
+
+Three bundled recipes (see docs/train-your-own-model.md): `lerobot-act`
+trains a robot policy from random weights on episodes under
+`<filesystem>/datasets/<name>`; `smolvla-finetune` makes the same
+episodes language-conditioned (public base, no token); `nanogpt-pretrain`
+pretrains a small GPT from zero and samples from it into the job log.
+Chain data-fetch and training with `depends_on`; suggest a short
+`steps=2000` proof run before a full one - it validates the dataset for
+cents. Trained artifacts land under `<filesystem>/outputs/<run_name>`;
+`download_file` brings them home, and inference runs on the USER'S
+hardware, never through the cloud (control loops need milliseconds).
+
 ### Fine-tune / distill
 
 The proven pipeline, end to end (see docs/distill-your-own-model.md):

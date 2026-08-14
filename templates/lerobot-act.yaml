@@ -1,0 +1,67 @@
+# Train an ACT robot policy FROM SCRATCH on your own recorded episodes
+# (LeRobot format). This is the Foundry's headline recipe: ~50-80M params
+# of action-chunking transformer, initialized from random weights, learned
+# entirely from demonstrations you recorded - a few dollars on an A10.
+#
+# Dataset: put a LeRobot-format dataset directory (or `huggingface-cli
+# download` a community one via script-run) under <filesystem>/datasets/.
+# The full walkthrough - recording, uploading, training, and running the
+# policy on your hardware at home - is docs/train-your-own-model.md.
+#
+# Checkpoints land on the persistent filesystem every save_freq steps, so
+# an idle-timeout or max-lifetime termination costs at most the steps
+# since the last save; the termination rescue covers the remainder.
+#
+# The image tag floats (the loader warns): LeRobot moves quickly, and the
+# exact CLI surface below is verified against the image at each real-run
+# gate. wandb is disabled explicitly - an unattended job must never sit
+# waiting on a login prompt.
+name: lerobot-act
+description: Train an ACT robot policy from scratch on your recorded episodes (LeRobot format)
+image: huggingface/lerobot-gpu:latest
+
+command: >
+  python -m lerobot.scripts.train
+  --policy.type=act --policy.device=cuda
+  --dataset.repo_id={{dataset}} --dataset.root=/data/datasets/{{dataset}}
+  --steps={{steps}} --batch_size={{batch_size}} --save_freq={{save_freq}}
+  --output_dir=/data/output/{{run_name}}
+  --wandb.enable=false
+
+parameters:
+  - name: dataset
+    type: string
+    description: Dataset directory name under <filesystem>/datasets (LeRobot format)
+  - name: run_name
+    type: string
+    default: act-run
+    description: Output directory name, created under <filesystem>/outputs
+  - name: steps
+    type: integer
+    default: 100000
+    description: Training steps (100k is the community baseline; 2000 proves the loop in minutes)
+  - name: batch_size
+    type: integer
+    default: 8
+    description: Batch size (8 fits an A10 comfortably for ACT)
+  - name: save_freq
+    type: integer
+    default: 10000
+    description: Checkpoint every N steps (bounds what a termination can cost you)
+
+volumes:
+  - host: "{persistent}/datasets"
+    container: /data/datasets
+    read_only: true
+  - host: "{persistent}/outputs"
+    container: /data/output
+  - host: "{persistent}/cache/huggingface"
+    container: /root/.cache/huggingface
+
+env:
+  HF_HOME: /root/.cache/huggingface
+
+gpu:
+  min_vram_gib: 16
+  recommended_types:
+    - gpu_1x_a10
