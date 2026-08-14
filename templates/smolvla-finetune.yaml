@@ -13,11 +13,12 @@ description: Fine-tune SmolVLA on your episodes for language-conditioned control
 image: huggingface/lerobot-gpu:latest
 
 command: >
-  python -m lerobot.scripts.train
-  --policy.path=lerobot/smolvla_base --policy.device=cuda
+  lerobot-train
+  --policy.path=lerobot/smolvla_base
   --dataset.repo_id={{dataset}} --dataset.root=/data/datasets/{{dataset}}
   --steps={{steps}} --batch_size={{batch_size}} --save_freq={{save_freq}}
   --output_dir=/data/output/{{run_name}}
+  --policy.push_to_hub=false --policy.repo_id=local/{{run_name}}
   --wandb.enable=false
 
 parameters:
@@ -58,3 +59,5 @@ gpu:
   recommended_types:
     - gpu_1x_a10
     - gpu_1x_a100_sxm4
+
+user: root

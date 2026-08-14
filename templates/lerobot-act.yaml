@@ -21,11 +21,12 @@ description: Train an ACT robot policy from scratch on your recorded episodes (L
 image: huggingface/lerobot-gpu:latest
 
 command: >
-  python -m lerobot.scripts.train
-  --policy.type=act --policy.device=cuda
+  lerobot-train
+  --policy.type=act
   --dataset.repo_id={{dataset}} --dataset.root=/data/datasets/{{dataset}}
   --steps={{steps}} --batch_size={{batch_size}} --save_freq={{save_freq}}
   --output_dir=/data/output/{{run_name}}
+  --policy.push_to_hub=false --policy.repo_id=local/{{run_name}}
   --wandb.enable=false
 
 parameters:
@@ -65,3 +66,5 @@ gpu:
   min_vram_gib: 16
   recommended_types:
     - gpu_1x_a10
+
+user: root

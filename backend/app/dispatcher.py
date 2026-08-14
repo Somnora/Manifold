@@ -164,6 +164,10 @@ def render_docker_command(
         f"--name manifold-task-{task_id}",
         "--gpus all",
     ]
+    if template.user:
+        # Restores docker's root default for images that drop privileges
+        # (validated to "root" at template load; see templates.py).
+        parts.append("--user 0:0")
     if template.network == "host":
         # Loopback-consumer jobs (llm-synthesize) dial servers other jobs
         # publish on the host's 127.0.0.1. Mutually exclusive with ports

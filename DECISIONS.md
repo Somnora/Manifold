@@ -3846,3 +3846,55 @@ to lerobot-act via depends_on against a mock instance, held-then-ordered,
 rendered command and declared outputs verified in the job log. Real-GPU
 gate pending (one A10, pusht, steps=2000, ~$0.50): it doubles as the
 phase-74 subagent smoke test and the auth-stack shakeout.
+
+## Phase 83 gate — what one real A10 taught, $0.92 all-in (2026-08-14)
+
+The first real-hardware session since the auth stack landed, and the
+Foundry's proving run. Everything below was learned live and encoded the
+same hour.
+
+- **The headline worked**: 2000 ACT steps from random weights on pusht,
+  22 steps/s on an A10, checkpoints at 1000/2000 on the persistent
+  filesystem, $0.04 of compute for the proof run - which extrapolates the
+  full 100k run to ~$1.60, under the doc's original estimate even at the
+  corrected $1.29/hr price. Task cost annotation, telemetry verdict
+  ("peak VRAM 1.7/22 GB" - an A10 is generous for ACT), created_by=owner
+  on the launch row, and the rescue hook finding zero unpersisted files
+  (checkpoints were already safe) all behaved on real hardware.
+
+- **Every failure was drift, and every fix is now code.** huggingface-cli
+  was renamed hf (doc snippet now uses the rename-proof python API);
+  lerobot's module path died in favor of the lerobot-train entry point;
+  --policy.device is gone (auto-selected); current LeRobot DEFAULTS to
+  pushing trained models to the Hub and its validation demands a repo_id
+  for it (templates now pin push_to_hub=false + a local repo_id - an
+  unattended job must never publish weights as a side effect). Flags in
+  the templates are now the set proven against the live image's --help,
+  and the golden tests pin exactly that.
+
+- **`user: root` exists because the LeRobot image drops to uid 1001**,
+  which can neither use the root-based HF cache nor write the NFS bind
+  mounts - checkpoints died on permission. The knob accepts ONLY "root":
+  it exists to undo an image's USER directive, not to become an identity
+  switch; the security boundary stays the mount jail. Docker's default
+  (root) is what every other bundled template already assumes.
+
+- **Auth/attribution/adoption shakeout passed in passing**: first real
+  boot generated the token into the real .env (breadcrumb = path only),
+  bare requests 401, the generated token 200s, a backend restart
+  re-adopted the live instance mid-session, and the phase-77 cascade
+  fired for real (failed fetch -> training skipped, never half-run).
+
+- **Two findings filed, not fixed on the meter.** (1) The bundled
+  vllm-serve template has drifted: the current vllm-openai image's
+  entrypoint consumes the template command as ARGUMENTS, so the python -c
+  bootstrap lands in vllm's -c/--compilation-config; a pinned v0.6.3
+  image fails the same way, so the repair is an --entrypoint knob or a
+  command rework - local work, not meter work. (2) Consequently the
+  phase-74 subagent-dispatch-over-real-forward smoke REMAINS OPEN; it
+  needs the serve repair first. Minor notes: sidecar idle memory fields
+  read None on a real A10, and files/list returned an empty shape where
+  find showed files - both cosmetic, both logged.
+
+Total session: ~43 minutes of instance time, $0.92, one instance,
+terminated with the safety hook's blessing.

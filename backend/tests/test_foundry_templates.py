@@ -64,8 +64,11 @@ def test_lerobot_act_render_is_golden(foundry):
                                    "save_freq": 1000})
     cmd = render_docker_command(t, params, filesystem="manifold-data",
                                 task_id="t1")
+    # --user 0:0: the LeRobot image drops to uid 1001, which cannot write
+    # the NFS bind mounts (checkpoints died at the real gate). The knob
+    # restores docker's root default; only "root" is accepted at load.
     assert cmd.startswith(
-        "docker run --rm --name manifold-task-t1 --gpus all")
+        "docker run --rm --name manifold-task-t1 --gpus all --user 0:0")
     # The mounts, exactly: datasets ro, outputs rw, shared HF cache.
     assert "-v /lambda/nfs/manifold-data/datasets:/data/datasets:ro" in cmd
     assert "-v /lambda/nfs/manifold-data/outputs:/data/output" in cmd
@@ -73,10 +76,19 @@ def test_lerobot_act_render_is_golden(foundry):
             "/root/.cache/huggingface" in cmd)
     # The training invocation, exactly: from-scratch ACT, this dataset,
     # wandb off (an unattended job must never wait on a login prompt).
-    assert "--policy.type=act --policy.device=cuda" in cmd
+    # lerobot-train entry point and NO --policy.device: both verified
+    # against the live image at the 2026-08-14 real gate (the module path
+    # python -m lerobot.scripts.train no longer exists, and device is
+    # auto-selected - the flag would error as unknown).
+    assert "lerobot-train --policy.type=act" in cmd
     assert "--dataset.repo_id=pusht --dataset.root=/data/datasets/pusht" in cmd
     assert "--steps=2000 --batch_size=8 --save_freq=1000" in cmd
     assert "--output_dir=/data/output/act-run" in cmd
+    # Never push to the Hub from an unattended job (current LeRobot
+    # DEFAULTS to pushing; validation demands repo_id for it - both
+    # learned at the real gate). Same philosophy as wandb off.
+    assert "--policy.push_to_hub=false" in cmd
+    assert "--policy.repo_id=local/act-run" in cmd
     assert "--wandb.enable=false" in cmd
     assert "huggingface/lerobot-gpu:latest" in cmd
 

@@ -108,6 +108,10 @@ class JobTemplate:
     # Safe under the hard rule: host networking lets a container dial
     # loopback, it does not create any new listener.
     network: str = ""
+    # "" (default) = the image's own user. "root" = force uid 0, undoing an
+    # image's USER directive so NFS bind mounts stay writable (see the
+    # parse-time comment; LeRobot's uid-1001 user cannot write them).
+    user: str = ""
     # Non-fatal advisories surfaced to the Jobs page and list_templates (e.g.
     # a floating image tag that may drift). Computed at parse time.
     warnings: list[str] = field(default_factory=list)
@@ -214,6 +218,21 @@ def parse_template(text: str, source: str = "<inline>") -> JobTemplate:
             f"template '{name}': network must be omitted or 'host', "
             f"got '{network}'"
         )
+
+    # Phase 83 (learned at the real gate): images that drop privileges
+    # (LeRobot runs as uid 1001) cannot write the NFS bind mounts, which
+    # docker's default root user always can - so a training job dies on
+    # its first checkpoint. `user: root` restores the fleet-wide default
+    # for exactly those images. Only "root" is accepted: the knob exists
+    # to UNDO an image's USER directive, not to become a general identity
+    # switch (the security boundary is the mount jail, not the container
+    # user - every container already gets --gpus all).
+    user = str(raw.get("user") or "")
+    if user not in ("", "root"):
+        raise TemplateError(
+            f"template '{name}': user must be omitted or 'root', "
+            f"got '{user}'"
+        )
     if network == "host" and ports:
         raise TemplateError(
             f"template '{name}': 'ports' and 'network: host' are mutually "
@@ -229,7 +248,7 @@ def parse_template(text: str, source: str = "<inline>") -> JobTemplate:
     return JobTemplate(
         name=name, description=str(raw["description"]), image=image,
         command=command, parameters=parameters, volumes=volumes, ports=ports,
-        env=env, gpu=gpu, network=network, warnings=warnings,
+        env=env, gpu=gpu, network=network, user=user, warnings=warnings,
     )
 
 

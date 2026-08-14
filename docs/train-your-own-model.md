@@ -4,15 +4,18 @@ Manifold's Foundry recipes turn "I want my own model" into a few jobs
 with a visible price tag. Three bundled templates cover the three honest
 meanings of that sentence:
 
-| Template | What you get | Rough cost (A10, $0.75/hr) |
+| Template | What you get | Cost (A10, $1.29/hr) |
 |---|---|---|
-| `lerobot-act` | A robot policy trained FROM SCRATCH on your own demonstrations | $2-3 full run; ~$0.30 proof run |
-| `smolvla-finetune` | The same episodes teaching a language-conditioned policy ("clear the desk") | $2-5 |
-| `nanogpt-pretrain` | A GPT pretrained from zero that samples its own text into the job log | under $0.50 |
+| `lerobot-act` | A robot policy trained FROM SCRATCH on your own demonstrations | ~$1.60 full 100k run; **$0.04 measured** for a 2k proof run |
+| `smolvla-finetune` | The same episodes teaching a language-conditioned policy ("clear the desk") | $2-5 (estimate) |
+| `nanogpt-pretrain` | A GPT pretrained from zero that samples its own text into the job log | under $0.50 (estimate) |
 
-Costs are estimates from public community runs, not promises; Manifold's
-estimator learns your real numbers after the first run, and every launch
-still passes the budget, ceiling, and policy guards.
+The lerobot-act numbers are MEASURED (2026-08-14 real gate: pusht, 2000
+steps in 1.9 min at 22 steps/s on an A10 - $0.04 of compute); the others
+are estimates until their first real runs. Boot and image pull add a few
+one-time minutes per instance. Manifold's estimator learns your real
+numbers after each run, and every launch still passes the budget,
+ceiling, and policy guards.
 
 ## The desk-robot walkthrough, end to end
 
@@ -28,12 +31,14 @@ arm optional. Fetch it onto the persistent filesystem with one
 
 ```python
 # scripts/fetch_dataset.py  (upload via Browse, run with script-run)
+# Uses the python API, not the CLI: the CLI was renamed
+# (huggingface-cli -> hf) and will rename again; the API endures.
 import subprocess, sys
 subprocess.run([sys.executable, "-m", "pip", "install", "-q",
-                "huggingface_hub[cli]"], check=True)
-subprocess.run(["huggingface-cli", "download", "lerobot/pusht",
-                "--repo-type", "dataset",
-                "--local-dir", "/data/datasets/pusht"], check=True)
+                "huggingface_hub"], check=True)
+from huggingface_hub import snapshot_download
+snapshot_download("lerobot/pusht", repo_type="dataset",
+                  local_dir="/data/datasets/pusht")
 ```
 
 ### 1. Record demonstrations (at your desk, no cloud involved)
