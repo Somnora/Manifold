@@ -415,11 +415,19 @@ export function ClusterPanel() {
                         {info.description} (${info.price_usd_per_hour}/hr)
                       </option>
                     ))}
+                    {/* Names only. These options exist so the form still
+                        works before the catalog answers - but they carried
+                        hardcoded prices ($24.72/hr and friends), which is an
+                        invented number on the screen where the user decides
+                        to spend. The Est. Burn Rate below already says "rate
+                        unavailable" in this same state; this list has to
+                        agree with it. A price on this screen comes from the
+                        provider or it does not appear. */}
                     {!Object.keys(types).length && (
                       <>
-                        <option value="gpu_8x_h100_sxm5">8x H100 SXM5 ($24.72/hr)</option>
-                        <option value="gpu_8x_a100_80gb">8x A100 80GB ($15.12/hr)</option>
-                        <option value="gpu_4x_a100_80gb">4x A100 80GB ($7.56/hr)</option>
+                        <option value="gpu_8x_h100_sxm5">8x H100 SXM5 (rate loading)</option>
+                        <option value="gpu_8x_a100_80gb">8x A100 80GB (rate loading)</option>
+                        <option value="gpu_4x_a100_80gb">4x A100 80GB (rate loading)</option>
                       </>
                     )}
                   </select>

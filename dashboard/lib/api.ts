@@ -907,7 +907,14 @@ export const api = {
     }>("/models/pull", {
       method: "POST",
       body: JSON.stringify({ instance_id: instanceId, name }),
-      timeoutMs: 30 * 60_000,
+      // Four hours, not 30 minutes. The old budget happened to equal the
+      // default idle timeout, so a big model hit the client abort and the
+      // instance teardown at the same moment and the failure looked like a
+      // network problem. Transfers run at roughly 0.6-0.7 MB/s over the
+      // managed connection, so a 4.4 GB 7B student needs ~2 hours; a budget
+      // that cannot fit the largest model on the shelf is a budget that
+      // reports a false failure while the backend is still working.
+      timeoutMs: 4 * 60 * 60_000,
     }),
 
   installModel: (body: {

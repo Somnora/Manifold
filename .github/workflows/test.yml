@@ -1,0 +1,56 @@
+# The proof, on every push.
+#
+# Until 2026-08-14 the only workflow in this repo was `desktop`, which runs
+# on tags. So nothing checked the test suite on a normal push, and the
+# dashboard lockfile drifted out of sync for three weeks without anyone
+# noticing: it passed on the author's npm 11 and failed on CI's npm 10, and
+# the only job that would have caught it only ran on a release tag.
+#
+# This runs the two cheapest checks that would have caught that, plus the
+# suite the README's claims rest on.
+#
+# ZERO SPEND BY CONSTRUCTION. The backend tests use MockLambdaClient
+# exclusively (see CLAUDE.md); no cloud credentials are configured for this
+# workflow, so a test that tried to reach a provider would fail rather than
+# bill anyone.
+name: test
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Install
+        working-directory: backend
+        run: uv sync --dev
+      - name: Test
+        working-directory: backend
+        # Mocks only, no network, no spend. -q keeps the log readable; the
+        # exit code is what gates the job.
+        run: uv run pytest -q
+
+  dashboard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        # Pinned to the same major the desktop workflow uses, because the
+        # lockfile has to satisfy the STRICTEST npm that touches it - npm 10
+        # builds the full optional-dependency tree and npm 11 does not.
+        # Bumping this without re-running `npm install --package-lock-only`
+        # is how the break happened.
+        with: { node-version: 22 }
+      - name: Install from the lockfile
+        working-directory: dashboard
+        # `npm ci`, never `npm install`: this step exists to prove the
+        # committed lockfile is complete and installable on a machine that
+        # is not the author's.
+        run: npm ci --no-fund --no-audit
+      - name: Typecheck and build
+        working-directory: dashboard
+        run: npm run build

@@ -98,7 +98,7 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`
   "mcpServers": {
     "manifold": {
       "command": "uv",
-      "args": ["run", "--directory", "/Users/jamesmcshane/Desktop/Manifold/backend", "manifold-mcp"]
+      "args": ["run", "--directory", "/absolute/path/to/Manifold/backend", "manifold-mcp"]
     }
   }
 }

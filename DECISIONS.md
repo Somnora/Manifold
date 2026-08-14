@@ -4299,3 +4299,65 @@ field, which only works if the template metadata came through.
 disconnect does not cancel a pull - the backend finished writing and
 renamed the file correctly, which is the behaviour we want, but it is
 undocumented.
+
+## 2026-08-14 — Pre-launch audit: the pull could terminate the box it was pulling from
+
+A six-agent audit ahead of the public launch post. The CI break has its own
+entry above; these are the rest, in the order they matter.
+
+**A model pull over ~1.2 GB was guaranteed to fail, delete itself, AND
+terminate the paid instance.** The Phase 85 pull streams the whole file in
+one request and only called `dispatcher.touch_activity` AFTER the last byte
+landed. The idle timer defaults to 30 minutes and the transfer runs at
+0.6-0.7 MB/s, so anything past roughly 1.2 GB tripped it mid-flight: the
+instance was torn down under the download, the `.partial` was deleted by the
+error path, and the user had paid for a boot and got nothing. A 7B student
+(~4.4 GB Q4_K_M, ~113 minutes) could never be pulled at all. Three walls sat
+at exactly the same 30-minute mark - the idle timeout, the dashboard's client
+budget, and nothing else - so the failure read as a network problem rather
+than a self-inflicted teardown. The gate on 2026-08-14 only passed because a
+0.6B student is 379 MB, comfortably under the cliff.
+
+Fixed by touching activity INSIDE the loop, throttled by bytes (32 MiB)
+rather than chunks so the cost stays flat if the chunk size is tuned later,
+and by raising the dashboard budget to four hours - a client timeout that
+cannot fit the largest model on the shelf reports a false failure while the
+backend is still working. The underlying 0.6-0.7 MB/s (sequential 64 KiB
+request-response round trips in `sftp_read`) is still open and is the real
+fix; this makes the slow path survivable rather than fast.
+
+**An invented price survived on the one screen where it matters most.** The
+cluster launch panel's Est. Burn Rate correctly says "rate unavailable"
+before the catalog loads, but the GPU-type dropdown right above it still
+carried hardcoded "$24.72/hr" literals in its fallback options. Half the fix
+had been applied and the other half missed, on the screen where a user
+decides to spend. Names only now.
+
+**Two things a stranger would have hit immediately**, both from following
+our own words: `docs/mcp-setup.md` shipped the author's absolute home path
+inside a JSON block captioned "with YOUR absolute repo path", so a
+copy-paste gives you a directory that does not exist; and the launch post's
+quickstart omitted `cd backend`, `uv sync` and `npm install`, so pasting it
+into a fresh clone produced `ModuleNotFoundError: No module named 'app'`.
+The README was correct all along - the post had drifted from it.
+
+**A number in the post had no receipt.** It claimed a "$1.01 verification
+day ... per its own spend page", and $1.01 appears nowhere in this repo:
+the documented figures are $0.92, $0.35 and $1.83. In a post whose thesis is
+rigorous self-auditing, and which explicitly invites readers into
+DECISIONS.md, an uncorroborated dollar figure is the one error that cannot
+be afforded. Replaced with the itemised $3.10 the file actually backs.
+
+**Added `.github/workflows/test.yml`.** Until today the only workflow ran on
+tags, which is precisely why a broken lockfile survived three weeks. The
+suite and the dashboard build now run on every push, and `npm ci` (never
+`npm install`) is the step that proves the committed lockfile is installable
+by someone who is not the author.
+
+**Still open:** `releases/latest` is a 404 while `docs/desktop-build.md`
+tells you to share that URL, and the only downloadable artifact is a stale
+July prerelease - cutting a fresh tagged release is now unblocked because CI
+is green, but publishing one is the owner's call. The dispatch-too-early GPU
+race is still open (the readiness probe checks `nvidia-container-cli`, not
+`docker --gpus`). The single-shot file-download route touches activity once
+before streaming and so shares the pull's old shape for very large files.

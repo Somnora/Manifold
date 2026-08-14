@@ -572,3 +572,48 @@ def test_install_needs_the_model_to_be_in_the_library(client, library,
     resp = client.post("/models/install", json={"name": "absent.gguf"})
     assert resp.status_code == 404
     assert "Pull it from the instance first" in resp.json()["detail"]
+
+
+# -- what the 2026-08-14 audit found ------------------------------------------
+
+
+def test_a_long_pull_keeps_the_instance_alive(client, library, monkeypatch):
+    """A pull must count as activity WHILE it streams, not after.
+
+    The idle timer defaults to 30 minutes and the transfer runs at roughly
+    0.6-0.7 MB/s, so a file over ~1.2 GB used to trip it mid-flight: the
+    instance was terminated out from under the download, the partial was
+    deleted, and the user paid for a boot and got nothing. A 7B student
+    could never be pulled at all. touch_activity now fires inside the loop.
+    """
+    from tests.test_reconcile import launch_connected
+
+    _, instance_id = launch_connected(client)
+    dispatcher = client.app.state.dispatcher
+
+    # 96 MiB in 64 KiB chunks: three touch intervals at the 32 MiB throttle.
+    size = 96 * 1024 * 1024
+    store = client.app.state.orchestrator.connections[instance_id] \
+        .ssh_connection().sftp_files
+    store["/lambda/nfs/manifold-data/models/big.gguf"] = b"\0" * size
+
+    touches = []
+    real_touch = dispatcher.touch_activity
+
+    def counting_touch(iid):
+        touches.append(iid)
+        return real_touch(iid)
+
+    monkeypatch.setattr(dispatcher, "touch_activity", counting_touch)
+
+    resp = client.post("/models/pull", json={"instance_id": instance_id,
+                                             "name": "big.gguf"})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["bytes"] == size
+
+    # The final touch after completion is not enough on its own - the point
+    # is that the timer was reset DURING the transfer.
+    assert len(touches) >= 3, (
+        f"only {len(touches)} activity touches for a {size // 1048576} MiB "
+        f"pull; a long transfer must reset the idle timer as it goes")
+    assert all(t == instance_id for t in touches)

@@ -2886,11 +2886,27 @@ def create_app(
         # the library for the installer to pick up.
         partial = localmodels.partial_path(final)
         written = 0
+        # A long pull IS activity, and saying so is what keeps the instance
+        # alive to finish it. Without this the idle timer (30 min by
+        # default) fires MID-TRANSFER: the box is terminated out from under
+        # the download, the partial is deleted, and the user has paid for a
+        # boot and lost the model. At the measured 0.6-0.7 MB/s that put a
+        # hard ceiling near 1.2 GB - a 7B student could never be pulled at
+        # all, and the failure looked like a network problem rather than a
+        # self-inflicted teardown. Found by the 2026-08-14 audit.
+        #
+        # Throttled by BYTES, not chunks, so the cost stays flat however the
+        # chunk size is tuned later.
+        touch_every = 32 * 1024 * 1024
+        next_touch = touch_every
         try:
             with open(partial, "wb") as handle:
                 async for chunk in conn.sftp_read(remote):
                     handle.write(chunk)
                     written += len(chunk)
+                    if written >= next_touch:
+                        dispatcher.touch_activity(req.instance_id)
+                        next_touch = written + touch_every
         except ConnectionError as exc:
             partial.unlink(missing_ok=True)
             raise HTTPException(409, str(exc))
