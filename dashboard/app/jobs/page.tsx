@@ -411,7 +411,7 @@ export default function JobsPage() {
             (Phase 84). It sits beside the queue because the config is what
             axolotl-finetune above takes as its config_path. */}
         <div className="mt-6">
-          <DistillConfigPanel connectedInstances={connected.length} />
+          <DistillConfigPanel connected={connected} />
         </div>
       </section>
 

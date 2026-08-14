@@ -4114,3 +4114,65 @@ are curated but not verified against the HuggingFace API the way
 MODEL_PRESETS were. No real-GPU run has priced this loop, so every cost
 figure in docs/distill-your-own-model.md is marked unverified arithmetic
 except the $1.29/hr A10 rate.
+
+## 2026-08-14 — Phase 84 shipped green and broken; what the verifier found
+
+**What happened.** Phase 84 was merged to `main` on the strength of 919
+passing tests and a clean dashboard build. Both adversarial verifiers then
+returned FAIL. Neither had been read before the merge — that was the process
+failure, and it is the one worth remembering: *green tests are evidence about
+the tests, not about the product.* One test actively pinned a bug as correct.
+
+**The four that mattered**, each found by EXECUTING the thing rather than
+reading it:
+
+1. **llm-synthesize could exit 0 with a zero-byte training file.** With an
+   unreachable teacher every record died in the per-record `except`, the loop
+   carried on, and the job went green. The only gate lived inside
+   `if hold_every:` — so the DEFAULT path (holdout_pct=0) had no gate at all.
+   Nothing failed until axolotl choked on the empty file an hour and a GPU
+   later. The gate now sits outside the holdout branch.
+
+2. **llm-judge scraped scores out of its own reason field.** A reply of
+   `{"score": 0, "reason": "answered in 8 words"}` fell past the range check
+   into a `re.search` over the raw text, scored **8**, and was **kept** — the
+   one guard the template exists for, inverted by an incidental digit. Valid
+   JSON is now answered from its `score` field alone. The prose fallback
+   survives only for a reply that IS a number: digit-scraping read "worse
+   than 10 others, I give it 2" as a 10. Prose now goes unscored, which drops
+   the row rather than fabricating a verdict for it — the safe direction for a
+   curation guard, and a deliberate tightening.
+
+3. **llm-eval published `match_rate_pct: 0.0` when it had graded nothing.** An
+   unreachable judge produced a scorecard indistinguishable from a student
+   that genuinely lost every round, and exited 0. The rate is now `null` with
+   a nonzero exit when `n_graded` is 0; the card is still written because its
+   per-item replies are how you find out why. The test asserting the old
+   behavior as "the honest output" was rewritten — it is the clearest example
+   in this repo of a test that made a bug permanent.
+
+4. **The dashboard Distill panel was dead on first click.** `DistillConfig`
+   was declared with three invented field names (`config_yaml`/`student`/
+   `notes`) against a backend returning `{"config": {yaml, base_model, ...}}`,
+   so every field read `undefined`: the YAML pane rendered empty and Copy
+   copied "undefined". It typechecked perfectly, because the type was wrong at
+   both ends. The panel also posted `student` where the backend reads
+   `student_model` (silently dropped) and omitted the required `dataset`
+   (a 422 whose array-shaped detail rendered as a stringified array). Fixed by
+   taking the field names from the backend verbatim, and `detailToMessage` now
+   flattens FastAPI validation arrays for *every* route, not just this one.
+
+**Also fixed:** a JSON `null` answer became the truthy string `"None"` and was
+graded as if the teacher had written it; a hand-supplied `judge_model` skipped
+the only reachability check, so a dead judge was discovered *after* torch
+imported and a multi-gigabyte student loaded onto a billed GPU (now a
+one-token confirm); `DEFAULT_MINUTES` had no entry for llm-judge, llm-eval or
+lora-merge, so all three costed out at the 15-minute fallback; a fractional
+judge score truncated (8.7 → 8) instead of rounding; the holdout summary read
+"every 2th generated row"; and the reviewed `output_dir` is not binding —
+axolotl-finetune's `--output_dir` FLAG overrides the YAML key, so the review
+panel now prints the job parameter you must set to match, as an advisory.
+
+**Still open and deliberately not fixed here:** llm-eval's transformers calls
+have still only run against stub torch/transformers, and STUDENT_PRESETS' repo
+ids are curated but unverified. Both need the real-hardware gate.

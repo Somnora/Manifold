@@ -29,7 +29,16 @@ DEFAULT_MINUTES: dict[str, float | None] = {
     "sdxl-generate": 3,
     "script-run": 15,
     "llm-synthesize": 20,
+    # Both are one model call per row, like llm-synthesize, but over a set
+    # that has already been filtered - and llm-eval additionally loads the
+    # student in-process and generates from it, which is the slow half (and
+    # slower still on the documented student_device=cpu escape hatch).
+    # Without these two the fallback `.get(template, 15)` quietly costed
+    # them as 15-minute jobs. Found by the Phase 84 verifier, 2026-08-14.
+    "llm-judge": 15,
+    "llm-eval": 40,
     "axolotl-finetune": 120,
+    "lora-merge": 10,
     "tao-train": 120,
     "vllm-serve": None,        # a server: no fixed runtime, so no fixed cost
     "sglang-serve": None,      # same: serves until stopped

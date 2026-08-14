@@ -206,6 +206,13 @@ env:
     os.makedirs(out_dir, exist_ok=True)
     card_path = f"/data/outputs/{output_name}.json"
 
+    def stored_answer(value):
+        # A JSON null means "no teacher answer here", so it must read as
+        # missing and let the teacher be dialled. str(None) is "None", four
+        # truthy characters that used to be graded as if the teacher had
+        # actually written them. Found by the Phase 84 verifier.
+        return "" if value is None else str(value)
+
     def pair(row):
         # (task, stored teacher answer) for a held-out row, whichever shape
         # llm-synthesize wrote. Returns (None, None) for a row this template
@@ -214,12 +221,12 @@ env:
             task = str(row["instruction"])
             if row.get("input"):
                 task = task + "\n\n" + str(row["input"])
-            return task, str(row["output"])
+            return task, stored_answer(row["output"])
         if "record" in row and "synthesis" in row:
             task = json.dumps(row["record"], ensure_ascii=False)
             if instruction:
                 task = instruction + "\n\n" + task
-            return task, str(row["synthesis"])
+            return task, stored_answer(row["synthesis"])
         return None, None
 
     items = []
@@ -257,11 +264,33 @@ env:
                              f"{READY_TIMEOUT}s ({exc})")
                 time.sleep(2)
 
-    judge = judge_model or discover(judge_base, judge_key, "judge")
+    # A model id supplied by hand skips discover(), and discover() was the
+    # only thing that ever touched the judge before torch imported and a
+    # multi-gigabyte student loaded onto a billed GPU. So a hand-supplied id
+    # gets a one-token chat instead: it exercises the exact call the run
+    # depends on (every OpenAI-compatible endpoint implements it, which
+    # /models is not guaranteed to), and a dead URL or stale key now costs
+    # seconds rather than GPU minutes. Found by the Phase 84 verifier.
+    def confirm(base, key, model, what):
+        print(f"checking the {what} {model} at {base} ...", flush=True)
+        try:
+            chat(base, key, model, "Reply with OK.", "Say OK.")
+        except Exception as exc:
+            sys.exit(f"the {what} {model} at {base} did not answer ({exc}). "
+                     f"Check the URL, the model id, and that the key in "
+                     f"env_file is current.")
+
+    if judge_model:
+        judge = judge_model
+        confirm(judge_base, judge_key, judge, "judge")
+    else:
+        judge = discover(judge_base, judge_key, "judge")
     need_teacher = any(not stored for _task, stored in items)
     teacher = teacher_model
     if need_teacher and not teacher:
         teacher = discover(teacher_base, teacher_key, "teacher")
+    elif need_teacher and teacher:
+        confirm(teacher_base, teacher_key, teacher, "teacher")
     teacher_label = teacher or "(stored in the held-out file)"
 
     # Self-preference: a judge grading its own answers flatters itself, and
@@ -382,7 +411,15 @@ env:
 
     graded = student_wins + teacher_wins + ties
     matched_or_beat = student_wins + ties
-    rate = (100.0 * matched_or_beat / graded) if graded else 0.0
+    # A rate needs a denominator. When every item is unscored (an unreachable
+    # judge, or one that never returns a readable verdict) this used to
+    # publish match_rate_pct 0.0 and exit 0 - indistinguishable from a
+    # student that genuinely lost every round, in a file whose whole job is
+    # to be trusted. The sibling template even warns about "a meaningless
+    # 0%". Publish null and fail instead. Found by the Phase 84 verifier on
+    # 2026-08-14. The card is still written: the per-item replies in it are
+    # how you find out WHY the judge said nothing.
+    rate = (100.0 * matched_or_beat / graded) if graded else None
     card = {
         "student_path": student_dir,
         "student_device": device,
@@ -397,7 +434,7 @@ env:
         "ties": ties,
         "unscored": unscored,
         "matched_or_beat": matched_or_beat,
-        "match_rate_pct": round(rate, 1),
+        "match_rate_pct": round(rate, 1) if rate is not None else None,
         "ab_rule": "student is A on even item indexes (0-based), B on odd",
         "results": results,
     }
@@ -407,9 +444,17 @@ env:
     print(f"scorecard -> {card_path}", flush=True)
     print(f"student won {student_wins}, tied {ties}, lost {teacher_wins}, "
           f"unscored {unscored}", flush=True)
+    if rate is None:
+        sys.exit(f"no item could be scored ({unscored} unscored of "
+                 f"{len(items)}): the judge at {judge_base} never returned a "
+                 f"readable verdict, so there is no score to report. Its "
+                 f"actual replies are in {card_path} under results[].reason.")
     if judge_is_teacher:
         print(f"WARNING: judge == teacher ({judge}); the number below is the "
               f"teacher grading itself", flush=True)
+    if unscored:
+        print(f"NOTE: {unscored} of {len(items)} items were unscored and are "
+              f"excluded from the rate below.", flush=True)
     print(f"student matched or beat the teacher on {matched_or_beat}/{graded} "
           f"held-out tasks ({rate:.0f}%)", flush=True)
 

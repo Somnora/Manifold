@@ -435,7 +435,7 @@ def test_holdout_ten_splits_deterministically(tmp_path):
     train = _lines(data / "synthesized" / "d.jsonl")
     held = _lines(data / "synthesized" / "eval-d.jsonl")
     assert len(train) == 18 and len(held) == 2
-    assert "2 rows held back (every 10th generated row, 10%)" in result.stdout
+    assert "2 rows held back (1 row in every 10, 10%)" in result.stdout
     # Exactly the 10th and 20th records, and no held row leaked into
     # training (that leak is what would make the scorecard a lie).
     assert [json.loads(r["input"])["i"] for r in held] == [10, 20]
@@ -641,10 +641,17 @@ def test_judge_threshold_is_honoured_at_the_boundary(tmp_path):
     assert "kept 2 of 6 rows scoring >= 9, dropped 4" in result.stdout
 
 
-def test_judge_reads_fences_prose_and_refuses_to_guess(tmp_path):
-    """Models fence their JSON however firmly you ask them not to, and
-    sometimes answer in a sentence. Both parse. A reply that is neither is
-    UNSCORED: never silently kept, never silently dropped."""
+def test_judge_reads_fences_and_refuses_to_guess_at_prose(tmp_path):
+    """Models fence their JSON however firmly you ask them not to, so a
+    fenced reply parses. PROSE DOES NOT.
+
+    This used to scrape the first digit out of a sentence, which read
+    "I would give this an 8 out of 10" correctly and "worse than 10 others,
+    I give it 2" as a 10. Since a scraped score can KEEP a row the judge
+    meant to reject, the tie goes to unscored - which drops the row from
+    training rather than fabricating a verdict for it. The narrow prose
+    case that still counts (a reply that IS a number) has its own test.
+    """
     scores = {
         1: '```json\n{"score": 9, "reason": "fenced"}\n```',
         2: "I would give this an 8 out of 10.",
@@ -654,12 +661,12 @@ def test_judge_reads_fences_prose_and_refuses_to_guess(tmp_path):
                              reply=score_by_index(scores))
     assert result.returncode == 0, result.stderr
     scored = _lines(data / "synthesized" / "scored-train.jsonl")
-    assert [r["judge_score"] for r in scored] == [9, 8, None]
+    assert [r["judge_score"] for r in scored] == [9, None, None]
     kept = _lines(data / "synthesized" / "kept-train.jsonl")
-    assert len(kept) == 2
-    assert "kept 2 of 3 rows scoring >= 7, dropped 0, unscored 1" \
+    assert len(kept) == 1
+    assert "kept 1 of 3 rows scoring >= 7, dropped 0, unscored 2" \
         in result.stdout
-    assert "  unscored: 1" in result.stdout
+    assert "  unscored: 2" in result.stdout
 
 
 def test_judge_warns_when_the_kept_file_is_not_trainable(tmp_path):
@@ -943,16 +950,40 @@ def test_eval_counts_ties_separately_but_credits_them(tmp_path):
     assert "student won 0, tied 4, lost 0, unscored 0" in result.stdout
 
 
-def test_eval_never_invents_a_win_from_an_unreadable_judge(tmp_path):
-    """A judge answering nonsense scores nothing. 0/0 and 0% is the honest
-    output; crediting either side would be the failure mode."""
+def test_eval_refuses_to_publish_a_rate_it_could_not_measure(tmp_path):
+    """A judge answering nonsense scores nothing, and nothing is not zero.
+
+    This test used to assert the opposite - that 0/0 printing "0%" and
+    exiting 0 was "the honest output" - which is how the bug shipped green.
+    A scorecard reading match_rate_pct 0.0 is indistinguishable from a
+    student that genuinely lost every round, so the rate must be null and
+    the job must fail. Found by the Phase 84 verifier, 2026-08-14.
+    """
     result, card, _, _ = _eval(tmp_path, held(4), {},
                                pick=lambda a, b: "the vibes are immaculate")
-    assert result.returncode == 0, result.stderr
+    assert result.returncode != 0
     assert card["unscored"] == 4 and card["n_graded"] == 0
     assert card["student_wins"] == 0 and card["teacher_wins"] == 0
-    assert card["match_rate_pct"] == 0.0
-    assert "on 0/0 held-out tasks (0%)" in result.stdout
+    # Null, not 0.0: no denominator means no rate, not a rate of zero.
+    assert card["match_rate_pct"] is None
+    assert "no item could be scored" in result.stderr
+    # The card still exists: its per-item replies are how you find out why.
+    assert len(card["results"]) == 4
+
+
+def test_eval_excludes_unscored_items_from_the_rate_and_says_so(tmp_path):
+    """A partial judge outage must not quietly shrink the denominator."""
+    seen = {"n": 0}
+
+    def flaky(a, b):
+        seen["n"] += 1
+        return "TIE" if seen["n"] > 2 else "unreadable"
+
+    result, card, _, _ = _eval(tmp_path, held(4), {}, pick=flaky)
+    assert result.returncode == 0, result.stderr
+    assert card["unscored"] == 2 and card["n_graded"] == 2
+    assert card["match_rate_pct"] == 100.0
+    assert "2 of 4 items were unscored" in result.stdout
 
 
 def test_eval_reuses_the_stored_teacher_answer(tmp_path):
@@ -1178,7 +1209,11 @@ def test_a_good_config_comes_back_verbatim():
     assert result["base_model"] == "Qwen/Qwen2.5-1.5B-Instruct"
     assert result["dataset_path"] == "/data/synthesized/kept-tags.jsonl"
     assert result["output_dir"] == "/data/output/tags-lora"
-    assert result["advisories"] == []
+    # One advisory always rides along: axolotl-finetune's --output_dir FLAG
+    # overrides the output_dir in the file, so the reviewed path is only
+    # the real one if the job parameter is set to match it.
+    assert len(result["advisories"]) == 1
+    assert "output_dir parameter to 'tags-lora'" in result["advisories"][0]
 
 
 def test_a_config_with_no_validation_split_is_advised_not_refused():
@@ -1661,3 +1696,156 @@ def test_the_chain_renders_the_paths_the_next_link_reads(client):
             coerce_parameters(loaded["axolotl-finetune"],
                               dict(CHAIN[2][1])),
             filesystem="manifold-data", task_id="s4")
+
+
+# -- what the Phase 84 verifier found ----------------------------------------
+#
+# Every test below is a repro of a bug that shipped green on 2026-08-14,
+# written from the verifier's own executed evidence. They share one shape:
+# make the far end fail, then assert the job FAILS rather than producing a
+# confident-looking artifact. That is the class the original tests missed -
+# they all asserted the happy path, and one of them (the 0/0 scorecard)
+# actively pinned the bug as correct.
+
+
+def dead_port():
+    """A port nothing is listening on: bind, read, release."""
+    import socket
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+def test_synthesize_fails_when_every_record_failed(tmp_path):
+    """An unreachable teacher must not produce a green job and an empty
+    training file. This is the default path (holdout_pct=0): the old gate
+    lived inside the holdout branch, so the common case had none."""
+    rows = "".join(json.dumps({"i": i}) + "\n" for i in range(4))
+    result, data, _ = _synthesize(tmp_path, rows, {
+        "teacher_base_url": f"http://127.0.0.1:{dead_port()}/v1",
+        "teacher_model": "ghost",
+    })
+    assert result.returncode != 0, result.stdout
+    assert "no rows were synthesized" in result.stderr
+    out = data / "synthesized" / "synthesized.jsonl"
+    # The empty file may exist; what must not happen is exiting 0 beside it.
+    assert not out.exists() or out.read_text() == ""
+
+
+def test_synthesize_warns_when_only_some_records_failed(tmp_path):
+    """A partial outage still writes a dataset, but a silently shrunken
+    one is how you train on half your data without noticing."""
+    def flaky(payload):
+        # Keyed to the RECORD, not the call count: chat() retries three
+        # times, so a one-shot failure just succeeds on retry.
+        if '"i": 1' in payload["messages"][1]["content"]:
+            raise RuntimeError("boom")
+        return "ok"
+
+    rows = "".join(json.dumps({"i": i}) + "\n" for i in range(4))
+    result, data, _ = _synthesize(tmp_path, rows, {}, reply=flaky)
+    assert result.returncode == 0, result.stderr
+    assert "WARNING:" in result.stdout and "records failed" in result.stdout
+
+
+def test_judge_never_scrapes_a_score_out_of_its_own_reason(tmp_path):
+    """{"score": 0, "reason": "answered in 8 words"} scored 8 and was KEPT:
+    an out-of-range score fell through to a digit search over the raw reply,
+    inverting the one guard this template exists to provide."""
+    rows = json.dumps({"instruction": "Tag it.", "input": "{}",
+                       "output": "junk"}) + "\n"
+    result, data, _ = _judge(
+        tmp_path, rows, {"threshold": 7, "criteria": "names the shot type"},
+        reply=lambda p: '{"score": 0, "reason": "answered in 8 words"}')
+    assert result.returncode != 0 or True     # exit code is the no-kept gate
+    kept = (data / "synthesized" / "kept-train.jsonl")
+    assert kept.read_text() == "", "a score of 0 was kept"
+    scored = json.loads((data / "synthesized" / "scored-train.jsonl")
+                        .read_text().strip())
+    assert scored["judge_score"] is None
+    assert "outside 1-10" in scored["judge_reason"]
+
+
+def test_judge_treats_an_out_of_range_score_as_unscored(tmp_path):
+    rows = json.dumps({"instruction": "Tag it.", "input": "{}",
+                       "output": "junk"}) + "\n"
+    result, data, _ = _judge(
+        tmp_path, rows, {"threshold": 7, "criteria": "names the shot type"},
+        reply=lambda p: '{"score": 42, "reason": "beats 9 of the others"}')
+    assert (data / "synthesized" / "kept-train.jsonl").read_text() == ""
+
+
+def test_judge_does_not_read_a_digit_out_of_prose(tmp_path):
+    """"worse than 10 others, I give it 2" used to score 10 (first match)."""
+    rows = json.dumps({"instruction": "Tag it.", "input": "{}",
+                       "output": "junk"}) + "\n"
+    result, data, _ = _judge(
+        tmp_path, rows, {"threshold": 7, "criteria": "names the shot type"},
+        reply=lambda p: "This answer is worse than 10 others, I give it 2.")
+    assert (data / "synthesized" / "kept-train.jsonl").read_text() == ""
+
+
+def test_judge_accepts_a_bare_number_reply(tmp_path):
+    """The prose fallback still exists, narrowed to a reply that IS a
+    number - the case it was actually for."""
+    rows = json.dumps({"instruction": "Tag it.", "input": "{}",
+                       "output": "good"}) + "\n"
+    result, data, _ = _judge(
+        tmp_path, rows, {"threshold": 7, "criteria": "names the shot type"},
+        reply=lambda p: "9")
+    assert len((data / "synthesized" / "kept-train.jsonl")
+               .read_text().strip().splitlines()) == 1
+
+
+def test_judge_rounds_a_fractional_score_instead_of_truncating(tmp_path):
+    """int(8.7) is 8, which quietly moves every fractional score down."""
+    rows = json.dumps({"instruction": "Tag it.", "input": "{}",
+                       "output": "good"}) + "\n"
+    result, data, _ = _judge(
+        tmp_path, rows, {"threshold": 9, "criteria": "names the shot type"},
+        reply=lambda p: '{"score": 8.7, "reason": "close"}')
+    scored = json.loads((data / "synthesized" / "scored-train.jsonl")
+                        .read_text().strip())
+    assert scored["judge_score"] == 9
+
+
+def test_judge_does_not_judge_a_row_with_a_null_answer(tmp_path):
+    """A JSON null became the string "None" and was judged on its merits."""
+    rows = json.dumps({"instruction": "Tag it.", "input": "{}",
+                       "output": None}) + "\n"
+    result, data, state = _judge(
+        tmp_path, rows, {"threshold": 7, "criteria": "names the shot type"},
+        reply=lambda p: '{"score": 9}')
+    assert state["chats"] == [], "a null answer was sent to the judge"
+    assert (data / "synthesized" / "kept-train.jsonl").read_text() == ""
+
+
+def test_eval_dials_the_teacher_for_a_null_stored_answer(tmp_path):
+    """"output": null is an absent answer, not the four-character teacher
+    reply "None"."""
+    rows = json.dumps({"instruction": "Tag it.", "input": "{}",
+                       "output": None}) + "\n"
+    result, card, state, _ = _eval(tmp_path, rows,
+                                   {"teacher_model": "stub/teacher"},
+                                   pick=lambda a, b: "TIE")
+    assert result.returncode == 0, result.stderr
+    # One of the calls is a teacher call, not the judge's comparison.
+    assert any(not c["messages"][0]["content"].startswith("You compare")
+               for c in state["chats"])
+    assert card["results"][0]["teacher_answer"] != "None"
+
+
+def test_eval_confirms_a_named_judge_before_loading_the_student(tmp_path):
+    """A hand-supplied judge_model skipped discovery, so a dead judge was
+    only found after torch imported and a multi-gigabyte student loaded
+    onto a billed GPU."""
+    result, card, _, gen_log = _eval(tmp_path, held(4), {
+        "judge_base_url": f"http://127.0.0.1:{dead_port()}/v1",
+        "judge_model": "ghost",
+    })
+    assert result.returncode != 0
+    assert "did not answer" in result.stderr
+    assert "loading student" not in result.stdout
+    assert not gen_log.exists(), "the student was loaded before the check"

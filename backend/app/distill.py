@@ -339,6 +339,20 @@ def validate_config(text: str, *, dataset: str,
             "no val_set_size: the run will report training loss only, with "
             "no held-out loss to show overfitting.")
 
+    # The reviewed output_dir is NOT automatically the one that gets used.
+    # axolotl-finetune's command passes `--output_dir /data/output/{{...}}`
+    # as a CLI flag, and the flag beats the YAML key - so a user who reviews
+    # and approves this config, then queues the job at its default
+    # output_dir, gets the adapter somewhere else and a confusing not-found
+    # at the lora-merge step, after paying for the whole training run. Say
+    # so on the review screen, where it is still free. Found by the Phase 84
+    # verifier, 2026-08-14.
+    advisories.append(
+        f"when you queue axolotl-finetune, set its output_dir parameter to "
+        f"'{output_dir[len(OUTPUT_DIR) + 1:]}': the job's flag overrides the "
+        f"output_dir in this file, so leaving it at the default writes the "
+        f"adapter elsewhere and lora-merge will not find it.")
+
     return {
         "yaml": cleaned,
         "parsed": parsed,

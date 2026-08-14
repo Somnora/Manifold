@@ -56,14 +56,36 @@ async function request<T>(
     // 401 means the backend enforces its API token and this browser does
     // not hold it (or holds a stale one): raise the TokenGate.
     if (resp.status === 401) notifyUnauthorized();
-    const err = new ApiError(
-      resp.status,
-      body.detail ?? `HTTP ${resp.status}`,
-    );
+    // FastAPI answers a request-model violation with detail as an ARRAY of
+    // {loc, msg, type} objects, and handing that straight to ApiError put a
+    // stringified array on screen ("[object Object]" territory) instead of a
+    // sentence. Every route that takes a body can produce this shape, so it
+    // is flattened here rather than at one call site. Found by the Phase 84
+    // verifier on 2026-08-14.
+    const err = new ApiError(resp.status, detailToMessage(body.detail, resp.status));
     err.body = body;
     throw err;
   }
   return body as T;
+}
+
+// A FastAPI error detail is either a plain string (everything Manifold
+// raises by hand) or a validation array. Both have to read as one sentence.
+function detailToMessage(detail: unknown, status: number): string {
+  if (typeof detail === "string" && detail) return detail;
+  if (Array.isArray(detail)) {
+    const parts = detail.map((d) => {
+      const item = d as { loc?: unknown[]; msg?: string };
+      // loc is ["body", "<field>"]; the field name is what the user needs.
+      const field = Array.isArray(item.loc)
+        ? item.loc.filter((x) => x !== "body").join(".")
+        : "";
+      const msg = item.msg ?? "is invalid";
+      return field ? `${field}: ${msg}` : msg;
+    });
+    if (parts.length) return parts.join("; ");
+  }
+  return `HTTP ${status}`;
 }
 
 export type UnpersistedFile = {
@@ -434,12 +456,35 @@ export type Brain = {
 // Phase 84: a draft training config, written by a brain from a plain-words
 // spec and checked by the backend before it comes back. It is text for the
 // user to read: Manifold never saves it and never trains from it.
+// These field names are the BACKEND's, verbatim (main.py returns
+// {"config": {...}} and distill.validate_config builds the inner object).
+// They were invented here once - config_yaml/student/notes - and every one
+// of them read as undefined at runtime, so the YAML pane rendered empty and
+// Copy copied "undefined" while the tests stayed green. Found by the Phase
+// 84 verifier on 2026-08-14; if these ever drift again, the panel goes
+// blank, not red.
 export type DistillConfig = {
-  config_yaml: string;
+  yaml: string;
   // The base model the brain settled on (its own pick when the user left
   // the student field empty).
-  student: string;
-  notes: string;
+  base_model: string;
+  dataset_path: string;
+  output_dir: string;
+  // Things worth knowing that are not refusals (a missing val_set_size, a
+  // base the training template does not mount).
+  advisories: string[];
+  brain: string;
+  suggested_path: string;
+};
+
+export type StudentPreset = {
+  model_id: string;
+  label: string;
+  params_b: number;
+  vram_gib: number;
+  tier: string;
+  license: string;
+  note: string;
 };
 
 export type Approval = {
@@ -815,17 +860,27 @@ export const api = {
   // A CLI brain (claude/codex/gemini) is given several minutes to answer, so
   // the default 30s abort would report a client failure while the backend was
   // still working, and the user would ask again and pay twice.
+  // `dataset` is REQUIRED by the backend (Field(min_length=1)) and
+  // `student_model` is its name for the pinned student - not `student`,
+  // which the backend silently ignored while the UI thought it had pinned
+  // one. Both spellings are the backend's; keep them in step with
+  // DistillConfigRequest in main.py.
   distillConfig: (body: {
     spec: string;
     brain: string;
-    dataset?: string;
-    student?: string;
+    dataset: string;
+    student_model?: string;
   }) =>
-    request<DistillConfig>("/distill/config", {
+    request<{ config: DistillConfig }>("/distill/config", {
       method: "POST",
       body: JSON.stringify(body),
       timeoutMs: 5 * 60_000,
-    }),
+    }).then((r) => r.config),
+
+  studentPresets: () =>
+    request<{ presets: StudentPreset[] }>("/student-presets").then(
+      (r) => r.presets,
+    ),
 
   approvals: () =>
     request<{ approvals: Approval[]; timeout_seconds: number }>(

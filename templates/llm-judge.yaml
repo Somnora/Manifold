@@ -140,6 +140,14 @@ env:
     scored_path = f"/data/synthesized/scored-{stem}.jsonl"
     kept_path = f"/data/synthesized/kept-{stem}.jsonl"
 
+    def answer_of(value):
+        # A JSON null is an absent answer, not the four-character string
+        # "None" - which is what str() makes of it, and which the judge would
+        # then dutifully score as if the teacher had written it. Found by the
+        # Phase 84 verifier. An empty answer is caught in the loop below and
+        # counted as unscored, so it is never kept.
+        return "" if value is None else str(value)
+
     def pair(row):
         # (task, answer) for a synthesized row, whichever shape it came in.
         # Returns (None, None) for a row this template cannot read, so the
@@ -148,10 +156,10 @@ env:
             task = str(row["instruction"])
             if row.get("input"):
                 task = task + "\n\n" + str(row["input"])
-            return task, str(row["output"])
+            return task, answer_of(row["output"])
         if "record" in row and "synthesis" in row:
             return (json.dumps(row["record"], ensure_ascii=False),
-                    str(row["synthesis"]))
+                    answer_of(row["synthesis"]))
         return None, None
 
     rows = []
@@ -240,24 +248,51 @@ env:
             s = s.strip()
         try:
             data = json.loads(s)
-            score = int(data["score"])
-            if 1 <= score <= 10:
-                return score, str(data.get("reason", ""))
         except Exception:
-            pass
-        found = re.search(r"\b(10|[1-9])\b", content)
-        if found:
-            return int(found.group(1)), content.strip()[:200]
+            data = None
+        # A reply that IS valid JSON is answered from its score field ALONE;
+        # the text search below never sees it. It used to fall through on an
+        # out-of-range score, so a judge that said
+        #   {"score": 0, "reason": "answered in 8 words"}
+        # had the 8 scraped out of its own reason and the row was KEPT - the
+        # curation guard, which is the entire point of this template,
+        # inverted by an incidental digit. Found by the Phase 84 verifier on
+        # 2026-08-14 (measured: score 0 -> kept, score 42 -> 9 -> kept).
+        if isinstance(data, dict) and "score" in data:
+            reason = str(data.get("reason", ""))
+            try:
+                # round, not int(): a judge answering 8.7 on a 1-10 scale
+                # meant nearly 9, and truncation quietly moves every
+                # fractional score down one.
+                score = int(round(float(data["score"])))
+            except (TypeError, ValueError):
+                return None, f"score is not a number: {reason or s[:150]}"[:200]
+            if 1 <= score <= 10:
+                return score, reason
+            return None, (f"score {data['score']!r} is outside 1-10, so this "
+                          f"row is unscored. {reason}")[:200]
+        # Not JSON at all. Only a reply that is JUST a number counts: a
+        # search for a digit anywhere in prose reads "worse than 10 others,
+        # I give it 2" as a 10.
+        bare = content.strip().rstrip(".").strip()
+        if re.fullmatch(r"10|[1-9]", bare):
+            return int(bare), "judge answered with a bare number"
         return None, content.strip()[:200]
 
     histogram = {}
     kept = dropped = unscored = 0
     with open(scored_path, "w") as scored_out, open(kept_path, "w") as kept_out:
         for i, (row, task, answer) in enumerate(rows, 1):
-            try:
-                score, reason = parse_score(ask(task, answer))
-            except Exception as exc:
-                score, reason = None, f"judge call failed after retries: {exc}"
+            if not answer.strip():
+                # Nothing to judge. Unscored rather than sent to the judge,
+                # which would score the empty string on its merits.
+                score, reason = None, "the row has no answer to judge"
+            else:
+                try:
+                    score, reason = parse_score(ask(task, answer))
+                except Exception as exc:
+                    score, reason = None, (f"judge call failed after retries: "
+                                           f"{exc}")
             scored_row = dict(row)
             scored_row["judge_score"] = score
             scored_row["judge_reason"] = reason
