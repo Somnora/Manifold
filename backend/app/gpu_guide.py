@@ -166,6 +166,11 @@ _FAMILIES: tuple[tuple[re.Pattern, FamilyNotes], ...] = tuple(
                 "memory is the wall even at 8x, or Blackwell capacity "
                 "near you gets cheap enough to matter."
             ),
+            note=(
+                "Measured here 2026-08-14: Qwen2.5-7B fp16 generated 168 "
+                "tokens/s single-stream on one SXM5 card, end to end "
+                "through Manifold's managed SSH forward."
+            ),
         )),
         (r"^B200", FamilyNotes(
             family="B200",

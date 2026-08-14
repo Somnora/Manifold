@@ -4556,3 +4556,40 @@ coordinate separate machines, not distributed training.
 Also in this change: hn-post.md's stale counts corrected against measured
 reality (over 970 tests, 37 MCP tools, ~50k tracked lines - the old "13k"
 undercounted by 4x), and a README paragraph pointing at the guide.
+
+## 2026-08-14 — The H100 gate: $2.00, three receipts and one honest miss
+
+One gpu_1x_h100_sxm5 ($4.29/hr, us-south-2, Somnora-South colocated),
+launched with a 2h lifetime ceiling. Manifold's own budget guard refused
+the launch first - $4.29/hr against the $4.00 guardrail - which is the
+guard binding its author's agent exactly as designed; the ceiling was
+raised to $5.00 for the authorized gate and restored to $4.00 at teardown.
+
+**1. The dispatch-too-early race fix held at T+0.** gpu-smoke was
+dispatched the same second the SSH connection came up - the exact window
+that killed the mini-gate job - and succeeded: the new probe's final stage
+(`docker run --rm --gpus all ubuntu:24.04 nvidia-smi -L`) held dispatch
+until a real container could see the GPU. One clean pass cannot prove the
+race extinct (it is a timing window), but the probe now exercises the
+exact path that fails, which the two host-side checks never did.
+
+**2. The pull fixes verified live, with an honest number.** A 2,048 MB
+file pulled home completely (renamed only at the last byte) while
+idle_seconds sampled 2-10s throughout - before the touch fix that counter
+would have climbed to 1,800 and terminated the box mid-transfer.
+Throughput: ~3 MB/s sustained cross-country. That is 4.5x the old 0.65
+MB/s, and NOT the 9.7 MB/s the loopback benchmark promised - RTT to
+us-south-2 is real, and the transfer still awaits each 4 MiB chunk in
+sequence (asyncssh parallelises within a read, not across reads).
+Cross-chunk pipelining is the next rung of this fix and is filed, not
+claimed.
+
+**3. The H100 ladder rung has a receipt.** Qwen2.5-7B fp16, single
+stream, 256-token generations through the whole real path (vLLM behind
+the managed SSH forward): 178/165/168 tok/s, median 168. Recorded in the
+hardware guide's H100 note with its date, as a measurement - the fits
+numbers beside it remain labelled arithmetic.
+
+Termination clean (rescue hook ran, nothing unsaved), zero orphans, test
+files removed from both ends. Gate total per the spend page: $2.00.
+Running total for all real-hardware gates: $5.10.
