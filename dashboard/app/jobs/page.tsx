@@ -16,6 +16,7 @@ import { ParameterForm } from "@/components/ParameterForm";
 import { EstimateWidget } from "@/components/EstimateWidget";
 import { TemplateEditor } from "@/components/TemplateEditor";
 import { DistillConfigPanel } from "@/components/DistillConfigPanel";
+import { OwnItLocallyPanel } from "@/components/OwnItLocallyPanel";
 import {
   AutoManageControls,
   type AutoManageState,
@@ -412,6 +413,7 @@ export default function JobsPage() {
             axolotl-finetune above takes as its config_path. */}
         <div className="mt-6">
           <DistillConfigPanel connected={connected} />
+          <OwnItLocallyPanel connected={connected} />
         </div>
       </section>
 

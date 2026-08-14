@@ -477,6 +477,22 @@ export type DistillConfig = {
   suggested_path: string;
 };
 
+// Phase 85: a model that lives on THIS machine, in DATA_ROOT/models.
+export type LocalModel = {
+  name: string;
+  path: string;
+  size_bytes: number;
+  suggested_ollama_name: string;
+  installed: boolean;
+};
+
+export type LocalModelLibrary = {
+  models: LocalModel[];
+  library_path: string;
+  ollama_available: boolean;
+  ollama_models: string[];
+};
+
 export type StudentPreset = {
   model_id: string;
   label: string;
@@ -876,6 +892,33 @@ export const api = {
       body: JSON.stringify(body),
       timeoutMs: 5 * 60_000,
     }).then((r) => r.config),
+
+  localModels: () => request<LocalModelLibrary>("/models/local"),
+
+  // Moves a whole model over SSH, so it gets a generous budget: the
+  // default 30s would report a failure while the transfer was still
+  // running, and the user would start it again.
+  pullModel: (instanceId: string, name: string) =>
+    request<{
+      name: string;
+      path: string;
+      bytes: number;
+      suggested_ollama_name: string;
+    }>("/models/pull", {
+      method: "POST",
+      body: JSON.stringify({ instance_id: instanceId, name }),
+      timeoutMs: 30 * 60_000,
+    }),
+
+  installModel: (body: {
+    name: string;
+    ollama_name?: string;
+    overwrite?: boolean;
+  }) =>
+    request<{ name: string; ollama_name: string; brain_ref: string }>(
+      "/models/install",
+      { method: "POST", body: JSON.stringify(body), timeoutMs: 10 * 60_000 },
+    ),
 
   studentPresets: () =>
     request<{ presets: StudentPreset[] }>("/student-presets").then(

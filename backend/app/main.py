@@ -37,7 +37,7 @@ from pydantic import BaseModel, Field
 
 from .sidecar_client import SidecarError
 
-from .config import Settings, load_settings
+from .config import DATA_ROOT, Settings, load_settings
 from .connections import MockSSHConnection
 from .db import Database, utcnow
 from .config import update_env_file
@@ -67,6 +67,7 @@ from .auth import (
     token_matches,
     valid_principal_name,
 )
+from . import localmodels
 from .dispatcher import Dispatcher, ParameterError, coerce_parameters
 from .model_client import MockModelClient, ModelClientError
 from .notifications import NotificationCenter, os_notify
@@ -387,6 +388,27 @@ class DistillConfigRequest(BaseModel):
     student_model: str = Field(default="", max_length=200)
 
 
+class ModelPullRequest(BaseModel):
+    # Module level, not nested in create_app - see PrincipalRequest above.
+    # Which running instance to pull through: the persistent filesystem is
+    # only reachable over a managed SSH connection, so a pull needs one.
+    instance_id: str = Field(min_length=1, max_length=128)
+    # The .gguf's bare filename under <filesystem>/models (gguf-quantize's
+    # output_name plus .gguf). A filename, never a path: the remote path and
+    # the local destination are both built by the backend.
+    name: str = Field(min_length=1, max_length=128)
+
+
+class ModelInstallRequest(BaseModel):
+    # A file already in the local library (GET /models/local).
+    name: str = Field(min_length=1, max_length=128)
+    # What it will answer to in Ollama, and in the brain picker.
+    ollama_name: str = Field(default="", max_length=64)
+    # Ollama's `create` overwrites an existing name without asking; this
+    # makes that the caller's explicit decision rather than a side effect.
+    overwrite: bool = False
+
+
 class AgentContextUpdateRequest(BaseModel):
     workspace_environment: dict | None = None
     active_gpu_connections: dict | None = None
@@ -691,6 +713,10 @@ def create_app(
     # the request line, secret and all).
     nonces = NonceStore()
     app.state.download_nonces = nonces
+    # Phase 85: where pulled .gguf models live on THIS machine. On app.state
+    # so the desktop build (DATA_ROOT outside the repo) and tests can point
+    # it elsewhere without reaching into config.
+    app.state.model_library = localmodels.library_dir(DATA_ROOT)
 
     # Phase 79: tokens resolve to NAMED principals. The .env token is
     # "owner"; additional tokens are minted through /principals and land
@@ -2753,6 +2779,208 @@ def create_app(
             f"(student {config['base_model']}); review only, nothing saved")
         return {"config": {**config, "brain": req.brain,
                            "suggested_path": distill.config_filename(dataset)}}
+
+    # -- the local model library (Phase 85) ----------------------------------------
+
+    def _library():
+        """The library directory, created on demand.
+
+        Read off app.state rather than recomputed, so a test (and the
+        desktop build, which moves DATA_ROOT out of the repo) can point it
+        somewhere else without reaching into config.
+        """
+        root = app.state.model_library
+        root.mkdir(parents=True, exist_ok=True)
+        return root
+
+    def _ollama_binary() -> str:
+        """Ollama's path, or "" when it is not installed.
+
+        which_with_fallback, not shutil.which: a macOS app launched from
+        Finder inherits launchd's bare PATH and cannot see a Homebrew
+        install (the same bug that reported "No brains found" to a user
+        logged into all three CLIs).
+        """
+        from .brains import which_with_fallback
+        return which_with_fallback("ollama") or ""
+
+    async def _installed_ollama_models(executable: str) -> list[str]:
+        """`ollama list`, parsed. Never raises: this decorates the library
+        listing, and a listing that 500s because Ollama is mid-upgrade is
+        worse than one that cannot say what is installed."""
+        if not executable:
+            return []
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                executable, "list",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL)
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+        except (OSError, asyncio.TimeoutError):
+            return []
+        return localmodels.parse_ollama_list(stdout.decode(errors="replace"))
+
+    @app.get("/models/local")
+    async def list_local_models():
+        """What is in the library on THIS machine, and whether Ollama is
+        here to run it.
+
+        `ollama` absent is a normal answer, not an error: the library still
+        holds real files, and the UI degrades to "here is the path and the
+        command" rather than offering a button that cannot work.
+        """
+        executable = _ollama_binary()
+        installed = await _installed_ollama_models(executable)
+        models = []
+        for path in sorted(_library().glob("*" + localmodels.GGUF_SUFFIX)):
+            suggested = localmodels.default_ollama_name(path.name)
+            models.append({
+                "name": path.name,
+                "path": str(path),
+                "size_bytes": path.stat().st_size,
+                "suggested_ollama_name": suggested,
+                "installed": localmodels.is_installed(suggested, installed),
+            })
+        return {"models": models, "library_path": str(_library()),
+                "ollama_available": bool(executable),
+                "ollama_models": installed}
+
+    @app.post("/models/pull")
+    async def pull_model(req: ModelPullRequest):
+        """Bring a quantized model home over the managed SSH connection.
+
+        Not the browser download route: the backend has to be able to find
+        this file again in order to install it, and a file the browser
+        routed into ~/Downloads is one Manifold can only talk about. It
+        lands in DATA_ROOT/models, beside manifold.db.
+
+        Pull BEFORE you terminate. The filesystem is reached through a
+        running instance, so a filesystem with no instance attached is
+        unreachable - that is a property of how storage is mounted, not a
+        limitation this route could work around.
+        """
+        try:
+            name = localmodels.validate_gguf_name(req.name)
+            final = localmodels.destination(_library(), name)
+        except localmodels.LocalModelError as exc:
+            raise HTTPException(422, str(exc))
+        _library()
+
+        conn = _connected(req.instance_id)
+        remote = _resolve_remote_path(req.instance_id, f"models/{name}")
+        try:
+            total = await conn.sftp_size(remote)
+        except FileNotFoundError:
+            raise HTTPException(
+                404,
+                f"{remote} is not on the instance. gguf-quantize writes "
+                f"<output_name>.gguf into <filesystem>/models; check the job "
+                f"finished and the name matches.")
+        except ConnectionError as exc:
+            raise HTTPException(409, str(exc))
+        except Exception as exc:
+            raise HTTPException(502, f"pull failed: {exc}")
+
+        # Written to .partial and renamed only once the last byte lands, so
+        # an interrupted transfer never leaves a plausible-looking model in
+        # the library for the installer to pick up.
+        partial = localmodels.partial_path(final)
+        written = 0
+        try:
+            with open(partial, "wb") as handle:
+                async for chunk in conn.sftp_read(remote):
+                    handle.write(chunk)
+                    written += len(chunk)
+        except ConnectionError as exc:
+            partial.unlink(missing_ok=True)
+            raise HTTPException(409, str(exc))
+        except Exception as exc:
+            partial.unlink(missing_ok=True)
+            raise HTTPException(502, f"pull failed after {written} bytes: {exc}")
+        if written != total:
+            partial.unlink(missing_ok=True)
+            raise HTTPException(
+                502,
+                f"pull is short: {written} of {total} bytes arrived. Nothing "
+                f"was added to the library; try again.")
+        partial.replace(final)
+
+        dispatcher.touch_activity(req.instance_id)
+        db.record_audit(current_principal(), "model_pull",
+                        f"{req.instance_id}:{remote} -> {final} "
+                        f"({written} bytes)")
+        return {"name": name, "path": str(final), "bytes": written,
+                "suggested_ollama_name": localmodels.default_ollama_name(name)}
+
+    @app.post("/models/install")
+    async def install_model(req: ModelInstallRequest):
+        """Register a library model with Ollama, which puts it in the brain
+        picker.
+
+        No new brain code exists for this: 127.0.0.1:11434 is already a
+        probed local endpoint, so an installed model turns up as
+        `local:ollama/<name>` within the detection cache window. That is the
+        whole point of installing rather than inventing a fourth brain kind.
+        """
+        try:
+            name = localmodels.validate_gguf_name(req.name)
+            source = localmodels.destination(_library(), name)
+            ollama_name = localmodels.validate_ollama_name(
+                req.ollama_name or localmodels.default_ollama_name(name))
+        except localmodels.LocalModelError as exc:
+            raise HTTPException(422, str(exc))
+        if not source.exists():
+            raise HTTPException(
+                404,
+                f"{name} is not in the library ({_library()}). Pull it from "
+                f"the instance first.")
+
+        executable = _ollama_binary()
+        if not executable:
+            raise HTTPException(
+                409,
+                f"Ollama is not installed on this machine, so there is "
+                f"nothing to install into. The model is already yours at "
+                f"{source} - install Ollama from ollama.com and run: "
+                f"ollama create {ollama_name} -f <Modelfile>")
+
+        installed = await _installed_ollama_models(executable)
+        if localmodels.is_installed(ollama_name, installed) and not req.overwrite:
+            raise HTTPException(
+                409,
+                f"Ollama already has a model named '{ollama_name}'. Choose "
+                f"another name, or pass overwrite to replace it.")
+
+        modelfile = _library() / f"{ollama_name}.Modelfile"
+        try:
+            modelfile.write_text(localmodels.modelfile_text(source))
+        except localmodels.LocalModelError as exc:
+            raise HTTPException(422, str(exc))
+
+        argv = localmodels.install_argv(executable, ollama_name, modelfile)
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *argv,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT)
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=600)
+        except asyncio.TimeoutError:
+            proc.kill()
+            raise HTTPException(
+                504, "ollama create took over 10 minutes and was stopped.")
+        except OSError as exc:
+            raise HTTPException(502, f"could not run ollama: {exc}")
+        output = stdout.decode(errors="replace")[-2000:]
+        if proc.returncode != 0:
+            raise HTTPException(
+                502,
+                f"ollama create exited {proc.returncode}: {output.strip()[-600:]}")
+
+        db.record_audit(current_principal(), "model_install",
+                        f"{name} -> ollama:{ollama_name}")
+        return {"name": name, "ollama_name": ollama_name,
+                "brain_ref": f"local:ollama/{ollama_name}",
+                "output": output}
 
     # -- capacity watches ---------------------------------------------------------------
 

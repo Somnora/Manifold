@@ -346,6 +346,53 @@ That means it wants the card. vLLM takes 90% of the GPU by default, so on a
 3. **`student_device: cpu`.** Fits beside anything, and is slow. Good for a
    20-row smoke test, not a 500-row scorecard.
 
+## 9. Own it locally
+
+A scorecard you like means the student is worth keeping. Right now it lives
+on a filesystem you reach by paying for an instance. Three steps take it off
+that filesystem for good.
+
+**Quantize it on the box.** Queue `gguf-quantize` with `model_dir` set to the
+merged model (the `lora-merge` output). It converts to GGUF and quantizes to
+`Q4_K_M` by default, writing `<output_name>.gguf` beside the model:
+
+    model_dir: my-student
+    output_name: my-student
+    quant: Q4_K_M
+
+This is CPU work, so chain it onto the instance that just did the merge
+rather than booting anything for it (`depends_on` the merge task, same
+target instance). A 1.5B student is roughly 3 GB of f16 safetensors and about
+1 GB as Q4_K_M, so the thing you download is a third the size. Q5_K_M is
+slightly better and slightly bigger; Q8_0 is near-lossless at about twice
+Q4; F16 skips quantization entirely.
+
+**Pull it home.** Jobs page -> **Own it locally** -> name the .gguf -> Pull.
+It comes down the managed SSH connection into your library at
+`<data dir>/models`, written to a `.partial` and renamed only when the last
+byte lands, so an interrupted transfer never leaves a half file that looks
+like a model.
+
+> **Pull before you terminate.** The persistent filesystem is only reachable
+> through a running instance. Once the box is gone the file is still on the
+> filesystem, but nothing can fetch it until you attach another instance.
+
+**Install it.** If Ollama is on your machine, the library list offers
+**Install into Ollama**. Manifold writes a one-line Modelfile (`FROM` the
+.gguf and nothing else, because a GGUF carries its own chat template and a
+guessed one would make the model babble) and runs `ollama create`.
+
+Then the part worth waiting for: **it appears in the brain picker**, as
+`local:ollama/my-student`, within about ten seconds. No new setting, no new
+brain type - the backend already probes `127.0.0.1:11434`, so a model
+installed into Ollama is simply a brain. The model you distilled can now
+drive Autopilot, answer in the chat, or write the config for the next
+distillation, running on your own hardware for nothing.
+
+No Ollama? The file is still yours. Manifold tells you where it is and the
+exact `ollama create` command; LM Studio can also open the .gguf directly
+from that folder.
+
 ## Chaining it up front
 
 The four batch jobs chain with "Run after" (`depends_on`), so you can

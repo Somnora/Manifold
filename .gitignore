@@ -39,3 +39,9 @@ desktop/src-tauri/icons/ios/
 custom-templates/
 worklog.md
 manifold-worklog.md
+
+# Phase 85: the local model library. In development DATA_ROOT is the repo
+# root, so pulled .gguf models land here - multi-gigabyte files that must
+# never be committable. The packaged app puts them in the platform app-data
+# dir instead.
+/models/
