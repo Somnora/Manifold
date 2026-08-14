@@ -4176,3 +4176,56 @@ panel now prints the job parameter you must set to match, as an advisory.
 **Still open and deliberately not fixed here:** llm-eval's transformers calls
 have still only run against stub torch/transformers, and STUDENT_PRESETS' repo
 ids are curated but unverified. Both need the real-hardware gate.
+
+## 2026-08-14 — Phase 85: the model comes home
+
+**Quantize on the instance, not on the laptop.** The merged student is a
+directory of f16 safetensors; its Q4_K_M GGUF is roughly a third the size.
+Converting on the box means the download is the small file, over a link
+already being paid for, and the user's machine needs no torch, no CUDA and no
+llama.cpp build. It is CPU work on a GPU box, which is only wasteful if you
+boot for it — chained onto the instance that just merged, it is a couple of
+minutes on a machine already running. *Alternative rejected:* pull the
+safetensors and convert locally, which moves 3x the bytes and imposes a
+Python/ML toolchain on a user whose whole reason for using Manifold is not
+having one.
+
+**`entrypoint: bash` and `user: root` on the template.** llama.cpp's `full`
+image ships `/app/tools.sh` as its ENTRYPOINT, which dispatches on flags like
+`--convert` and would consume the command as its own arguments — the exact
+shape of the vllm-serve bug one image over. `user: root` is defence against
+an image update adding a USER directive, since the .gguf is written to the
+NFS mount that a uid-1001 process could not touch (the LeRobot lesson).
+Neither knob is new; both existed because earlier gates burned a run.
+
+**A backend pull route, not the browser download.** The existing download
+route hands bytes to the browser, which puts them wherever the browser puts
+things. The installer needs to *find the file again*, so the pull writes into
+DATA_ROOT/models and the install reads from there. A file in ~/Downloads is
+one Manifold can only talk about. Written to `.partial` and renamed on
+completion, so a dropped transfer never leaves a plausible model behind.
+
+**Ollama over a bundled runtime.** Shipping an inference server would mean
+owning llama.cpp builds for three platforms. Ollama and LM Studio already do
+that, and the payoff is that installing costs *zero new brain code*:
+`127.0.0.1:11434` is already a probed local endpoint, so an installed model
+turns up in the picker as `local:ollama/<name>` on its own. Absent Ollama the
+feature degrades to "here is your file and the command", never a dead button.
+
+**The Modelfile is one line.** `FROM "<path>"` and nothing else. A GGUF
+converted from a HuggingFace model carries its own chat template in its
+metadata; a TEMPLATE line guessed here would silently override a correct one,
+and the symptom — a distilled model that babbles — reads as "distillation
+failed" rather than "Manifold added a wrong prompt format".
+
+**Testing:** the executing-script doctrine extends from `python -c` to
+`bash -c`. The template's real script is run by a real bash with PATH shims
+standing in for `convert_hf_to_gguf.py` and `llama-quantize` that record the
+argv they were handed, so a shifted parameter fails loudly rather than
+rendering plausibly. The routes are tested against a fake `ollama` on PATH,
+so the suite passes on a machine that has never installed it and never
+creates a model on one that has.
+
+**Unverified until the real gate:** the pinned image tag actually converting a
+Qwen student, and whether the chat template survives into GGUF metadata. Both
+are hardware questions; neither can be answered in mocks.

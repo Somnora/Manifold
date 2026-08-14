@@ -218,6 +218,12 @@ ROUTE_ROLES: dict[tuple[str, str], str] = {
     # Writes nothing, but it spends: an api: brain bills the user's key and
     # a cli: brain acts under their login.
     ("POST", "/distill/config"): "operator",
+    # Phase 85. Reading the local library is a viewer act; pulling moves
+    # bytes over a billed connection and installing runs a subprocess on
+    # the user's machine, so both are operator.
+    ("GET", "/models/local"): "viewer",
+    ("POST", "/models/pull"): "operator",
+    ("POST", "/models/install"): "operator",
     ("POST", "/watches"): "operator",
     ("DELETE", "/watches/{watch_id}"): "operator",
     ("POST", "/autopilot/runs"): "operator",

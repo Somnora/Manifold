@@ -1,0 +1,123 @@
+# Convert a merged HF model into a single quantized .gguf file - the format
+# Ollama and LM Studio run on a laptop.
+#
+#   models/<merged student> --> [convert to f16 --> quantize] --> models/<name>.gguf
+#
+# This is the first half of "own it locally": the second half (pulling the
+# file home and installing it into Ollama) happens on YOUR machine, through
+# POST /models/pull and POST /models/install. See docs/distill-your-own-model.md.
+#
+# WHY QUANTIZE ON THE INSTANCE. The merged student is ~6 GB of f16
+# safetensors for a 3B base; its Q4_K_M gguf is ~2 GB. Converting here means
+# the download is the small file, over a link you are already paying for, and
+# your laptop needs no torch, no CUDA, and no llama.cpp build. It is CPU work
+# on a GPU box, which sounds wasteful and is not: chained onto the instance
+# that just did the merge (depends_on + the same target instance) it adds a
+# couple of minutes to a box that is already running, rather than a boot.
+#
+# ENTRYPOINT. The llama.cpp `full` image ships /app/tools.sh as its
+# ENTRYPOINT, which dispatches on flags like --convert and --quantize and
+# would otherwise swallow this command as its own arguments - the exact bug
+# that made vllm-serve try to serve a model named "manifold" (DECISIONS.md
+# 2026-08-14). `entrypoint: bash` takes the wheel; the script below calls the
+# two tools directly.
+#
+# IMAGE TAG. `:full` is a floating tag and llama.cpp moves fast; the tool
+# paths below are resolved at run time rather than assumed, and the script
+# says exactly what it looked for when it cannot find them. Pin a digest here
+# if you need a run to be reproducible a year from now.
+name: gguf-quantize
+description: Convert a merged model under <filesystem>/models into a quantized .gguf (Ollama/LM Studio format), written beside it. CPU work - chain it onto the instance that did the merge.
+image: ghcr.io/ggml-org/llama.cpp:full
+entrypoint: bash
+# The .gguf is written to the persistent NFS mount, and an image whose USER
+# is not root cannot write there - which is how the LeRobot gate burned a
+# training run on 2026-08-14 (uid 1001, permission denied on its first
+# checkpoint). This image runs as root today; the knob makes that a property
+# of the template rather than of whatever the tag points at this week.
+user: root
+
+# Two mounts share the persistent filesystem's models/ directory, so the
+# merged input and the .gguf output sit side by side - which is what makes
+# `POST /models/pull` a single well-known path rather than a search.
+#
+# Same quoting rule as llm-synthesize and lora-merge: the script is inside a
+# single-quoted `bash -c`, so the INSTANCE shell passes it through untouched
+# and the CONTAINER's bash expands $1..$4. The token after the closing quote
+# is $0 (a shell's own name), which is why it is the literal "manifold" and
+# NOT a parameter - putting a parameter there shifts every slot by one, and
+# nothing notices until a model called "manifold" fails to load.
+#
+# The script contains no single quotes anywhere, deliberately: one would end
+# the outer quoting and hand the rest of the program to the instance shell.
+command: >
+  bash -c 'set -e;
+  md="$1"; out="$2"; q="$3"; keep="$4";
+  case "$q" in Q4_K_M|Q5_K_M|Q8_0|F16) ;;
+  *) echo "manifold: quant must be one of Q4_K_M, Q5_K_M, Q8_0, F16 (got: $q)" >&2; exit 2;; esac;
+  case "$md" in ""|*[!A-Za-z0-9._-]*)
+  echo "manifold: model_dir must be a plain directory name under models/ using [A-Za-z0-9._-] (got: $md)" >&2; exit 2;; esac;
+  case "$out" in ""|*[!A-Za-z0-9._-]*)
+  echo "manifold: output_name must use [A-Za-z0-9._-] only, no directories (got: $out)" >&2; exit 2;; esac;
+  src="/data/models/$md";
+  if [ ! -f "$src/config.json" ]; then
+  echo "manifold: no model at $src - model_dir is a directory name under <filesystem>/models, the lora-merge output_name" >&2; exit 2; fi;
+  conv="$(command -v convert_hf_to_gguf.py || true)";
+  if [ -z "$conv" ]; then for c in /app/convert_hf_to_gguf.py /convert_hf_to_gguf.py /app/gguf-py/convert_hf_to_gguf.py; do
+  if [ -f "$c" ]; then conv="$c"; break; fi; done; fi;
+  if [ -z "$conv" ]; then
+  echo "manifold: no convert_hf_to_gguf.py on PATH or at /app - this image is not a llama.cpp full image" >&2; exit 3; fi;
+  qz="$(command -v llama-quantize || true)";
+  if [ -z "$qz" ]; then for c in /app/llama-quantize /app/bin/llama-quantize /usr/local/bin/llama-quantize; do
+  if [ -x "$c" ]; then qz="$c"; break; fi; done; fi;
+  if [ -z "$qz" ] && [ "$q" != "F16" ]; then
+  echo "manifold: no llama-quantize on PATH or at /app - this image is not a llama.cpp full image" >&2; exit 3; fi;
+  mkdir -p /tmp/quant /data/models;
+  f16="/tmp/quant/$out-f16.gguf";
+  final="/data/models/$out.gguf";
+  echo "manifold: converting $src to f16 gguf (this reads the whole model)";
+  python3 "$conv" "$src" --outfile "$f16" --outtype f16;
+  if [ "$q" = "F16" ]; then mv "$f16" "$final";
+  else echo "manifold: quantizing to $q";
+  "$qz" "$f16" "$final" "$q";
+  case "$keep" in True|true|1) mv "$f16" "/data/models/$out-f16.gguf";
+  echo "manifold: kept the f16 at /data/models/$out-f16.gguf";; esac; fi;
+  ls -lh "$final";
+  echo "manifold: wrote $final - pull it home with POST /models/pull"' manifold
+  {{model_dir}} {{output_name}} {{quant}} {{keep_f16}}
+
+parameters:
+  - name: model_dir
+    type: string
+    description: Merged model directory name under <filesystem>/models (the lora-merge output_name, e.g. my-student)
+  - name: output_name
+    type: string
+    default: student
+    description: Name for the .gguf; it lands at <filesystem>/models/<name>.gguf
+  - name: quant
+    type: string
+    default: Q4_K_M
+    description: "Quantization: Q4_K_M (smallest, the usual choice), Q5_K_M (a little bigger, a little better), Q8_0 (near-lossless, ~2x Q4), F16 (no quantization, largest)"
+  - name: keep_f16
+    type: boolean
+    default: false
+    description: Also keep the intermediate f16 .gguf on the filesystem. Useful if you plan to try several quants; it is large.
+
+volumes:
+  # models/ read-write: the merged input is read from here and the .gguf is
+  # written back beside it. Not read-only, unlike lora-merge's input mount,
+  # because input and output share this one directory by design.
+  - host: "{persistent}/models"
+    container: /data/models
+  # The f16 intermediate is roughly 2 GB per billion parameters and is thrown
+  # away by default, so it belongs on the instance's ephemeral disk rather
+  # than on the filesystem you pay to keep.
+  - host: /workspace/ephemeral/quant-tmp
+    container: /tmp/quant
+
+env:
+  TMPDIR: /tmp/quant
+
+# No `gpu:` block: conversion and quantization are CPU and RAM work. The
+# recommendation is not a bigger card, it is to chain this onto the instance
+# that just merged the model rather than booting anything for it.
