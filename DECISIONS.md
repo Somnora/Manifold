@@ -4456,3 +4456,50 @@ spend and no secrets to protect, and `NetworkGuardMiddleware` is installed
 unconditionally, so an untokened backend still refuses every non-loopback
 caller. Both halves are pinned by tests - mock with a token set stays open,
 real mode with a token still 401s.
+
+## 2026-08-14 — The safety-hook flake: reproduced, narrowed, NOT fixed
+
+`test_blocked_termination_notifies_once_until_the_files_change` fails about
+one full-suite run in three and never in isolation. Written up because the
+dead ends are the expensive part, and because CI (added today) will surface
+it as an occasional red build on a public repo.
+
+**The exact failure**, captured by looping the suite until it reproduced:
+
+    assert len(blocked_pings()) == 2
+    AssertionError: assert 1 == 2
+
+So the SECOND OS ping is MISSING - the one that should fire after the user
+"saves" one of two unsaved files and the unsaved SET therefore changes.
+It is a missing notification, not a duplicate, which rules out the obvious
+reading (a retry firing an extra ping).
+
+**Ruled out, each by experiment rather than by argument:**
+
+- *Background retry loops.* The obvious suspect: `TestClient` runs the app
+  lifespan, so the idle and auto-manage loops really do retry blocked
+  terminations underneath the assertions. Parking `_idle_loop` and
+  `_auto_manage_loop` did not help; parking ALL SIX loops (`_task_loop`,
+  `_idle_loop`, `_watch_loop`, `_telemetry_loop`, `_auto_manage_loop`,
+  `_adopt_loop`) still failed 2 runs in 4 - the same rate. The scaffolding
+  was reverted rather than left in place looking like a fix.
+- *Stale unsaved state.* An instrumented replay of the exact sequence
+  (block, three retries, trim the file list, block again) produces both
+  pings every time. `terminate` calls `rescue` fresh, `rescue` reads the
+  sidecar live, and the mock returns `list(self.unpersisted)` - no cache
+  anywhere on that path.
+- *A notifier cooldown.* There is none. `NotificationCenter.notify` records
+  and pings unconditionally; `notify_once` is a different method this path
+  does not use.
+
+**Still live, unconfirmed:** `notify()` wraps its whole body in
+`except Exception -> log and return None`, so a transient failure inside
+`create_notification` would drop a ping silently and look exactly like
+this. Three full-suite runs with ERROR logging captured did not reproduce
+it, so this is a hypothesis, not a finding. If it IS the cause, the bug is
+larger than the test: a notification the user needs would be lost in
+production the same way, and the blanket except is worth narrowing.
+
+**Not fixed.** Loosening the assertion was rejected: the exact count IS the
+property under test (one ping per distinct unsaved set), so a test allowed
+to drift proves nothing.
