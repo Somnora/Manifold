@@ -431,6 +431,17 @@ export type Brain = {
   ready: boolean;
 };
 
+// Phase 84: a draft training config, written by a brain from a plain-words
+// spec and checked by the backend before it comes back. It is text for the
+// user to read: Manifold never saves it and never trains from it.
+export type DistillConfig = {
+  config_yaml: string;
+  // The base model the brain settled on (its own pick when the user left
+  // the student field empty).
+  student: string;
+  notes: string;
+};
+
 export type Approval = {
   id: string;
   run_id: string;
@@ -800,6 +811,21 @@ export const api = {
     }),
 
   brains: () => request<{ brains: Brain[] }>("/brains").then((r) => r.brains),
+
+  // A CLI brain (claude/codex/gemini) is given several minutes to answer, so
+  // the default 30s abort would report a client failure while the backend was
+  // still working, and the user would ask again and pay twice.
+  distillConfig: (body: {
+    spec: string;
+    brain: string;
+    dataset?: string;
+    student?: string;
+  }) =>
+    request<DistillConfig>("/distill/config", {
+      method: "POST",
+      body: JSON.stringify(body),
+      timeoutMs: 5 * 60_000,
+    }),
 
   approvals: () =>
     request<{ approvals: Approval[]; timeout_seconds: number }>(

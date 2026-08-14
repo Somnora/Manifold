@@ -160,6 +160,7 @@ ROUTE_ROLES: dict[tuple[str, str], str] = {
     ("GET", "/subagents/models"): "viewer",
     ("GET", "/subagents/swarm/status"): "viewer",
     ("GET", "/model-presets"): "viewer",
+    ("GET", "/student-presets"): "viewer",
     ("GET", "/watches"): "viewer",
     ("GET", "/brains"): "viewer",
     ("GET", "/approvals/pending"): "viewer",
@@ -214,6 +215,9 @@ ROUTE_ROLES: dict[tuple[str, str], str] = {
     ("DELETE", "/tasks/finished"): "operator",
     ("DELETE", "/tasks/{task_id}"): "operator",
     ("POST", "/subagents/dispatch"): "operator",
+    # Writes nothing, but it spends: an api: brain bills the user's key and
+    # a cli: brain acts under their login.
+    ("POST", "/distill/config"): "operator",
     ("POST", "/watches"): "operator",
     ("DELETE", "/watches/{watch_id}"): "operator",
     ("POST", "/autopilot/runs"): "operator",

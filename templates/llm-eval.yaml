@@ -1,0 +1,421 @@
+# The scorecard: does the student you just distilled actually hold up against
+# the teacher? Held-out prompts in, one honest number out.
+#
+#   eval-*.jsonl --> [student answer vs teacher answer -> judge] --> scorecard.json
+#
+# The student is loaded IN-PROCESS with transformers from merged weights on
+# the filesystem (the lora-merge output). It is deliberately not a second
+# server: one server per instance is a house rule, and a scorecard run is a
+# batch job, not a service.
+#
+# VRAM ARITHMETIC, read this before you queue it. vLLM takes 90% of the card
+# by default, so on a 24GB A10 a live vllm-serve teacher holds about 21.6GB
+# and loading a 3B student beside it is a guaranteed CUDA OOM. Three ways
+# through, pick one:
+#   1. (recommended) Run this AFTER the teacher is stopped. Teacher answers
+#      are already stored in the holdout file that llm-synthesize wrote, so
+#      no teacher needs to be running at all. Point judge_base_url at an API.
+#   2. Keep the teacher and the judge on APIs (env_file carries the key).
+#      Nothing else wants the card and the student gets all of it.
+#   3. student_device=cpu, which fits beside anything and is slow. Use it for
+#      a 20-row smoke test, not for a 500-row scorecard.
+#
+# WHAT THE NUMBER IS. A judge model picks blind between two answers, with the
+# student placed at position A on even item indexes and position B on odd ones
+# so position bias cannot decide the run. That cancels position bias and
+# nothing else: a judge that IS the teacher grades its own homework, and
+# judges reward longer answers. The template warns loudly when judge_model
+# equals teacher_model and records both ids in scorecard.json. This is a
+# preference score from one judge, not a benchmark.
+name: llm-eval
+description: Score a distilled student against its teacher on held-out prompts with a blind judge, writing scorecard.json to <filesystem>/outputs
+image: axolotlai/axolotl:main-latest
+network: host
+
+# Same env-script quoting rule as llm-synthesize: $EVAL_PY is referenced
+# INSIDE a single-quoted `bash -c`, so the INSTANCE shell leaves it literal
+# and the CONTAINER's shell expands it. Parameters ride the top level as
+# positional args and reach python via "$@" intact. The shell prologue sources
+# the user's own .env off the persistent filesystem, because an API key must
+# never be a parameter (parameters are rendered into the docker command, which
+# is written verbatim to the job log). env_file is the LAST positional, which
+# is why the prologue reads the last one rather than $1. No entrypoint
+# override: the axolotl image runs a shell, exactly as lora-merge relies on.
+command: >
+  bash -c 'ef=""; for a in "$@"; do ef="$a"; done;
+  if [ -n "$ef" ]; then if [ ! -f "/data/$ef" ]; then
+  echo "manifold: env file not found: /data/$ef (path is relative to the filesystem root)" >&2;
+  exit 2; fi; set -a; . "/data/$ef"; set +a; fi;
+  exec python3 -c "$EVAL_PY" "$@"' manifold
+  {{eval_name}} {{student_path}} {{output_name}} {{instruction}} {{port}}
+  {{limit}} {{max_new_tokens}} {{student_device}} {{judge_base_url}}
+  {{judge_model}} {{teacher_base_url}} {{teacher_model}} {{env_file}}
+
+parameters:
+  - name: eval_name
+    type: string
+    description: Held-out file to grade on, a filename under <filesystem>/synthesized (e.g. eval-distill.jsonl, written by llm-synthesize with holdout_pct > 0)
+  - name: student_path
+    type: string
+    description: Merged student model directory name under <filesystem>/models (the lora-merge output_name)
+  - name: output_name
+    type: string
+    default: scorecard
+    description: Scorecard name; the JSON lands at <filesystem>/outputs/<name>.json
+  - name: instruction
+    type: string
+    default: ""
+    description: Task text for records-shaped rows. Alpaca rows carry their own instruction and ignore this.
+  - name: port
+    type: integer
+    default: 8080
+    description: Loopback port of a vllm-serve job on this instance (ignored when the judge and teacher URLs are set)
+  - name: limit
+    type: integer
+    default: 0
+    description: Max held-out items to grade (0 = all). Use a small number to test.
+  - name: max_new_tokens
+    type: integer
+    default: 512
+    description: Generation budget for each student answer
+  - name: student_device
+    type: string
+    default: auto
+    description: auto = GPU when one is free, else CPU. cpu = force CPU, the escape hatch for running beside a live teacher (slow).
+  - name: judge_base_url
+    type: string
+    default: ""
+    description: OpenAI-compatible base URL of the judge. Empty = the model served on this instance. Must carry no credentials.
+  - name: judge_model
+    type: string
+    default: ""
+    description: Judge model id. Empty = auto-discover the one model this instance is serving.
+  - name: teacher_base_url
+    type: string
+    default: ""
+    description: OpenAI-compatible base URL of the teacher, only dialled for items whose held-out row has no stored teacher answer. Must carry no credentials.
+  - name: teacher_model
+    type: string
+    default: ""
+    description: Teacher model id, only used when a teacher answer has to be dialled
+  - name: env_file
+    type: string
+    default: ""
+    description: Optional .env on the filesystem (e.g. research/.env), sourced for the judge and teacher API keys. Set MANIFOLD_JUDGE_API_KEY / MANIFOLD_TEACHER_API_KEY (or OPENAI_API_KEY) in it.
+
+volumes:
+  # The whole filesystem, as llm-synthesize mounts it: the held-out file is
+  # under synthesized/, the student under models/, the scorecard goes to
+  # outputs/, and env_file may be anywhere.
+  - host: "{persistent}"
+    container: /data
+  - host: /workspace/ephemeral/eval-tmp
+    container: /tmp/eval
+
+env:
+  # Reuse the cache axolotl-finetune already filled, so a tokenizer that has
+  # to be fetched is fetched once for the whole filesystem.
+  HF_HOME: /data/cache/huggingface
+  TMPDIR: /tmp/eval
+  EVAL_PY: |
+    import json, os, sys, time, urllib.request
+
+    eval_name, student_path, output_name, instruction, port = (
+        sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], int(sys.argv[5]))
+    limit, max_new_tokens = int(sys.argv[6]), int(sys.argv[7])
+
+    def arg(n, default=""):
+        # Optional trailing parameters read positionally with a default.
+        # New parameters are only ever APPENDED: inserting one would shift
+        # every slot after it and bind the wrong values (silently).
+        value = sys.argv[n] if len(sys.argv) > n else ""
+        return value if value else default
+
+    student_device = arg(8, "auto").strip().lower()
+    judge_url = arg(9).strip().rstrip("/")
+    judge_model = arg(10).strip()
+    teacher_url = arg(11).strip().rstrip("/")
+    teacher_model = arg(12).strip()
+    # argv[13] is env_file. The SHELL already sourced it before python started;
+    # python must never see the keys themselves, only their effect on environ.
+
+    if student_device not in ("auto", "cpu", "cuda"):
+        sys.exit(f"student_device must be auto, cpu or cuda, got "
+                 f"{student_device!r}")
+    # The rendered docker command is written verbatim to the job log, so a URL
+    # carrying a key or a user:pass would leak it. Keys ride env_file instead.
+    for label, url in (("judge_base_url", judge_url),
+                       ("teacher_base_url", teacher_url)):
+        if "?" in url or "@" in url:
+            sys.exit(f"{label} must carry no credentials: no query string, no "
+                     f"user:pass@host. Put the key in a .env and name it in "
+                     f"env_file.")
+
+    judge_base = judge_url or f"http://127.0.0.1:{port}/v1"
+    teacher_base = teacher_url or f"http://127.0.0.1:{port}/v1"
+    # Read once, never printed, never put on a command line.
+    judge_key = (os.environ.get("MANIFOLD_JUDGE_API_KEY")
+                 or os.environ.get("OPENAI_API_KEY") or "")
+    teacher_key = (os.environ.get("MANIFOLD_TEACHER_API_KEY")
+                   or os.environ.get("OPENAI_API_KEY") or "")
+    # Overridable so tests can fail fast; ops rarely needs to touch it.
+    READY_TIMEOUT = int(os.environ.get("MANIFOLD_EVAL_READY_TIMEOUT", "300"))
+
+    def api(base, key, path, payload=None, timeout=600):
+        headers = {"Content-Type": "application/json"}
+        if key:
+            headers["Authorization"] = "Bearer " + key
+        req = urllib.request.Request(
+            base + path,
+            data=json.dumps(payload).encode() if payload else None,
+            headers=headers)
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.load(r)
+
+    def chat(base, key, model, system, user, temperature=0.0):
+        # Retry transient errors so a single blip never drops an item.
+        last = None
+        for attempt in range(3):
+            try:
+                reply = api(base, key, "/chat/completions", {
+                    "model": model,
+                    "temperature": temperature,
+                    "messages": [
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": user},
+                    ],
+                })
+                return reply["choices"][0]["message"]["content"]
+            except Exception as exc:
+                last = exc
+                time.sleep(1 + attempt)
+        raise last
+
+    # -- preflights: fail in seconds, not after a 40s torch import ------------
+    stem = eval_name[:-6] if eval_name.endswith(".jsonl") else eval_name
+    in_path = "/data/synthesized/" + stem + ".jsonl"
+    if not os.path.exists(in_path):
+        sys.exit(f"held-out file not found: {in_path} (eval_name is a filename "
+                 f"under synthesized/; llm-synthesize writes it when "
+                 f"holdout_pct > 0)")
+    student_dir = "/data/models/" + student_path
+    if not os.path.isfile(os.path.join(student_dir, "config.json")):
+        sys.exit(f"no model at {student_dir} (student_path is a directory name "
+                 f"under models/, the lora-merge output_name)")
+    out_dir = "/data/outputs"
+    os.makedirs(out_dir, exist_ok=True)
+    card_path = f"/data/outputs/{output_name}.json"
+
+    def pair(row):
+        # (task, stored teacher answer) for a held-out row, whichever shape
+        # llm-synthesize wrote. Returns (None, None) for a row this template
+        # cannot read, so the caller fails fast naming the keys.
+        if "instruction" in row and "output" in row:
+            task = str(row["instruction"])
+            if row.get("input"):
+                task = task + "\n\n" + str(row["input"])
+            return task, str(row["output"])
+        if "record" in row and "synthesis" in row:
+            task = json.dumps(row["record"], ensure_ascii=False)
+            if instruction:
+                task = instruction + "\n\n" + task
+            return task, str(row["synthesis"])
+        return None, None
+
+    items = []
+    with open(in_path) as f:
+        for i, line in enumerate(f, 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError as exc:
+                sys.exit(f"{in_path} line {i} is not JSON: {exc}")
+            task, stored = pair(row)
+            if task is None:
+                sys.exit(f"{in_path} line {i} is neither an alpaca row "
+                         f"(instruction/input/output) nor a records row "
+                         f"(record/synthesis); its keys are {sorted(row)}.")
+            items.append((task, stored))
+            if limit and len(items) >= limit:
+                break
+    if not items:
+        sys.exit(f"{in_path} has no held-out items to grade")
+
+    # -- resolve the judge (and the teacher, only if we have to dial it) ------
+    def discover(base, key, what):
+        print(f"waiting for a {what} at {base} (up to {READY_TIMEOUT}s) ...",
+              flush=True)
+        deadline = time.time() + READY_TIMEOUT
+        while True:
+            try:
+                return api(base, key, "/models", timeout=10)["data"][0]["id"]
+            except Exception as exc:
+                if time.time() >= deadline:
+                    sys.exit(f"no {what} answered at {base} within "
+                             f"{READY_TIMEOUT}s ({exc})")
+                time.sleep(2)
+
+    judge = judge_model or discover(judge_base, judge_key, "judge")
+    need_teacher = any(not stored for _task, stored in items)
+    teacher = teacher_model
+    if need_teacher and not teacher:
+        teacher = discover(teacher_base, teacher_key, "teacher")
+    teacher_label = teacher or "(stored in the held-out file)"
+
+    # Self-preference: a judge grading its own answers flatters itself, and
+    # that is the bias most likely to decide this run. Say so out loud and
+    # record it, rather than printing a number that quietly means nothing.
+    judge_is_teacher = bool(teacher) and judge == teacher
+    if judge_is_teacher:
+        print(f"WARNING: the judge and the teacher are the same model "
+              f"({judge}). It is grading its own answers, so treat the "
+              f"result as unreliable.", flush=True)
+
+    # -- the student, loaded in-process ---------------------------------------
+    # torch/transformers are imported HERE, not at the top: a missing file or
+    # an unreachable judge should fail in seconds, not after a 40-second torch
+    # import on a GPU that bills by the minute.
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    device = student_device
+    if device == "auto":
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    dtype = torch.float32
+    if device == "cuda":
+        dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    print(f"loading student {student_dir} on {device} ...", flush=True)
+    tokenizer = AutoTokenizer.from_pretrained(student_dir,
+                                              trust_remote_code=True)
+    student = AutoModelForCausalLM.from_pretrained(
+        student_dir, torch_dtype=dtype, trust_remote_code=True).to(device)
+    student.eval()
+
+    def student_answer(task):
+        text = task
+        if getattr(tokenizer, "chat_template", None):
+            text = tokenizer.apply_chat_template(
+                [{"role": "user", "content": task}],
+                tokenize=False, add_generation_prompt=True)
+        encoded = tokenizer(text, return_tensors="pt").to(device)
+        with torch.no_grad():
+            # Greedy: a scorecard that changes run to run is not a scorecard.
+            generated = student.generate(**encoded,
+                                         max_new_tokens=max_new_tokens,
+                                         do_sample=False)
+        prompt_len = encoded["input_ids"].shape[1]
+        return tokenizer.decode(generated[0][prompt_len:],
+                                skip_special_tokens=True).strip()
+
+    # -- the blind comparison -------------------------------------------------
+    JUDGE_SYSTEM = ("You compare two candidate answers to the same task. "
+                    "Reply with JSON only, no prose and no code fence, in "
+                    "exactly this form: {\"winner\": \"A\" or \"B\" or "
+                    "\"TIE\", \"reason\": \"<one short sentence>\"}. Judge "
+                    "only how well each answer does the task. Ignore length, "
+                    "ignore style, ignore which one sounds more confident.")
+
+    def parse_winner(content):
+        # (winner, reason). Models wrap JSON in ```json fences; a bare A/B/TIE
+        # in the text is the last resort. Anything else is unscored, never
+        # silently counted as a win for either side.
+        s = content.strip()
+        if s.startswith("```"):
+            s = s[3:]
+            if s[:4].lower() == "json":
+                s = s[4:]
+            if s.endswith("```"):
+                s = s[:-3]
+            s = s.strip()
+        try:
+            data = json.loads(s)
+            winner = str(data["winner"]).strip().upper()
+            if winner in ("A", "B", "TIE"):
+                return winner, str(data.get("reason", ""))
+        except Exception:
+            pass
+        bare = content.strip().upper()
+        if bare in ("A", "B", "TIE"):
+            return bare, content.strip()[:200]
+        return None, content.strip()[:200]
+
+    results = []
+    student_wins = teacher_wins = ties = unscored = 0
+    for index, (task, stored) in enumerate(items):
+        answer_student = student_answer(task)
+        answer_teacher = stored
+        if not answer_teacher:
+            answer_teacher = chat(teacher_base, teacher_key, teacher,
+                                  instruction or "Answer the task.", task)
+        # Deterministic by index, so the assignment is reproducible and
+        # position bias cancels across the run instead of favouring one side.
+        student_is_a = index % 2 == 0
+        first = answer_student if student_is_a else answer_teacher
+        second = answer_teacher if student_is_a else answer_student
+        user = (f"TASK\n{task}\n\nANSWER A\n{first}\n\nANSWER B\n{second}")
+        try:
+            winner, reason = parse_winner(
+                chat(judge_base, judge_key, judge, JUDGE_SYSTEM, user))
+        except Exception as exc:
+            winner, reason = None, f"judge call failed after retries: {exc}"
+        if winner is None:
+            verdict = "unscored"
+            unscored += 1
+        elif winner == "TIE":
+            verdict = "tie"
+            ties += 1
+        elif (winner == "A") == student_is_a:
+            verdict = "student"
+            student_wins += 1
+        else:
+            verdict = "teacher"
+            teacher_wins += 1
+        results.append({"index": index, "task": task,
+                        "student_answer": answer_student,
+                        "teacher_answer": answer_teacher,
+                        "student_position": "A" if student_is_a else "B",
+                        "winner": verdict, "reason": reason})
+        if (index + 1) % 10 == 0:
+            print(f"progress: {index + 1}/{len(items)} graded", flush=True)
+
+    graded = student_wins + teacher_wins + ties
+    matched_or_beat = student_wins + ties
+    rate = (100.0 * matched_or_beat / graded) if graded else 0.0
+    card = {
+        "student_path": student_dir,
+        "student_device": device,
+        "teacher_model": teacher_label,
+        "judge_model": judge,
+        "judge_is_teacher": judge_is_teacher,
+        "eval_file": in_path,
+        "n_items": len(items),
+        "n_graded": graded,
+        "student_wins": student_wins,
+        "teacher_wins": teacher_wins,
+        "ties": ties,
+        "unscored": unscored,
+        "matched_or_beat": matched_or_beat,
+        "match_rate_pct": round(rate, 1),
+        "ab_rule": "student is A on even item indexes (0-based), B on odd",
+        "results": results,
+    }
+    with open(card_path, "w") as f:
+        json.dump(card, f, indent=2)
+
+    print(f"scorecard -> {card_path}", flush=True)
+    print(f"student won {student_wins}, tied {ties}, lost {teacher_wins}, "
+          f"unscored {unscored}", flush=True)
+    if judge_is_teacher:
+        print(f"WARNING: judge == teacher ({judge}); the number below is the "
+              f"teacher grading itself", flush=True)
+    print(f"student matched or beat the teacher on {matched_or_beat}/{graded} "
+          f"held-out tasks ({rate:.0f}%)", flush=True)
+
+gpu:
+  min_vram_gib: 24
+  recommended_types:
+    - gpu_1x_a100_sxm4
+    - gpu_1x_h100_sxm5
+    - gpu_1x_a6000

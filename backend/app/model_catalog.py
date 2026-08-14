@@ -173,3 +173,91 @@ MODEL_PRESETS = [
         "parameters": {"tensor_parallel": 8},
     },
 ]
+
+
+# The other end of the shelf: small open bases to distill INTO, not models
+# to serve. A distilled student is only useful if it is cheap to run, so
+# every entry here LoRA-trains on a single A10 (24GB) and serves on one
+# afterwards. Same key names as MODEL_PRESETS so a client can reuse the
+# same type, plus params_b (the size is the whole point when you are
+# picking a student) and license (a distilled model inherits the base's
+# terms, and the Qwen Research entries are not commercial-use).
+#
+# vram_gib here is the LoRA TRAINING floor at the modest sequence lengths
+# these configs default to (weights in bf16 + activations + LoRA optimizer
+# state), which is the number that decides whether the run OOMs. Serving
+# the merged result needs roughly half of it. These are practical figures
+# from the tier, not a fresh benchmark: treat them as "will it fit", not
+# as a spec.
+#
+# Gated repos (Llama, Gemma) are absent for the same reason they are absent
+# above: Manifold does not pass a HuggingFace token, so they would fail on
+# first download rather than "just work".
+STUDENT_PRESETS = [
+    # -- tiny: minutes to train, narrow tasks -------------------------------
+    {
+        "label": "Qwen3 0.6B",
+        "model_id": "Qwen/Qwen3-0.6B",
+        "params_b": 0.6,
+        "vram_gib": 8,
+        "tier": "A10 24GB",
+        "license": "Apache-2.0",
+        "note": "The smallest student worth training. Good for one narrow "
+                "job (tagging, routing, extraction); do not expect "
+                "conversation.",
+    },
+    {
+        "label": "Qwen2.5 1.5B Instruct",
+        "model_id": "Qwen/Qwen2.5-1.5B-Instruct",
+        "params_b": 1.5,
+        "vram_gib": 12,
+        "tier": "A10 24GB",
+        "license": "Apache-2.0",
+        "note": "Well-understood small instruct base; a safe default when "
+                "the task needs a sentence back, not just a label.",
+    },
+    {
+        "label": "SmolLM2 1.7B Instruct",
+        "model_id": "HuggingFaceTB/SmolLM2-1.7B-Instruct",
+        "params_b": 1.7,
+        "vram_gib": 12,
+        "tier": "A10 24GB",
+        "license": "Apache-2.0",
+        "note": "Trained for on-device use, so it stays fast on cheap "
+                "hardware after you distill into it.",
+    },
+    {
+        "label": "Qwen3 1.7B",
+        "model_id": "Qwen/Qwen3-1.7B",
+        "params_b": 1.7,
+        "vram_gib": 12,
+        "tier": "A10 24GB",
+        "license": "Apache-2.0",
+        "note": "Current-generation small Qwen. Start here if the teacher "
+                "is also a Qwen model: the tokenizer and style already "
+                "match.",
+    },
+    # -- 3B and up: the A10 training ceiling --------------------------------
+    {
+        "label": "Qwen2.5 3B Instruct",
+        "model_id": "Qwen/Qwen2.5-3B-Instruct",
+        "params_b": 3.0,
+        "vram_gib": 22,
+        "tier": "A10 24GB",
+        "license": "Qwen Research (non-commercial)",
+        "note": "The capable end of the A10 tier. Note the licence: the 3B "
+                "is Qwen Research, not Apache, so a model distilled from it "
+                "is not for commercial use.",
+    },
+    {
+        "label": "Qwen3 4B Instruct",
+        "model_id": "Qwen/Qwen3-4B-Instruct-2507",
+        "params_b": 4.0,
+        "vram_gib": 24,
+        "tier": "A10 24GB",
+        "license": "Apache-2.0",
+        "note": "The A10 ceiling for LoRA: fits at short sequence lengths "
+                "and micro_batch_size 1-2, and OOMs if you push either. "
+                "Also servable straight from the serve presets.",
+    },
+]

@@ -1,0 +1,306 @@
+# Curate a synthesized dataset before you train on it: ask a judge model to
+# score every generated pair 1 to 10 against your criteria, then keep only the
+# rows that clear a threshold.
+#
+#   synthesized.jsonl --> [criteria + pair -> judge model] --> kept-*.jsonl
+#
+# Two files land beside the input, both under <filesystem>/synthesized/:
+#   scored-<name>.jsonl  every input row plus judge_score and judge_reason
+#   kept-<name>.jsonl    the rows scoring >= threshold, in the SAME SHAPE the
+#                        input had, so axolotl-finetune can train on it as-is
+#
+# TRAINABILITY. "Same shape" only means trainable when the upstream
+# llm-synthesize ran with output_format=alpaca. A records-shaped file carries
+# {record, synthesis} keys and axolotl's `type: alpaca` will not train on it.
+# This template says so in its final log lines rather than letting you find
+# out inside a GPU job.
+#
+# JUDGE LOCALITY. Same rule as llm-synthesize: the judge must be reachable
+# FROM THE INSTANCE. A vllm-serve job on this instance is (host networking
+# lets the container dial the host's loopback), a public OpenAI-compatible
+# API is, your laptop's Ollama is not.
+#
+# SELF-PREFERENCE. If the judge is the same model that generated the answers,
+# it is grading its own homework and will flatter itself. Point judge_model at
+# something other than the teacher when you can, and read the score histogram
+# with that in mind. This is a preference score from one model, not a
+# benchmark. Stdlib-only (urllib), so the container starts in seconds.
+name: llm-judge
+description: Score a synthesized dataset 1 to 10 with a judge model and keep the rows that clear a threshold (curation pass before fine-tuning)
+image: python:3.11-slim
+network: host
+
+# Same env-script quoting rule as llm-synthesize: $PYCODE is referenced INSIDE
+# a single-quoted `bash -c`, so the INSTANCE shell leaves it literal and the
+# CONTAINER's shell expands it. Parameters ride the top level as positional
+# args and reach python via "$@" intact. The shell prologue sources the user's
+# own .env off the persistent filesystem, because an API key must never be a
+# parameter (parameters are rendered into the docker command, which is written
+# verbatim to the job log). env_file is the LAST positional, which is why the
+# prologue reads the last one rather than $1.
+command: >
+  bash -c 'ef=""; for a in "$@"; do ef="$a"; done;
+  if [ -n "$ef" ]; then if [ ! -f "/data/$ef" ]; then
+  echo "manifold: env file not found: /data/$ef (path is relative to the filesystem root)" >&2;
+  exit 2; fi; set -a; . "/data/$ef"; set +a; fi;
+  exec python -c "$PYCODE" "$@"' manifold
+  {{input_name}} {{criteria}} {{threshold}} {{port}} {{limit}}
+  {{judge_base_url}} {{judge_model}} {{env_file}}
+
+parameters:
+  - name: input_name
+    type: string
+    description: Synthesized file to score, a filename under <filesystem>/synthesized (e.g. distill-train.jsonl)
+  - name: criteria
+    type: string
+    description: What a good pair looks like; the judge scores each pair 1 to 10 against this
+  - name: threshold
+    type: integer
+    default: 7
+    description: Minimum score to keep a row (1 to 10)
+  - name: port
+    type: integer
+    default: 8080
+    description: Loopback port of the vllm-serve job on this instance (ignored when judge_base_url is set)
+  - name: limit
+    type: integer
+    default: 0
+    description: Max rows to score (0 = all). Use a small number to test.
+  - name: judge_base_url
+    type: string
+    default: ""
+    description: OpenAI-compatible base URL of the judge (e.g. https://api.example.com/v1). Empty = the model served on this instance. Must carry no credentials.
+  - name: judge_model
+    type: string
+    default: ""
+    description: Judge model id. Empty = auto-discover the one model this instance is serving.
+  - name: env_file
+    type: string
+    default: ""
+    description: Optional .env on the filesystem (e.g. research/.env), sourced for the judge API key. Set MANIFOLD_JUDGE_API_KEY (or OPENAI_API_KEY) in it.
+
+volumes:
+  # The whole filesystem, as llm-synthesize mounts it: the input and both
+  # outputs live under synthesized/, and env_file may be anywhere.
+  - host: "{persistent}"
+    container: /data
+
+env:
+  PYCODE: |
+    import json, os, re, sys, time, urllib.request
+    input_name, criteria, threshold, port, limit = (
+        sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4]),
+        int(sys.argv[5]))
+
+    def arg(n, default=""):
+        # Optional trailing parameters read positionally with a default.
+        # New parameters are only ever APPENDED: inserting one would shift
+        # every slot after it and bind the wrong values (silently).
+        value = sys.argv[n] if len(sys.argv) > n else ""
+        return value if value else default
+
+    judge_url = arg(6).strip().rstrip("/")
+    judge_model = arg(7).strip()
+    # argv[8] is env_file. The SHELL already sourced it before python started;
+    # python must never see the key itself, only its effect on os.environ.
+
+    if not 1 <= threshold <= 10:
+        sys.exit(f"threshold must be between 1 and 10, got {threshold}")
+    # The rendered docker command is written verbatim to the job log, so a URL
+    # carrying a key or a user:pass would leak it. Keys ride env_file instead.
+    if "?" in judge_url or "@" in judge_url:
+        sys.exit("judge_base_url must carry no credentials: no query string, "
+                 "no user:pass@host. Put the key in a .env and name it in "
+                 "env_file (MANIFOLD_JUDGE_API_KEY=...).")
+
+    base = judge_url or f"http://127.0.0.1:{port}/v1"
+    # Read once, never printed, never put on a command line.
+    api_key = (os.environ.get("MANIFOLD_JUDGE_API_KEY")
+               or os.environ.get("OPENAI_API_KEY") or "")
+    # Overridable so tests can fail fast; ops rarely needs to touch it.
+    READY_TIMEOUT = int(os.environ.get("MANIFOLD_JUDGE_READY_TIMEOUT", "300"))
+
+    def api(path, payload=None, timeout=600):
+        headers = {"Content-Type": "application/json"}
+        if api_key:
+            headers["Authorization"] = "Bearer " + api_key
+        req = urllib.request.Request(
+            base + path,
+            data=json.dumps(payload).encode() if payload else None,
+            headers=headers)
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.load(r)
+
+    # Preflight: the input must exist. Fail with a path, not a traceback.
+    stem = input_name[:-6] if input_name.endswith(".jsonl") else input_name
+    in_path = "/data/synthesized/" + stem + ".jsonl"
+    if not os.path.exists(in_path):
+        sys.exit(f"input file not found: {in_path} "
+                 f"(input_name is a filename under synthesized/)")
+    scored_path = f"/data/synthesized/scored-{stem}.jsonl"
+    kept_path = f"/data/synthesized/kept-{stem}.jsonl"
+
+    def pair(row):
+        # (task, answer) for a synthesized row, whichever shape it came in.
+        # Returns (None, None) for a row this template cannot read, so the
+        # caller can fail fast naming the keys instead of judging garbage.
+        if "instruction" in row and "output" in row:
+            task = str(row["instruction"])
+            if row.get("input"):
+                task = task + "\n\n" + str(row["input"])
+            return task, str(row["output"])
+        if "record" in row and "synthesis" in row:
+            return (json.dumps(row["record"], ensure_ascii=False),
+                    str(row["synthesis"]))
+        return None, None
+
+    rows = []
+    with open(in_path) as f:
+        for i, line in enumerate(f, 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError as exc:
+                sys.exit(f"{in_path} line {i} is not JSON: {exc}")
+            task, answer = pair(row)
+            if task is None:
+                sys.exit(f"{in_path} line {i} is neither an alpaca row "
+                         f"(instruction/input/output) nor a records row "
+                         f"(record/synthesis); its keys are "
+                         f"{sorted(row)}. Was it written by llm-synthesize?")
+            rows.append((row, task, answer))
+            if limit and len(rows) >= limit:
+                break
+    if not rows:
+        sys.exit(f"{in_path} has no rows to score")
+    alpaca = "instruction" in rows[0][0]
+
+    # WAIT for the judge to answer instead of crashing if this job was queued
+    # before vllm-serve finished loading. A named model on a remote API needs
+    # no such dance: it is already up.
+    model = judge_model
+    if not (model and judge_url):
+        print(f"waiting for a judge at {base} "
+              f"(up to {READY_TIMEOUT}s) ...", flush=True)
+        deadline = time.time() + READY_TIMEOUT
+        while True:
+            try:
+                discovered = api("/models", timeout=10)["data"][0]["id"]
+                break
+            except Exception as exc:
+                if time.time() >= deadline:
+                    sys.exit(f"no judge answered at {base} within "
+                             f"{READY_TIMEOUT}s: is a vllm-serve job running "
+                             f"and finished loading? ({exc})")
+                time.sleep(2)
+        model = model or discovered
+    print(f"judging {len(rows)} rows with {model} "
+          f"(keeping score >= {threshold})", flush=True)
+
+    SYSTEM = ("You grade one answer to one task. Reply with JSON only, no "
+              "prose and no code fence, in exactly this form: "
+              "{\"score\": <integer 1-10>, \"reason\": \"<one short "
+              "sentence>\"}. 10 means the answer fully satisfies the "
+              "criteria; 1 means it does not satisfy them at all.")
+
+    def ask(task, answer):
+        # Retry transient judge errors so a single blip never drops a row.
+        user = (f"CRITERIA\n{criteria}\n\nTASK\n{task}\n\nANSWER\n{answer}")
+        last = None
+        for attempt in range(3):
+            try:
+                reply = api("/chat/completions", {
+                    "model": model,
+                    "temperature": 0.0,
+                    "messages": [
+                        {"role": "system", "content": SYSTEM},
+                        {"role": "user", "content": user},
+                    ],
+                })
+                return reply["choices"][0]["message"]["content"]
+            except Exception as exc:
+                last = exc
+                time.sleep(1 + attempt)
+        raise last
+
+    def parse_score(content):
+        # (score, reason). Models wrap JSON in ```json fences and sometimes
+        # answer in prose; a bare number in the text is the last resort. An
+        # unreadable reply becomes (None, ...) and is counted as unscored,
+        # never silently kept and never silently dropped.
+        s = content.strip()
+        if s.startswith("```"):
+            s = s[3:]
+            if s[:4].lower() == "json":
+                s = s[4:]
+            if s.endswith("```"):
+                s = s[:-3]
+            s = s.strip()
+        try:
+            data = json.loads(s)
+            score = int(data["score"])
+            if 1 <= score <= 10:
+                return score, str(data.get("reason", ""))
+        except Exception:
+            pass
+        found = re.search(r"\b(10|[1-9])\b", content)
+        if found:
+            return int(found.group(1)), content.strip()[:200]
+        return None, content.strip()[:200]
+
+    histogram = {}
+    kept = dropped = unscored = 0
+    with open(scored_path, "w") as scored_out, open(kept_path, "w") as kept_out:
+        for i, (row, task, answer) in enumerate(rows, 1):
+            try:
+                score, reason = parse_score(ask(task, answer))
+            except Exception as exc:
+                score, reason = None, f"judge call failed after retries: {exc}"
+            scored_row = dict(row)
+            scored_row["judge_score"] = score
+            scored_row["judge_reason"] = reason
+            scored_out.write(json.dumps(scored_row) + "\n")
+            scored_out.flush()
+            if score is None:
+                unscored += 1
+                print(f"row {i}: judge reply was not a score ({reason})",
+                      flush=True)
+            else:
+                histogram[score] = histogram.get(score, 0) + 1
+                if score >= threshold:
+                    # Verbatim input row: the kept file keeps the shape the
+                    # trainer already knows how to read.
+                    kept_out.write(json.dumps(row) + "\n")
+                    kept_out.flush()
+                    kept += 1
+                else:
+                    dropped += 1
+            if i % 25 == 0:
+                print(f"progress: {i}/{len(rows)} judged", flush=True)
+
+    print(f"score histogram (n={len(rows)}):", flush=True)
+    for score in range(10, 0, -1):
+        count = histogram.get(score, 0)
+        print(f"  {score:>2} | {'#' * count} {count}", flush=True)
+    if unscored:
+        print(f"  unscored: {unscored}", flush=True)
+    print(f"kept {kept} of {len(rows)} rows scoring >= {threshold}, "
+          f"dropped {dropped}, unscored {unscored}", flush=True)
+    print(f"kept rows -> {kept_path}", flush=True)
+    print(f"scored rows -> {scored_path}", flush=True)
+    if alpaca:
+        print(f"kept rows are alpaca-shaped: point an axolotl-finetune config "
+              f"at {kept_path} with type: alpaca", flush=True)
+    else:
+        print("kept rows are records-shaped {record, synthesis}: axolotl's "
+              "type: alpaca will NOT train on them. Re-run llm-synthesize "
+              "with output_format=alpaca if you meant to distill.", flush=True)
+    if not kept:
+        sys.exit(f"no row scored >= {threshold}: nothing to train on. Lower "
+                 f"the threshold or fix the criteria (the histogram above "
+                 f"shows what the judge actually gave).")
+
+gpu:
+  min_vram_gib: 0

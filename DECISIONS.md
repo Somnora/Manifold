@@ -3957,3 +3957,160 @@ the HOST's CUDA state, not container passthrough; it should probe
 once) for jobs dispatched within the first minute of a connection.
 
 Running total for the two real gates: ~$1.27, every audit book closed.
+
+## Phase 84 - Distill v2: teacher, judge, scorecard (2026-08-14)
+
+- **Recipes again, not a platform.** The whole distillation upgrade is two
+  new template files, one modified one, and a single POST route. Curation
+  and evaluation are jobs, so they inherit everything already built:
+  depends_on chaining with skip-on-parent-failure, the mount jail, the
+  budget/ceiling/policy stack, the rescue on termination, the cost
+  annotation, the audit trail. **Alternative:** a "distillation service"
+  module owning the pipeline end to end - rejected for the same reason as
+  Phase 83. It would have re-implemented five subsystems to gain a progress
+  bar, and every guard would have needed a second implementation.
+
+- **Teacher-agnostic through a base URL, not a backend proxy.** llm-synthesize
+  and llm-judge take `teacher_base_url` / `judge_base_url` and dial it
+  themselves from inside the container. **Alternative:** route teacher calls
+  through the backend's brain registry, so the dashboard's model picker
+  would list them - rejected. The backend runs on the user's laptop; the job
+  runs in a datacenter. Proxying would have put a laptop on the critical
+  path of a thousand GPU-side requests, and would have made the backend a
+  credential holder for a key that belongs on the instance. The rule the
+  templates document instead is locality: the teacher must be reachable FROM
+  THE INSTANCE, so a served model and a public API qualify and a laptop
+  Ollama never can, whatever the UI implies.
+
+- **API keys ride the user's own .env, because parameters are public.** The
+  dispatcher writes the fully rendered docker command into the job log
+  (dispatcher.py:1044), which is persisted and shown on the job card. Any key
+  passed as a parameter is therefore echoed verbatim and stored in SQLite, so
+  all three templates copy script-run's `env_file` convention instead: a
+  KEY=value file on the persistent filesystem, sourced by the shell before
+  python starts. `teacher_base_url` and `judge_base_url` additionally refuse a
+  query string or a `user:pass@host`, which is the other way a key reaches
+  that log line. Manifold never sees the key at all.
+
+- **Curation is its own job, not a flag on synthesize.** llm-judge reads a
+  synthesized file and writes `scored-<name>.jsonl` (evidence) and
+  `kept-<name>.jsonl` (the training set), both back into `synthesized/`
+  because that is the only dataset directory axolotl-finetune mounts.
+  **Alternative:** a `min_score` parameter on llm-synthesize that filtered
+  inline - rejected for three reasons. Generation and judging want different
+  models (a judge that is also the teacher grades its own homework, which the
+  template warns about by name), the score histogram is the artifact that
+  teaches a beginner what their data is actually worth, and re-judging with a
+  different threshold must not cost a second generation pass. Separating them
+  also means a failed judge run leaves the generated data intact.
+
+- **The holdout is deterministic and is capped at 50%.** Every Nth GENERATED
+  row (not every Nth input row, so input failures cannot make the split
+  lumpy) is written to `eval-<name>.jsonl` keeping the teacher's answer, so
+  llm-eval grades against it later without paying to generate it twice.
+  `holdout_pct` is bounded 0-50 and the job FAILS if either half comes out
+  empty: a 100% holdout starves the trainer and a holdout that rounds to zero
+  rows makes the scorecard print a meaningless 0%, and both are silent.
+
+- **The config generator returns for REVIEW and can never train.** POST
+  /distill/config asks a brain for an axolotl YAML, validates it, and hands
+  it back as text. It writes no file and starts no job; saving is the
+  existing upload route and training is the existing axolotl-finetune job,
+  both human actions. **Alternative:** save-and-queue in one click - rejected
+  outright. axolotl EXECUTES that config on the GPU box, so validation is a
+  security boundary and not a lint: an allowlist of top-level and per-dataset
+  keys, `trust_remote_code` refused by name, `base_model` restricted to the
+  vetted student shelf, `datasets[0].path` required to EQUAL the file the
+  user named (a glob would sweep in the held-out `eval-*.jsonl` and train the
+  student on its own exam), `output_dir` confined to the writable mount, and
+  anchors/aliases refused because a size cap alone does not stop an expansion
+  bomb. A model wrote the file; a human reads it before it runs.
+
+- **One seam, plus one static catalog read.** `GET /student-presets` is a
+  second route, taken deliberately: the shelf of small open bases is how you
+  CHOOSE a student, and a catalog that only arrives with the first generated
+  answer is a catalog nobody can use. It mirrors GET /model-presets exactly
+  (three lines, lazy import, viewer role). The seam that does work is still
+  the single POST.
+
+- **llm-eval loads the student in-process, and the VRAM arithmetic is in the
+  template header.** transformers from the merged weights on the filesystem,
+  not a second vllm-serve. **Alternative:** serve the student and compare two
+  endpoints - rejected: one server per instance is a standing rule, a
+  scorecard run is a batch job rather than a service, and a served student
+  would need the card that the teacher is already holding. vLLM takes 90% of
+  the GPU by default, so on a 24GB A10 a live teacher holds ~21.6GB and a 3B
+  student beside it is a guaranteed OOM. The default path avoids the
+  collision entirely: teacher answers are already stored in the holdout file,
+  so the recommended run happens after the teacher is stopped, with
+  `student_device=cpu` as the documented slow escape hatch.
+
+- **The scorecard says what it is.** A judge picks blind between the two
+  answers with the student at position A on even item indexes and B on odd,
+  which cancels position bias and NOTHING else. Ties are a third outcome
+  rather than folded into wins; `judge_model`, `teacher_model` and
+  `judge_is_teacher` land in scorecard.json; and an equal judge and teacher
+  print a warning above the headline number. It is a preference score from
+  one model, not a benchmark, and the template and the doc both say so.
+
+- **The chain is the batch tail; the teacher server is bound with Run on.**
+  depends_on refuses a server parent ("a server that never exits on its own:
+  'after it succeeds' would mean never"), which is correct and stays.
+  synthesize -> judge -> finetune -> merge chains up front; the teacher is
+  started separately and the batch jobs are pointed at that instance with
+  target_instance_id. llm-eval only joins the chain when there is no local
+  server to collide with, i.e. when teacher and judge are both APIs.
+
+- **llm-synthesize's compatibility guarantee is behaviour, not bytes.** The
+  advertised "byte-for-byte backward compatible" is not achievable and was
+  not claimed: every declared parameter always renders, so four new ones
+  append four quoted args to the docker command. What IS guaranteed is that
+  defaults reproduce the old behaviour exactly. The mechanism: new
+  parameters are only ever APPENDED, and the script reads them as
+  `sys.argv[n] if len(sys.argv) > n else default`, so no existing slot moves.
+  env_file forced the one structural change: the old
+  `bash -c 'exec python -c "$PYCODE" "$@"' manifold` had no shell step in
+  which to source anything, so a prologue now runs inside the same
+  single-quoted wrapper (env_file is the LAST positional, which is why the
+  prologue reads the last argument rather than $1). The env var stayed named
+  PYCODE so test_pipeline.py keeps addressing it.
+
+- **The `manifold` token is bash's $0, and belongs to `bash -c` alone.** This
+  is the mechanism behind the bug fixed the day before this phase, recorded
+  here because three new templates copy the pattern. `bash -c SCRIPT [name
+  [args...]]`: the first operand after the script is assigned to $0 (the
+  shell's name for its own error messages), and only the ones after it become
+  $1, $2. So in llm-synthesize's wrapper the literal `manifold` is padding,
+  and dropping it would silently eat the first real parameter. Commit
+  8c34a79 cargo-culted the same token onto vllm-serve and sglang-serve, which
+  have NO bash wrapper at all (`entrypoint: python3`, command starting at
+  `-c`): python's -c consumes no argv0 operand, so `manifold` became a real
+  argument, every parameter bound one slot off, and model_id was the string
+  "manifold" for a month. Rule, now testable: the token appears after
+  `bash -c '<script>'` and nowhere else.
+
+**Test coverage:** the bundled registry loads clean with all three templates
+(targeted runs: tests/test_templates.py, test_serve_templates.py,
+test_foundry_templates.py, test_pipeline.py, test_template_quoting.py = 51
+passed; test_mcp.py, test_rbac.py, test_auth.py = 51 passed, so the MCP
+import allowlist and the closed ROUTE_ROLES table both still hold; the
+dashboard builds clean). All three templates declare no `ports:`, so none is
+misclassified as a server and all are legal chain links. distill.py's
+validator was exercised against a stub brain over TestClient (fenced and
+unfenced YAML, prose, unknown envelope, and sixteen rejection paths incl.
+trust_remote_code, off-shelf base, glob path, held-out path, traversal, and
+an alias bomb). The template scripts were executed for real against a
+loopback stub OpenAI server after being rendered through a real shell, which
+is the two-class rule the vllm-serve repair established: golden renders catch
+drift in the docker line, executed scripts catch drift in what actually runs.
+**Open, stated plainly:** those harnesses were throwaway, so permanent tests
+for llm-judge and llm-eval (including CASES entries in
+test_template_quoting.py and a floating-tag warning assertion for llm-eval's
+axolotl image) are still owed; llm-eval's transformers calls have only run
+against stub torch/transformers and need a real-hardware gate;
+estimates.DEFAULT_MINUTES has no entry for the two new templates, so their
+estimate degrades to the 15-minute fallback; and the STUDENT_PRESETS repo ids
+are curated but not verified against the HuggingFace API the way
+MODEL_PRESETS were. No real-GPU run has priced this loop, so every cost
+figure in docs/distill-your-own-model.md is marked unverified arithmetic
+except the $1.29/hr A10 rate.
