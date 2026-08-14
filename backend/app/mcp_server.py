@@ -418,6 +418,47 @@ async def save_template(yaml_text: str, note: str = "") -> dict:
 
 
 @mcp.tool()
+async def generate_training_config(spec: str, dataset: str, brain: str,
+                                   student_model: str = "",
+                                   note: str = "") -> dict:
+    """Turn a plain-words distillation goal into an axolotl LoRA training
+    config, written by a model and checked by the backend.
+
+    `spec` is what the student should learn, in the user's words, e.g.
+    "distill film-shot tagging into a 3B LoRA that fits an A10". `dataset`
+    is the bare filename of the curated training set under
+    <filesystem>/synthesized (llm-judge writes kept-<name>.jsonl there).
+    `brain` is a ref from the backend's brain registry: "cli:claude",
+    "cli:codex", "cli:gemini", "api:<name>", "local:<endpoint>/<model>", or
+    "instance:<instance_id>" for a model already served on a GPU.
+    `student_model` optionally pins the base model; leave it empty and the
+    brain picks from Manifold's curated shelf of small open bases.
+
+    REVIEW ONLY: nothing is written to the filesystem and no training
+    starts. Show the returned YAML to the user first. When they approve,
+    upload it with upload_file to configs/<name>.yaml (the response's
+    suggested_path) and then run_job axolotl-finetune. `advisories` lists
+    things worth saying out loud before they spend a GPU hour.
+
+    The backend rejects a config that names an unvetted base model, points
+    at a path the job does not mount, or asks to run remote code; the error
+    says which. That is a real rejection, not a hiccup: fix the spec or the
+    brain's answer, do not retry blindly."""
+    return await _call(
+        "generate_training_config", "POST", "/distill/config",
+        note=note,
+        args={"dataset": dataset, "brain": brain,
+              "student_model": student_model,
+              "spec": f"({len(spec)} chars)"},
+        body={"spec": spec, "dataset": dataset, "brain": brain,
+              "student_model": student_model},
+        # A CLI brain is allowed to think for up to 280s server-side; the
+        # client's default 60s would abandon the call mid-answer.
+        request_timeout=300.0,
+    )
+
+
+@mcp.tool()
 async def delete_template(name: str, note: str = "") -> dict:
     """Delete a CUSTOM template by name. Bundled templates cannot be
     deleted; if the custom one was overriding a bundled name, the bundled

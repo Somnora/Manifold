@@ -40,6 +40,7 @@ npm run dev     # then open http://localhost:3000
   - `task_queue.py` — `TaskQueue` interface + SQLite implementation
   - `dispatcher.py` — per-instance parallel task dispatch (server+batch coexist; jobs can target an instance), idle auto-termination, capacity watches, GPU telemetry sampling, auto-manage lifecycle (queue-then-launch through the guarded paths)
   - `estimates.py` — pure cost/utilization functions: pre-launch estimate + post-run right-size hint (advisory only, off the launch path)
+  - `distill.py` — pure prompt-building + allowlist validation for brain-written axolotl configs (POST /distill/config); returns for review, never saves, never trains
   - `agent.py` — Autopilot: agent loop driven by any brain; fixed action allowlist; per-action human approval gates on spend actions
   - `brains.py` — brain registry: instance-served models, local Ollama/LM Studio (auto-detected), frontier APIs (key-gated)
   - `preferences.py` — the Settings-page policies (approval gates, notification toggles, data safety). config.yaml holds the DEFAULTS; the user's choices live in SQLite and override them. Never secrets.
@@ -53,8 +54,8 @@ npm run dev     # then open http://localhost:3000
 - `desktop/` — Tauri v2 shell (.dmg/.msi): spawns the frozen backend as a sidecar, navigates a native window to it (see docs/desktop-build.md)
 - `backend/tests/` — pytest; everything runs against mocks
 - `sidecar/manifold_sidecar.py` — runs ON the instance, 127.0.0.1 only; embedded into cloud-init (metrics, unpersisted/recent files, fs browse/usage/delete)
-- `templates/*.yaml` — bundled job templates (vllm-serve, sglang-serve, whisper-batch, axolotl-finetune, tao-train, sdxl-generate, script-run, llm-synthesize, gpu-smoke, and the Foundry trio: lerobot-act, smolvla-finetune, nanogpt-pretrain); user-authored templates live in `custom-templates/` under the data dir, same loader and mount jail, editable from the Jobs page or via MCP `save_template`
-- `docs/` — user-facing guides (agent-on-gpu.md, mcp-setup.md, openai-proxy.md, data-pipeline.md, distill-your-own-model.md, train-your-own-model.md, desktop-build.md, local-hub.md, team-mode.md)
+- `templates/*.yaml` — bundled job templates (vllm-serve, sglang-serve, whisper-batch, axolotl-finetune, lora-merge, tao-train, sdxl-generate, script-run, gpu-smoke; the distill chain: llm-synthesize, llm-judge, llm-eval; the Foundry trio: lerobot-act, smolvla-finetune, nanogpt-pretrain); user-authored templates live in `custom-templates/` under the data dir, same loader and mount jail, editable from the Jobs page or via MCP `save_template`
+- `docs/` — user-facing guides (agent-on-gpu.md, mcp-setup.md, openai-proxy.md, data-pipeline.md, distill-your-own-model.md, train-your-own-model.md, custom-templates.md, desktop-build.md, local-hub.md, team-mode.md)
 - `config.yaml` — guardrails, retry policy, SSH settings, telemetry sample interval
 - `.env` — secrets only (gitignored; template in `.env.example`)
 - `DECISIONS.md` — every non-obvious choice gets an entry (what/alternatives/why)

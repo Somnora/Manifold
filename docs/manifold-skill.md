@@ -112,12 +112,20 @@ hardware, never through the cloud (control loops need milliseconds).
 
 ### Fine-tune / distill
 
-The proven pipeline, end to end (see docs/distill-your-own-model.md):
-`vllm-serve` a teacher, `llm-synthesize` a dataset from it, then
-`axolotl-finetune` a student LoRA. All three are templates; all three
-run on the same instance sequentially. The finetune step can be
-enqueued up front with `depends_on` on the synthesize task: it holds
-until the dataset job succeeds and is skipped if it fails.
+The pipeline, end to end (see docs/distill-your-own-model.md):
+`vllm-serve` a teacher, `llm-synthesize` a dataset from it (set
+`output_format=alpaca` and `holdout_pct=10`), `llm-judge` to score and
+keep only the good rows, `axolotl-finetune` a student LoRA, `lora-merge`
+to fold it into the base, `llm-eval` for a blind scorecard against the
+held-out rows. All are templates on one instance. Chain the batch ones
+up front with `depends_on`: each holds until its parent succeeds and is
+skipped if it fails. The teacher is NOT a valid parent (a server never
+exits); start it first and point the batch jobs at that box with
+`target_instance_id` instead. `generate_training_config` asks a brain
+for the axolotl YAML and validates it, but returns it for the user to
+review: it saves nothing and starts nothing. Teacher/judge API keys ride
+a `.env` on the persistent filesystem named in `env_file`, never a
+parameter (parameters are logged verbatim).
 
 ### Browse files
 

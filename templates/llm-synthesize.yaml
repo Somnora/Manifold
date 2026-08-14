@@ -1,17 +1,32 @@
-# Synthesize a dataset with the model served ON THIS INSTANCE: map an
-# instruction over every record of a JSONL/CSV file and write structured
-# results back to persistent storage.
+# Synthesize a dataset with ANY reachable teacher: map an instruction over
+# every record of a JSONL/CSV file and write structured results back to
+# persistent storage.
 #
-#   scraped records --> [instruction + record -> served model] --> synthesized.jsonl
+#   scraped records --> [instruction + record -> teacher model] --> synthesized.jsonl
 #
-# Requires a running vllm-serve job on the same instance (the model server
-# on the host's loopback — that is why this template uses host networking).
-# The model id is auto-discovered from /v1/models. Output: one JSON line
-# per record: {"record": <input>, "synthesis": <model output>} under
-# <filesystem>/synthesized/. Stdlib-only (urllib), so the container starts
-# in seconds.
+# TEACHER LOCALITY. The teacher must be reachable FROM THE INSTANCE, not from
+# your laptop. A vllm-serve job on this same instance is (that is why this
+# template uses host networking: the container dials the host's loopback). A
+# public OpenAI-compatible API is. Ollama or LM Studio running on your laptop
+# is NOT, and no setting here can make it so.
+#
+# TEACHER LICENSE. Open-weights teachers (Qwen, Llama, Mistral) are the clean
+# path: their licenses permit training on their outputs, subject to their own
+# terms. Frontier-API terms generally FORBID using the outputs to train a
+# competing model. Manifold labels the choice; you decide what your project
+# is allowed to do.
+#
+# Defaults reproduce the original loopback behaviour exactly: leave
+# teacher_base_url, teacher_model, holdout_pct and env_file alone and this
+# template behaves as it always has (127.0.0.1:<port>/v1, model
+# auto-discovered from /v1/models, one output file).
+#
+# Output: one JSON line per record under <filesystem>/synthesized/. With
+# holdout_pct > 0 a slice is held back into eval-<output_name>.jsonl beside
+# it, so a later scorecard (llm-eval) never grades on training data.
+# Stdlib-only (urllib), so the container starts in seconds.
 name: llm-synthesize
-description: Map an instruction over a JSONL/CSV dataset using the model served on this instance
+description: Map an instruction over a JSONL/CSV dataset using any reachable teacher (the model served on this instance, or an OpenAI-compatible API). Open-weights teachers are the clean path for training; frontier-API terms usually forbid it.
 image: python:3.11-slim
 network: host
 
@@ -21,9 +36,22 @@ network: host
 # so they reach the container intact). A bare `python -c "$PYCODE"` would be
 # expanded to empty by the instance shell and run nothing. See DECISIONS.md
 # 2026-07-12 (env-script quoting).
+#
+# The shell prologue exists for one reason: an API key must never be a
+# parameter (every parameter is rendered into the docker command, which is
+# written verbatim to the job log). It sources the user's own .env off the
+# persistent filesystem instead, exactly as script-run does. env_file is the
+# LAST positional, which is why the prologue reads the last one ("for a in
+# $@" leaves $a holding it) rather than $1: new parameters are APPENDED so
+# the argv slots of the existing ones never shift.
 command: >
-  bash -c 'exec python -c "$PYCODE" "$@"' manifold
+  bash -c 'ef=""; for a in "$@"; do ef="$a"; done;
+  if [ -n "$ef" ]; then if [ ! -f "/data/$ef" ]; then
+  echo "manifold: env file not found: /data/$ef (path is relative to the filesystem root)" >&2;
+  exit 2; fi; set -a; . "/data/$ef"; set +a; fi;
+  exec python -c "$PYCODE" "$@"' manifold
   {{input_path}} {{output_name}} {{instruction}} {{port}} {{limit}} {{output_format}}
+  {{teacher_base_url}} {{teacher_model}} {{holdout_pct}} {{env_file}}
 
 parameters:
   - name: input_path
@@ -39,15 +67,31 @@ parameters:
   - name: port
     type: integer
     default: 8080
-    description: Loopback port of the vllm-serve job on this instance
+    description: Loopback port of the vllm-serve job on this instance (ignored when teacher_base_url is set)
   - name: limit
     type: integer
     default: 0
-    description: Max records to process (0 = all) — use a small number to test
+    description: Max records to process (0 = all). Use a small number to test.
   - name: output_format
     type: string
     default: records
     description: records = {record, synthesis} rows; alpaca = {instruction, input, output} rows that axolotl-finetune trains on directly (distillation)
+  - name: teacher_base_url
+    type: string
+    default: ""
+    description: OpenAI-compatible base URL of the teacher (e.g. https://api.example.com/v1). Empty = the model served on this instance. Must carry no credentials.
+  - name: teacher_model
+    type: string
+    default: ""
+    description: Teacher model id. Empty = auto-discover the one model this instance is serving.
+  - name: holdout_pct
+    type: integer
+    default: 0
+    description: Percent of generated rows (0 to 50) held back into eval-<output_name>.jsonl for llm-eval, so the scorecard never grades on training data. 0 = no holdout.
+  - name: env_file
+    type: string
+    default: ""
+    description: Optional .env on the filesystem (e.g. research/.env), sourced for the teacher API key. Set MANIFOLD_TEACHER_API_KEY (or OPENAI_API_KEY) in it.
 
 volumes:
   - host: "{persistent}"
@@ -58,18 +102,49 @@ env:
     import csv, json, os, sys, time, urllib.request
     inp, out_name, instruction, port, limit = (
         sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4]), int(sys.argv[5]))
-    out_format = sys.argv[6] if len(sys.argv) > 6 else "records"
+
+    def arg(n, default=""):
+        # Parameters added after the first release are read positionally with
+        # a default, so an older 5-argument call behaves exactly as it did.
+        # New parameters are only ever APPENDED; inserting one would shift
+        # every slot after it and bind the wrong values (silently).
+        value = sys.argv[n] if len(sys.argv) > n else ""
+        return value if value else default
+
+    out_format = arg(6, "records")
+    teacher_url = arg(7).strip().rstrip("/")
+    teacher_model = arg(8).strip()
+    holdout_pct = int(arg(9, "0"))
+    # argv[10] is env_file. The SHELL already sourced it before python started;
+    # python must never see the key itself, only its effect on os.environ.
+
     if out_format not in ("records", "alpaca"):
         sys.exit(f"output_format must be 'records' or 'alpaca', got {out_format!r}")
-    base = f"http://127.0.0.1:{port}/v1"
+    if not 0 <= holdout_pct <= 50:
+        sys.exit(f"holdout_pct must be between 0 and 50, got {holdout_pct} "
+                 f"(a larger holdout would starve the training file)")
+    # The rendered docker command is written verbatim to the job log, so a URL
+    # carrying a key or a user:pass would leak it. Keys ride env_file instead.
+    if "?" in teacher_url or "@" in teacher_url:
+        sys.exit("teacher_base_url must carry no credentials: no query string, "
+                 "no user:pass@host. Put the key in a .env and name it in "
+                 "env_file (MANIFOLD_TEACHER_API_KEY=...).")
+
+    base = teacher_url or f"http://127.0.0.1:{port}/v1"
+    # Read once, never printed, never put on a command line.
+    api_key = (os.environ.get("MANIFOLD_TEACHER_API_KEY")
+               or os.environ.get("OPENAI_API_KEY") or "")
     # Overridable so tests can fail fast; ops rarely needs to touch it.
     READY_TIMEOUT = int(os.environ.get("MANIFOLD_SYNTH_READY_TIMEOUT", "300"))
 
     def api(path, payload=None, timeout=600):
+        headers = {"Content-Type": "application/json"}
+        if api_key:
+            headers["Authorization"] = "Bearer " + api_key
         req = urllib.request.Request(
             base + path,
             data=json.dumps(payload).encode() if payload else None,
-            headers={"Content-Type": "application/json"})
+            headers=headers)
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return json.load(r)
 
@@ -81,20 +156,23 @@ env:
 
     # Preflight 2: WAIT for the served model to actually answer, instead of
     # crashing if synthesize was queued before vllm-serve finished loading.
-    print(f"waiting for a model on 127.0.0.1:{port} "
-          f"(up to {READY_TIMEOUT}s) ...", flush=True)
-    model = None
-    deadline = time.time() + READY_TIMEOUT
-    while True:
-        try:
-            model = api("/models", timeout=10)["data"][0]["id"]
-            break
-        except Exception as exc:
-            if time.time() >= deadline:
-                sys.exit(f"no model answered on :{port} within {READY_TIMEOUT}s "
-                         f"— is a vllm-serve job running and finished loading? "
-                         f"({exc})")
-            time.sleep(2)
+    # A named model on a remote API needs no such dance: it is already up.
+    model = teacher_model
+    if not (model and teacher_url):
+        print(f"waiting for a model at {base} "
+              f"(up to {READY_TIMEOUT}s) ...", flush=True)
+        deadline = time.time() + READY_TIMEOUT
+        while True:
+            try:
+                discovered = api("/models", timeout=10)["data"][0]["id"]
+                break
+            except Exception as exc:
+                if time.time() >= deadline:
+                    sys.exit(f"no model answered at {base} within "
+                             f"{READY_TIMEOUT}s: is a vllm-serve job running "
+                             f"and finished loading? ({exc})")
+                time.sleep(2)
+        model = model or discovered
     print(f"synthesizing with {model}", flush=True)
 
     def records():
@@ -136,7 +214,7 @@ env:
 
     def as_points(content):
         # Turn the model's reply into usable structured points when it is
-        # JSON — including the ```json fenced form models love to emit.
+        # JSON, including the ```json fenced form models love to emit.
         s = content.strip()
         if s.startswith("```"):
             s = s[3:]
@@ -151,11 +229,19 @@ env:
             return None
 
     out_path = f"/data/synthesized/{out_name}.jsonl"
+    eval_path = f"/data/synthesized/eval-{out_name}.jsonl"
     os.makedirs("/data/synthesized", exist_ok=True)
-    done = failed = 0
-    with open(out_path, "w") as out:
+    # Every Nth GENERATED row is held back, not every Nth INPUT row: input
+    # failures would otherwise make the split lumpy and unpredictable. The
+    # held rows keep the teacher's answer, so llm-eval has something to grade
+    # against without paying to generate them a second time.
+    hold_every = max(2, int(round(100.0 / holdout_pct))) if holdout_pct else 0
+    done = failed = held = 0
+    out = open(out_path, "w")
+    evals = open(eval_path, "w") if hold_every else None
+    try:
         for i, record, parse_error in records():
-            if limit and done + failed >= limit:
+            if limit and done + held + failed >= limit:
                 break
             if parse_error:
                 failed += 1
@@ -177,16 +263,36 @@ env:
                         row["synthesis_json"] = points   # ready-to-use points
                     else:
                         row["parse_error"] = True         # model did not emit JSON
-                out.write(json.dumps(row) + "\n")
-                out.flush()
-                done += 1
+                if hold_every and (done + held + 1) % hold_every == 0:
+                    evals.write(json.dumps(row) + "\n")
+                    evals.flush()
+                    held += 1
+                else:
+                    out.write(json.dumps(row) + "\n")
+                    out.flush()
+                    done += 1
             except Exception as exc:
                 failed += 1
                 print(f"record {i} failed after retries: {exc}", flush=True)
-            if (done + failed) % 25 == 0:
-                print(f"progress: {done} ok, {failed} failed", flush=True)
+            if (done + held + failed) % 25 == 0:
+                print(f"progress: {done} ok, {held} held out, {failed} failed",
+                      flush=True)
+    finally:
+        out.close()
+        if evals:
+            evals.close()
     print(f"finished: {done} synthesized, {failed} failed -> {out_path}",
           flush=True)
+    if hold_every:
+        print(f"holdout: {held} rows held back (every {hold_every}th generated "
+              f"row, {100.0 / hold_every:.0f}%) -> {eval_path}", flush=True)
+        # An empty half is not a holdout, it is a silent trap: axolotl would
+        # fail on an empty training file, or llm-eval would score 0/0 and
+        # print a meaningless 0%.
+        if not done or not held:
+            sys.exit(f"holdout produced an unusable split: {done} training "
+                     f"rows and {held} eval rows. Generate more records or "
+                     f"lower holdout_pct.")
 
 gpu:
   min_vram_gib: 0

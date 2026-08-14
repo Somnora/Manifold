@@ -15,6 +15,7 @@ import { StatusBadge } from "@/components/Badge";
 import { ParameterForm } from "@/components/ParameterForm";
 import { EstimateWidget } from "@/components/EstimateWidget";
 import { TemplateEditor } from "@/components/TemplateEditor";
+import { DistillConfigPanel } from "@/components/DistillConfigPanel";
 import {
   AutoManageControls,
   type AutoManageState,
@@ -404,6 +405,13 @@ export default function JobsPage() {
 
         <div className="mt-6">
           <TemplateEditor templates={templates} onChanged={loadTemplates} />
+        </div>
+
+        {/* The config a fine-tune reads, drafted from a plain-words spec
+            (Phase 84). It sits beside the queue because the config is what
+            axolotl-finetune above takes as its config_path. */}
+        <div className="mt-6">
+          <DistillConfigPanel connectedInstances={connected.length} />
         </div>
       </section>
 

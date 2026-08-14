@@ -371,6 +371,22 @@ class AgentHandshakeRequest(BaseModel):
     protocol: str = "manifold-v1"
 
 
+class DistillConfigRequest(BaseModel):
+    # Module level, not nested in create_app - see PrincipalRequest above for
+    # why a closure-local model degrades to a query parameter and 422s.
+    # What the student should learn, in plain words, e.g. "distill film-shot
+    # tagging into a 3B LoRA that fits an A10".
+    spec: str = Field(min_length=10, max_length=4000)
+    # The curated training file's bare name under <filesystem>/synthesized
+    # (llm-judge's kept-*.jsonl, or llm-synthesize's output).
+    dataset: str = Field(min_length=1, max_length=128)
+    # Which brain writes the config: any ref from GET /brains.
+    brain: str = Field(min_length=3, max_length=200)
+    # Optional: pin the student base instead of letting the brain pick one
+    # off the shelf. Must still be a shelf entry; the validator checks it.
+    student_model: str = Field(default="", max_length=200)
+
+
 class AgentContextUpdateRequest(BaseModel):
     workspace_environment: dict | None = None
     active_gpu_connections: dict | None = None
@@ -2646,6 +2662,97 @@ def create_app(
         """Curated, ungated vLLM-serveable models tiered by GPU VRAM."""
         from .model_catalog import MODEL_PRESETS
         return {"presets": MODEL_PRESETS}
+
+    # -- distillation ------------------------------------------------------------------
+
+    @app.get("/student-presets")
+    async def student_presets():
+        """The other end of the shelf: small open bases to distill INTO.
+
+        Static catalog, same shape as /model-presets. It is a separate read
+        rather than a field on the generation response below because you
+        pick the student BEFORE you describe the task, and a catalog that
+        only arrives with the first answer is a catalog nobody can use."""
+        from .model_catalog import STUDENT_PRESETS
+        return {"presets": STUDENT_PRESETS}
+
+    @app.post("/distill/config")
+    async def generate_distill_config(req: DistillConfigRequest):
+        """Ask a brain for an axolotl LoRA config; validate it; return it.
+
+        REVIEW ONLY. Nothing is written and no training starts: saving is
+        the existing upload route (POST /instances/{id}/files/upload with
+        dest=configs/<name>.yaml, so it needs a connected instance) and
+        training is the existing axolotl-finetune job. Both stay human
+        decisions.
+
+        Validation lives in distill.py and is a security boundary, not a
+        lint: axolotl EXECUTES the config on the GPU box, so a model-written
+        file is checked against an allowlist before anyone can save it.
+
+        Slow on purpose: a CLI brain is allowed minutes. A client with the
+        default 30s request timeout will report a failure while the backend
+        is still working, so callers must raise theirs (the dashboard passes
+        an explicit timeoutMs)."""
+        from . import distill
+        from .model_catalog import STUDENT_PRESETS
+
+        try:
+            dataset = distill.validate_dataset_name(req.dataset)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc))
+        if req.student_model and req.student_model not in {
+                s["model_id"] for s in STUDENT_PRESETS}:
+            raise HTTPException(
+                422,
+                f"'{req.student_model}' is not on the student shelf. Pick "
+                f"one from GET /student-presets, or leave it empty and let "
+                f"the brain choose.")
+
+        try:
+            client, brain_model, brain_port = brains.resolve(req.brain)
+        except ValueError as exc:
+            raise HTTPException(409, str(exc))
+
+        prompt = distill.build_prompt(
+            spec=req.spec, dataset=dataset, students=STUDENT_PRESETS,
+            student_model=req.student_model)
+        try:
+            reply = await client.chat_completion(brain_port, {
+                "model": brain_model,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 2048,
+                # A config, not prose: near-greedy keeps the same spec from
+                # producing a different set of hyperparameters every click.
+                "temperature": 0.2,
+            })
+        except ModelClientError as exc:
+            raise HTTPException(502, f"the {req.brain} brain failed: {exc}")
+        try:
+            text = reply["choices"][0]["message"]["content"] or ""
+        except (KeyError, IndexError, TypeError):
+            # A brain that answers 200 with a shape we do not recognise is
+            # the same class of problem as one that answers prose: say what
+            # came back instead of raising a KeyError at the user.
+            raise HTTPException(
+                502,
+                f"the {req.brain} brain answered in an unexpected shape: "
+                f"{str(reply)[:200]}")
+
+        try:
+            config = distill.validate_config(
+                text, dataset=dataset, students=STUDENT_PRESETS)
+        except distill.ConfigRejected as exc:
+            raise HTTPException(502, str(exc))
+
+        # An api: brain spends the user's money and a cli: brain acts under
+        # their login, so which one wrote this belongs in the audit trail.
+        db.record_audit(
+            current_principal(), "distill_config",
+            f"{req.brain} wrote a training config for {dataset} "
+            f"(student {config['base_model']}); review only, nothing saved")
+        return {"config": {**config, "brain": req.brain,
+                           "suggested_path": distill.config_filename(dataset)}}
 
     # -- capacity watches ---------------------------------------------------------------
 
