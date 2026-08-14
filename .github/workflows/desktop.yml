@@ -70,9 +70,18 @@ jobs:
       - env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # find, not a glob. upload-artifact@v4 keeps the common ancestor of
+          # its `path:` patterns, so the installers land at
+          # dist/<artifact>/dmg/*.dmg and dist/<artifact>/msi/*.msi - one level
+          # deeper than dist/<artifact>/*.dmg. The v0.2.0 tag build produced
+          # both installers and then failed here with "no matches found",
+          # after seven minutes of CI. A recursive find does not care how the
+          # action nests them.
+          mapfile -t installers < <(find dist -type f \( -name '*.dmg' -o -name '*.msi' \) | sort)
+          printf 'publishing %s\n' "${installers[@]}"
+          test "${#installers[@]}" -ge 2 || { echo "expected a .dmg AND a .msi, found ${#installers[@]}" >&2; exit 1; }
           gh release create "${{ github.ref_name }}" \
-            dist/manifold-macos-14/*.dmg \
-            dist/manifold-windows-2022/*.msi \
+            "${installers[@]}" \
             --repo "${{ github.repository }}" \
             --title "Manifold ${{ github.ref_name }}" \
             --notes "Unsigned builds: macOS shows an \"unidentified developer\" warning (right-click the app -> Open); Windows shows a SmartScreen warning (More info -> Run anyway). See docs/desktop-build.md."
