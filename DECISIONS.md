@@ -3935,3 +3935,25 @@ terminated with the safety hook's blessing.
   approved gate. sglang's inside-container --host 0.0.0.0 stays: the
   renderer's 127.0.0.1-only port publish is the jail, per the
   long-standing doctrine on that line.
+
+## Mini-gate: the serve repair verified live, and phase-74 closed (2026-08-14)
+
+~25 minutes of A10, ~$0.35. The repaired vllm-serve template served
+Qwen2.5-0.5B-Instruct on real hardware: the bootstrap's own log line
+shows `--entrypoint python3` in the production docker invocation, the
+model reached ready through the managed forward, `/subagents/dispatch`
+returned a real chat completion over the live SSH forward (THE phase-74
+smoke, the last open item from the original audit), and the OpenAI proxy
+round-tripped real inference under the api token's role gate. Teardown
+exercised terminate-under-a-running-server; the hook found nothing
+unpersisted and the box died clean.
+
+One new finding, filed: the first serve attempt hit a DISPATCH-TOO-EARLY
+race - the job started seconds after SSH connect, before the NVIDIA
+container runtime finished coming up, so torch saw 0 devices inside the
+container while host nvidia-smi was fine. The gpu-ready preflight checks
+the HOST's CUDA state, not container passthrough; it should probe
+`docker run --gpus all` visibility (or retry engine-init class failures
+once) for jobs dispatched within the first minute of a connection.
+
+Running total for the two real gates: ~$1.27, every audit book closed.
