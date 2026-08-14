@@ -112,6 +112,14 @@ class JobTemplate:
     # image's USER directive so NFS bind mounts stay writable (see the
     # parse-time comment; LeRobot's uid-1001 user cannot write them).
     user: str = ""
+    # "" (default) = the image's own entrypoint. A single binary name
+    # (e.g. "python3") overrides it, because an image with an opinionated
+    # ENTRYPOINT consumes the template's command as ARGUMENTS: the
+    # current vllm-openai image turned our `python3 -c <script>` into
+    # `vllm serve ... -c <script>`, feeding the bootstrap into
+    # --compilation-config (found at the 2026-08-14 real gate). One token
+    # only - flags belong in `command`.
+    entrypoint: str = ""
     # Non-fatal advisories surfaced to the Jobs page and list_templates (e.g.
     # a floating image tag that may drift). Computed at parse time.
     warnings: list[str] = field(default_factory=list)
@@ -233,6 +241,13 @@ def parse_template(text: str, source: str = "<inline>") -> JobTemplate:
             f"template '{name}': user must be omitted or 'root', "
             f"got '{user}'"
         )
+
+    entrypoint = str(raw.get("entrypoint") or "")
+    if entrypoint and (any(c.isspace() for c in entrypoint)):
+        raise TemplateError(
+            f"template '{name}': entrypoint must be a single binary name "
+            f"(no spaces - flags belong in `command`), got '{entrypoint}'"
+        )
     if network == "host" and ports:
         raise TemplateError(
             f"template '{name}': 'ports' and 'network: host' are mutually "
@@ -248,7 +263,8 @@ def parse_template(text: str, source: str = "<inline>") -> JobTemplate:
     return JobTemplate(
         name=name, description=str(raw["description"]), image=image,
         command=command, parameters=parameters, volumes=volumes, ports=ports,
-        env=env, gpu=gpu, network=network, user=user, warnings=warnings,
+        env=env, gpu=gpu, network=network, user=user, entrypoint=entrypoint,
+        warnings=warnings,
     )
 
 

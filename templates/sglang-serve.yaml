@@ -8,8 +8,12 @@ name: sglang-serve
 description: Serve a model with SGLang (OpenAI-compatible API on a loopback port). Features RadixAttention prefix caching and multi-LoRA support for agent swarms. Standard HF Transformers repos or local paths only.
 image: lmsysorg/sglang:latest
 
+# Same entrypoint override as vllm-serve: serve images ship opinionated
+# ENTRYPOINTs that would eat this command as their own arguments.
+entrypoint: python3
+
 command: >
-  python3 -c 'import os, sys
+  -c 'import os, sys
 
   (model_id, max_context, port, tensor_parallel,
    lora_paths, mem_fraction_static, enable_lora, max_loras, max_lora_rank) = sys.argv[1:10]
@@ -44,7 +48,7 @@ command: >
   print(f"manifold: launching sglang -> {joined}", flush=True)
 
   os.execvp(cmd[0], cmd)
-  ' manifold {{model_id}} {{max_context}} {{port}} {{tensor_parallel}} {{lora_paths}} {{mem_fraction_static}} {{enable_lora}} {{max_loras}} {{max_lora_rank}}
+  ' {{model_id}} {{max_context}} {{port}} {{tensor_parallel}} {{lora_paths}} {{mem_fraction_static}} {{enable_lora}} {{max_loras}} {{max_lora_rank}}
 
 parameters:
   - name: model_id

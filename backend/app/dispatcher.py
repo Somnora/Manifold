@@ -168,6 +168,10 @@ def render_docker_command(
         # Restores docker's root default for images that drop privileges
         # (validated to "root" at template load; see templates.py).
         parts.append("--user 0:0")
+    if template.entrypoint:
+        # Overrides an image's opinionated ENTRYPOINT, which would
+        # otherwise consume the command below as its own arguments.
+        parts.append(f"--entrypoint {shlex.quote(template.entrypoint)}")
     if template.network == "host":
         # Loopback-consumer jobs (llm-synthesize) dial servers other jobs
         # publish on the host's 127.0.0.1. Mutually exclusive with ports

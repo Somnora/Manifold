@@ -3898,3 +3898,40 @@ same hour.
 
 Total session: ~43 minutes of instance time, $0.92, one instance,
 terminated with the safety hook's blessing.
+
+## vllm-serve repair — two bugs, one hiding behind the other (2026-08-14)
+
+- **The entrypoint knob exists because images have opinions.** The current
+  vllm-openai image's ENTRYPOINT is effectively `vllm serve`, so the
+  template's `python3 -c <script>` command arrived as vllm's own
+  arguments and `-c` landed in --compilation-config (proven at the real
+  gate; a pinned v0.6.3 failed identically, so this was never a
+  latest-tag regression). `entrypoint:` on a template forces the binary;
+  validated to a single token because flags belong in `command`. Both
+  serve templates now set `entrypoint: python3`.
+
+- **Behind it hid an argv shift that made model_id the string
+  "manifold".** Commit 8c34a79 (the Gemini-era feature drop the original
+  audit existed for) prepended a stray token to both serve templates'
+  argument lists while their scripts unpack from sys.argv[1:] - so every
+  parameter bound one slot off, and the server would have tried to serve
+  a model named "manifold". No test ever caught it because every test
+  asserted the RENDERED STRING, and the string contained all the right
+  fragments in all the wrong positions.
+
+- **The fix for the test gap is tests that EXECUTE the bootstrap.**
+  tests/test_serve_templates.py extracts each template's embedded script
+  from the loaded yaml and runs it with the real argv protocol and a
+  stubbed os.execvp, asserting the FINAL command the container would
+  exec - model binding, lora and speculative branches, sglang's module
+  path. Rendered-string goldens catch drift in the docker line; executed
+  bootstraps catch drift in what actually runs. Both classes are now
+  covered, and the 851-test suite passing UNCHANGED around this repair is
+  the measure of the old gap.
+
+- **Not yet re-verified on hardware.** The repair is mock- and
+  unit-proven; a real serve (and with it the phase-74 subagent smoke,
+  still the one open audit book) needs ~$0.30 of A10 time and a user-
+  approved gate. sglang's inside-container --host 0.0.0.0 stays: the
+  renderer's 127.0.0.1-only port publish is the jail, per the
+  long-standing doctrine on that line.

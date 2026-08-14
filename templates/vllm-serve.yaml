@@ -6,8 +6,14 @@ name: vllm-serve
 description: Serve a model with vLLM (OpenAI-compatible API on a loopback port). Supports multi-LoRA subagent personas and speculative decoding draft models. Standard HF Transformers repos or local paths only.
 image: vllm/vllm-openai:latest
 
+# The image's own ENTRYPOINT is `vllm serve` and would consume this
+# command as its ARGUMENTS (our -c became --compilation-config at the
+# 2026-08-14 real gate). entrypoint: python3 makes the bootstrap below
+# actually run.
+entrypoint: python3
+
 command: >
-  python3 -c 'import os, sys, subprocess
+  -c 'import os, sys, subprocess
 
   (model_id, max_context, port, tensor_parallel, tool_call_parser,
    enable_lora, max_loras, max_cpu_loras, lora_modules, max_lora_rank,
@@ -45,7 +51,7 @@ command: >
   print(f"manifold: launching vllm -> {joined}", flush=True)
 
   os.execvp(cmd[0], cmd)
-  ' manifold {{model_id}} {{max_context}} {{port}} {{tensor_parallel}} {{tool_call_parser}} {{enable_lora}} {{max_loras}} {{max_cpu_loras}} {{lora_modules}} {{max_lora_rank}} {{speculative_model}} {{num_speculative_tokens}}
+  ' {{model_id}} {{max_context}} {{port}} {{tensor_parallel}} {{tool_call_parser}} {{enable_lora}} {{max_loras}} {{max_cpu_loras}} {{lora_modules}} {{max_lora_rank}} {{speculative_model}} {{num_speculative_tokens}}
 
 parameters:
   - name: model_id
