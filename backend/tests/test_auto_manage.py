@@ -210,8 +210,14 @@ def test_idle_loop_skips_auto_managed_instance(tmp_path):
     # auto-termination (its lifecycle owns teardown), even at timeout 0.
     from tests.test_reconcile import launch_connected
 
+    # timeout 0 so the instance is INSTANTLY idle-eligible, but the idle
+    # LOOP parked (poll 1h) because this test drives _check_idle() itself
+    # below. At 0.02s the loop fired ~50 times a second underneath the
+    # assertions and the test failed intermittently on CI with StopIteration
+    # - a background sweep racing the one the test meant to observe. The
+    # exemption being tested is unaffected by how often the loop ticks.
     settings = _fast(tmp_path, idle=IdleSettings(timeout_seconds=0,
-                                                 poll_seconds=0.02))
+                                                 poll_seconds=3600))
     sidecar = MockSidecarClient(unpersisted=[])
     app, mock = _app(settings, sidecar=sidecar)
     with TestClient(app) as client:
