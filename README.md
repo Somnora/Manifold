@@ -35,6 +35,11 @@ Launch an instance, queue a `vllm-serve` job, watch it go ready, open the
 chat. Everything you see works identically against the real cloud once a
 Lambda API key is pasted into Settings.
 
+**Know your hardware.** The launch form carries a built-in guide to the
+whole ladder, from a single A10 to an 8x B200 node: what each card is for,
+when to step up, and what fits on it - with live provider prices and the
+capability arithmetic labelled as arithmetic, never asserted.
+
 ## Why it exists
 
 Renting a GPU is easy. Renting one *safely* is not. Manifold's backend is

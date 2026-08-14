@@ -45,7 +45,7 @@ explicit "burn it" override, and it is a separate argument you have to pass on
 purpose. The usual answer to this problem is "use persistent volumes
 correctly," which is fine advice that does not help at 2am.
 
-**The guards bind agents, not just me.** It exposes 20 MCP tools, so Claude
+**The guards bind agents, not just me.** It exposes 37 MCP tools, so Claude
 Code can reach the instances and delegate work to them: hand off a long batch
 job, or spin up a local model for image and video generation. Every one of
 those tools goes through the same backend, so an agent renting GPUs hits the
@@ -86,7 +86,7 @@ Lambda Cloud is what works today. Google Cloud VMs are in progress, with EC2,
 CoreWeave, RunPod, and DigitalOcean after.
 
 On the obvious question: this is built with Claude Code, and I am not going to
-pretend otherwise. It ships with 480 tests that all run against mocks, every
+pretend otherwise. It ships with over 970 tests that all run against mocks, every
 phase is gated on those tests passing, and every non-obvious architectural
 decision is written down in DECISIONS.md with the alternatives I rejected. That
 file is 177KB and is probably the most honest view of how it was actually
@@ -114,7 +114,7 @@ bypassed by any client, including an AI agent. Narrower scope, stricter rails.
 The API calls are the easy part. The parts that took the time are the SSH
 supervision that survives backend restarts and re-adopts running instances, the
 save-before-terminate interlock, and making sure no client can reach around the
-guards. Roughly 13k lines and 480 tests, and very little of it is HTTP calls.
+guards. Roughly 50k lines and over 970 tests, and very little of it is HTTP calls.
 
 **"Why one provider?"**
 Because getting the guards right against one provider was already the hard

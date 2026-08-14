@@ -493,6 +493,34 @@ export type LocalModelLibrary = {
   ollama_models: string[];
 };
 
+// Phase 86: one rung of the hardware ladder. Numbers are the provider's
+// (or arithmetic on them, with the formula in fits_basis); prose is the
+// backend's curated teaching layer.
+export type GpuRung = {
+  instance_type: string;
+  label: string;
+  family: string;
+  era: string;
+  gpu_count: number;
+  vram_per_gpu_gib: number | null;
+  vram_total_gib: number | null;
+  price_usd_per_hour: number;
+  regions_with_capacity: string[];
+  available_now: boolean;
+  price_per_gib_hour: number | null;
+  good_for: string;
+  step_up_when: string;
+  note: string;
+  fits: {
+    serve_fp16_b: number;
+    serve_4bit_b: number;
+    lora_bf16_b: number;
+    qlora_4bit_b: number;
+  } | null;
+};
+
+export type GpuGuide = { rungs: GpuRung[]; fits_basis: string };
+
 export type StudentPreset = {
   model_id: string;
   label: string;
@@ -926,6 +954,8 @@ export const api = {
       "/models/install",
       { method: "POST", body: JSON.stringify(body), timeoutMs: 10 * 60_000 },
     ),
+
+  gpuGuide: () => request<GpuGuide>("/gpu-guide"),
 
   studentPresets: () =>
     request<{ presets: StudentPreset[] }>("/student-presets").then(
