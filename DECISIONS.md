@@ -4229,3 +4229,73 @@ creates a model on one that has.
 **Unverified until the real gate:** the pinned image tag actually converting a
 Qwen student, and whether the chat template survives into GGUF metadata. Both
 are hardware questions; neither can be answered in mocks.
+
+## 2026-08-14 — The real A10 gate for Phases 84 + 85: $1.83, five findings
+
+One A10 (gpu_1x_a10, $1.29/hr, us-east-1), the whole chain end to end:
+30 seed records -> synthesize with a live Qwen2.5-3B teacher (24 rows + 6
+held out) -> judge (22 kept, 2 dropped, 0 unscored) -> a brain wrote the
+axolotl config -> train a Qwen3-0.6B LoRA (28 steps, 22s, loss 2.3 -> 0.2)
+-> merge -> scorecard (student matched or beat the teacher on 3 of 4) ->
+quantize to Q4_K_M (1137 MiB -> 379 MB) -> pull home -> install into Ollama
+-> **the distilled student answered "Low Angle" as a brain in the picker.**
+
+Everything below was invisible to 968 passing tests.
+
+**1. An empty Ollama took down /brains entirely (500).** A freshly installed
+Ollama with no models answers `{"object":"list","data":null}`, and
+`.get("data", [])` does not default when the key EXISTS holding null - so
+the probe iterated None and raised. That route is the brain picker, the
+chat, Autopilot and the distill panel at once. Phase 85's own docs tell
+users to install Ollama, so this feature created the conditions for its own
+outage. Fixed by validating the BODY, not just the status code.
+
+**2. `entrypoint: bash` + a command starting `bash -c` double up.** docker
+execs ENTRYPOINT + COMMAND, so it ran `bash bash -c '<script>'`, where the
+second `bash` is read as a script FILE: "cannot execute binary file", exit
+126. The payload must start at `-c`, exactly as the serve templates do
+under `entrypoint: python3`.
+
+*The doctrine failure matters more than the bug.* The executing test ran
+the extracted script under its own `bash -c` - proving the script was right
+while saying nothing about how it gets invoked. **Executing the script is
+not enough; the test must execute the ENTRYPOINT + COMMAND concatenation
+the container actually runs.** The harness now renders the real docker
+command, splits it as a shell would, and runs entrypoint + trailing args.
+It also passes `template.env` the way docker's `-e` does, without which the
+embedded fixer silently no-opped as an unset variable.
+
+**3. The merged model's tokenizer is not portable between images.** The
+trainer writes `extra_special_tokens` as a LIST of token strings; the
+transformers inside the llama.cpp image wants a MAPPING and dies on
+`.keys()` before conversion starts. Three of six shelf presets are Qwen3,
+so this is the common path. Fixed without touching the user's model: the
+script builds a directory of SYMLINKS to it and replaces only the one
+offending link with a corrected real file.
+
+**4. The teacher must be stopped before training.** Predicted exactly by
+the Phase 84 gate agent, and confirmed live: vLLM holds ~21.6 GB of a 24 GB
+A10, and `axolotl-finetune` died with `CUBLAS_STATUS_ALLOC_FAILED` before
+its first step. Stopping it freed the card (0 MiB of 23028) and the same
+config trained in 22 seconds. Now a warning in the doc at the step where it
+bites, not only in llm-eval's header.
+
+**5. A reasoning student returns an empty answer on a small token budget.**
+Qwen3 emits a `<think>` block first; our student thought for ~90 words
+before answering, so a short budget stopped it mid-thought and returned
+`content: ""` with `done_reason: length`. That reads as "the distillation
+failed" when the model is correct - it answered "Low Angle" given room.
+Documented, with the advice to prefer a non-reasoning base for short-label
+tasks. Also fixed: `POST /models/install` returned
+`local:ollama/<name>` while the picker lists `local:ollama/<name>:latest`.
+
+**Verified and NOT a problem:** the chat template survives conversion
+intact - Ollama parsed the student's `<think>` blocks into its `thinking`
+field, which only works if the template metadata came through.
+
+**Known and unfixed:** the pull runs at roughly 0.6-0.7 MB/s over SFTP
+(379 MB took about nine minutes). Fine for a 0.6B student, painful for a
+3B one; the chunked `sftp_read` is the place to look. Also, a client
+disconnect does not cancel a pull - the backend finished writing and
+renamed the file correctly, which is the behaviour we want, but it is
+undocumented.

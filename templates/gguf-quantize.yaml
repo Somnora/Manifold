@@ -50,8 +50,15 @@ user: root
 #
 # The script contains no single quotes anywhere, deliberately: one would end
 # the outer quoting and hand the rest of the program to the instance shell.
+#
+# NOTE THE MISSING `bash`. docker runs ENTRYPOINT + COMMAND, so with
+# `entrypoint: bash` the payload below must start at `-c`, exactly as the
+# serve templates start at `-c` under `entrypoint: python3`. Writing
+# `bash -c ...` here produced `bash bash -c ...`, where the second `bash`
+# is read as a SCRIPT FILE: "cannot execute binary file", exit 126, found
+# at the 2026-08-14 real gate.
 command: >
-  bash -c 'set -e;
+  -c 'set -e;
   md="$1"; out="$2"; q="$3"; keep="$4";
   case "$q" in Q4_K_M|Q5_K_M|Q8_0|F16) ;;
   *) echo "manifold: quant must be one of Q4_K_M, Q5_K_M, Q8_0, F16 (got: $q)" >&2; exit 2;; esac;
@@ -73,10 +80,13 @@ command: >
   if [ -z "$qz" ] && [ "$q" != "F16" ]; then
   echo "manifold: no llama-quantize on PATH or at /app - this image is not a llama.cpp full image" >&2; exit 3; fi;
   mkdir -p /tmp/quant /data/models;
+  work="/tmp/quant/src-$out"; rm -rf "$work"; mkdir -p "$work";
+  for f in "$src"/*; do ln -s "$f" "$work"/; done;
+  python3 -c "$FIXUP_PY" "$work";
   f16="/tmp/quant/$out-f16.gguf";
   final="/data/models/$out.gguf";
   echo "manifold: converting $src to f16 gguf (this reads the whole model)";
-  python3 "$conv" "$src" --outfile "$f16" --outtype f16;
+  python3 "$conv" "$work" --outfile "$f16" --outtype f16;
   if [ "$q" = "F16" ]; then mv "$f16" "$final";
   else echo "manifold: quantizing to $q";
   "$qz" "$f16" "$final" "$q";
@@ -117,6 +127,46 @@ volumes:
 
 env:
   TMPDIR: /tmp/quant
+  # Two images, two transformers versions, one incompatible file. The
+  # trainer writes tokenizer_config.json with extra_special_tokens as a
+  # LIST of token strings; the transformers inside the llama.cpp image
+  # expects a MAPPING and dies on `.keys()` before conversion starts
+  # (AttributeError: 'list' object has no attribute 'keys'). Found at the
+  # 2026-08-14 real gate on a Qwen3 student - and three of the six shelf
+  # presets are Qwen3, so this is the common path, not an edge case.
+  #
+  # The model itself is NEVER modified. The script builds a directory of
+  # symlinks to it and this fixer replaces only the one offending link
+  # with a corrected real file, so what gets converted is the user's model
+  # with one metadata key normalised, and their weights are untouched.
+  FIXUP_PY: |
+    import json, os, sys
+
+    work = sys.argv[1]
+    path = os.path.join(work, "tokenizer_config.json")
+    if not os.path.exists(path):
+        raise SystemExit(0)
+    with open(path) as f:
+        config = json.load(f)
+
+    extra = config.get("extra_special_tokens")
+    if not isinstance(extra, list):
+        raise SystemExit(0)      # already a mapping, or absent: nothing to do
+
+    # A list of token strings becomes the mapping transformers wants. The
+    # names are synthetic but never surface: the converter reads the token
+    # VALUES, and the gguf records those.
+    config["extra_special_tokens"] = {
+        f"extra_special_token_{i}": token
+        for i, token in enumerate(extra)
+        if isinstance(token, str)
+    }
+    os.unlink(path)              # drop the symlink, do not follow it
+    with open(path, "w") as f:
+        json.dump(config, f, indent=2)
+    print(f"manifold: normalised {len(extra)} extra_special_tokens from a "
+          f"list to a mapping for the converter (the model on the "
+          f"filesystem is unchanged)", flush=True)
 
 # No `gpu:` block: conversion and quantization are CPU and RAM work. The
 # recommendation is not a bigger card, it is to chain this onto the instance

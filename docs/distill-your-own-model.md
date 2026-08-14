@@ -352,6 +352,13 @@ A scorecard you like means the student is worth keeping. Right now it lives
 on a filesystem you reach by paying for an instance. Three steps take it off
 that filesystem for good.
 
+> **Stop the teacher before you train.** vLLM takes 90% of the card by
+> default, so on a 24 GB A10 a live teacher holds ~21.6 GB and
+> `axolotl-finetune` dies with `CUDA error: CUBLAS_STATUS_ALLOC_FAILED`
+> before its first step. The teacher's answers are already stored in the
+> files it wrote, so nothing is lost by stopping it. Verified the hard way
+> at the 2026-08-14 gate.
+
 **Quantize it on the box.** Queue `gguf-quantize` with `model_dir` set to the
 merged model (the `lora-merge` output). It converts to GGUF and quantizes to
 `Q4_K_M` by default, writing `<output_name>.gguf` beside the model:
@@ -388,6 +395,14 @@ brain type - the backend already probes `127.0.0.1:11434`, so a model
 installed into Ollama is simply a brain. The model you distilled can now
 drive Autopilot, answer in the chat, or write the config for the next
 distillation, running on your own hardware for nothing.
+
+**If your student is a reasoning model, give it room.** Three of the six
+shelf presets are Qwen3, which emit a `<think>` block before answering. A
+short-answer student still thinks for ~90 words first, so a small token
+budget stops generation mid-thought and returns an EMPTY answer - which
+reads as "the distillation failed" when the model is fine. Ask for at
+least ~400 tokens, or pick a non-reasoning base (Qwen2.5, SmolLM2) when
+the task is short labels.
 
 No Ollama? The file is still yours. Manifold tells you where it is and the
 exact `ollama create` command; LM Studio can also open the .gguf directly

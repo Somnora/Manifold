@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import stat
 import subprocess
 from pathlib import Path
@@ -59,19 +60,41 @@ elif len(sys.argv) >= 3 and sys.argv[2].endswith(".gguf"):
 """
 
 
+def docker_argv(template, params, *, filesystem="fs", task_id="t"):
+    """The argv the CONTAINER actually execs: ENTRYPOINT + COMMAND.
+
+    This is the seam that broke at the real gate. `--entrypoint bash` with
+    a command that itself began `bash -c ...` produced `bash bash -c ...`,
+    where the second `bash` is a script FILE argument - exit 126, "cannot
+    execute binary file". The old harness ran the extracted script directly
+    with its own `bash -c`, so it proved the script was right while saying
+    nothing about how the script gets invoked, and the template shipped
+    broken with a green test.
+
+    So: render the real docker command, split it the way a shell does, and
+    rebuild exactly what docker would exec.
+    """
+    rendered = render_docker_command(
+        template, coerce_parameters(template, params),
+        filesystem=filesystem, task_id=task_id)
+    parts = shlex.split(rendered)
+    entrypoint = parts[parts.index("--entrypoint") + 1] \
+        if "--entrypoint" in parts else None
+    # The image is the last token before the command payload; every arg
+    # before it is a docker flag or its value.
+    image_at = parts.index(template.image)
+    return ([entrypoint] if entrypoint else []) + parts[image_at + 1:]
+
+
 def run_script(template, params, tmp_path, *, tools=("convert_hf_to_gguf.py",
                                                      "llama-quantize"),
-               make_model=True):
-    """Run the template's real `bash -c` body with fake llama.cpp tools.
+               make_model=True, tokenizer=None):
+    """Execute the container's real ENTRYPOINT + COMMAND with fake tools.
 
-    The command is `bash -c '<script>' manifold {{args}}`: the script is
-    extracted verbatim and handed to a real bash with the coerced parameter
-    values as $1..$4 - and `manifold` as $0, exactly as the container gets
-    it. A shifted argument binds the wrong slot here, loudly.
+    Not the script in isolation: the whole invocation, so a mismatch
+    between `entrypoint:` and `command:` fails here rather than on a
+    billed GPU.
     """
-    m = re.match(r"bash -c '(.*)' manifold\s", template.command, re.DOTALL)
-    assert m, "gguf-quantize command is not `bash -c '<script>' manifold ...`"
-    script = m.group(1)
 
     root = tmp_path / "fs"
     models = root / "data" / "models"
@@ -80,6 +103,8 @@ def run_script(template, params, tmp_path, *, tools=("convert_hf_to_gguf.py",
         src = models / str(params.get("model_dir", "student"))
         src.mkdir(parents=True, exist_ok=True)
         (src / "config.json").write_text("{}")
+        if tokenizer is not None:
+            (src / "tokenizer_config.json").write_text(json.dumps(tokenizer))
 
     bindir = tmp_path / "bin"
     bindir.mkdir(exist_ok=True)
@@ -89,18 +114,16 @@ def run_script(template, params, tmp_path, *, tools=("convert_hf_to_gguf.py",
         path.write_text(_SHIM)
         path.chmod(path.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP)
 
-    values = coerce_parameters(template, params)
-    argv = [str(values[p.name]) for p in template.parameters]
-
+    argv = docker_argv(template, params)
     # /data and /tmp/quant are container paths; redirect them into tmp_path
-    # so the script can be run unprivileged without touching the real root.
-    script = script.replace("/data/models", str(models))
-    script = script.replace("/tmp/quant", str(tmp_path / "quant"))
+    # so the invocation can run unprivileged without touching the real root.
+    argv = [a.replace("/data/models", str(models))
+             .replace("/tmp/quant", str(tmp_path / "quant")) for a in argv]
 
     result = subprocess.run(
-        ["bash", "-c", script, "manifold", *argv],
-        capture_output=True, text=True,
-        env={**os.environ, "PATH": f"{bindir}:{os.environ['PATH']}",
+        argv, capture_output=True, text=True,
+        env={**os.environ, **template.env,
+             "PATH": f"{bindir}:{os.environ['PATH']}",
              "SHIM_LOG": str(log)},
     )
     calls = json.loads(log.read_text()) if log.exists() else []
@@ -119,9 +142,15 @@ def test_quantize_calls_convert_then_quantize_with_the_right_argv(quantize,
 
     convert = calls[0]
     assert convert[0].endswith("convert_hf_to_gguf.py")
-    # The source is the model directory, NOT the literal "manifold" that
-    # $0 holds - the vllm-serve bug, in this template's shape.
-    assert convert[1] == str(models / "my-student")
+    # The converter reads a directory of SYMLINKS to the model, not the
+    # model directory itself, so the tokenizer fixup below can correct one
+    # metadata file without touching the user's weights. What matters is
+    # that it carries the user's model - and is not the literal "manifold"
+    # that $0 holds, which is the vllm-serve bug in this template's shape.
+    work = Path(convert[1])
+    assert work.name == "src-student", convert[1]
+    assert (work / "config.json").resolve() == \
+        (models / "my-student" / "config.json").resolve()
     assert convert[convert.index("--outtype") + 1] == "f16"
 
     quant = calls[1]
@@ -131,6 +160,42 @@ def test_quantize_calls_convert_then_quantize_with_the_right_argv(quantize,
     assert quant[2] == str(models / "student.gguf")
     assert quant[3] == "Q4_K_M"
     assert (models / "student.gguf").exists()
+
+
+def test_a_list_shaped_extra_special_tokens_is_normalised(quantize, tmp_path):
+    """The trainer writes extra_special_tokens as a LIST; the transformers
+    inside the llama.cpp image wants a MAPPING and dies on .keys() before
+    conversion starts. Found at the 2026-08-14 real gate on a Qwen3
+    student. The user's model must come through untouched."""
+    result, calls, models = run_script(
+        quantize, {"model_dir": "m", "output_name": "s"}, tmp_path,
+        tokenizer={"extra_special_tokens": ["<|im_start|>", "<|im_end|>"],
+                   "split_special_tokens": False})
+    assert result.returncode == 0, result.stderr
+    assert "normalised 2 extra_special_tokens" in result.stdout
+
+    work = Path(calls[0][1])
+    fixed = json.loads((work / "tokenizer_config.json").read_text())
+    assert fixed["extra_special_tokens"] == {
+        "extra_special_token_0": "<|im_start|>",
+        "extra_special_token_1": "<|im_end|>"}
+    assert fixed["split_special_tokens"] is False   # everything else kept
+
+    # The model on the filesystem is untouched: still the original list.
+    original = json.loads(
+        (models / "m" / "tokenizer_config.json").read_text())
+    assert original["extra_special_tokens"] == ["<|im_start|>", "<|im_end|>"]
+
+
+def test_a_mapping_shaped_tokenizer_is_left_alone(quantize, tmp_path):
+    result, calls, _ = run_script(
+        quantize, {"model_dir": "m", "output_name": "s"}, tmp_path,
+        tokenizer={"extra_special_tokens": {"pad": "<|pad|>"}})
+    assert result.returncode == 0, result.stderr
+    assert "normalised" not in result.stdout
+    work = Path(calls[0][1])
+    assert json.loads((work / "tokenizer_config.json").read_text())[
+        "extra_special_tokens"] == {"pad": "<|pad|>"}
 
 
 def test_quantize_honours_the_chosen_quant(quantize, tmp_path):
@@ -217,6 +282,25 @@ def test_the_image_entrypoint_is_overridden(quantize):
     assert "-v /lambda/nfs/fs/models:/data/models" in cmd
     # The $0 padding is present and is the literal, not a parameter.
     assert "' manifold " in cmd
+
+
+def test_entrypoint_and_command_do_not_double_up(quantize):
+    """ENTRYPOINT + COMMAND must form ONE valid invocation.
+
+    `entrypoint: bash` plus a command starting `bash -c` execs
+    `bash bash -c ...`, and bash reads the second `bash` as a script file:
+    exit 126. The payload must therefore start at the flag, exactly as the
+    serve templates start at `-c` under `entrypoint: python3`.
+    """
+    argv = docker_argv(quantize, {"model_dir": "m"})
+    assert argv[0] == "bash"
+    assert argv[1] == "-c", f"payload must start at -c, got {argv[1]!r}"
+    assert argv[2].lstrip().startswith("set -e"), "argv[2] must be the script"
+    # $0, then the four parameters in declared order.
+    assert argv[3] == "manifold"
+    assert len(argv) == 4 + len(quantize.parameters)
+    # The binary must appear exactly once across the whole invocation.
+    assert argv.count("bash") == 1
 
 
 def test_quantize_declares_no_ports_so_it_is_not_a_server(quantize):
@@ -432,8 +516,10 @@ def test_install_registers_the_model_and_returns_its_brain_ref(
     assert resp.status_code == 200, resp.text
     body = resp.json()
     # The whole point of installing: it is now a brain, through machinery
-    # that already existed.
-    assert body["brain_ref"] == "local:ollama/my-student"
+    # that already existed. The ref must be spelled the way GET /brains
+    # will list it - Ollama appends :latest, and returning the bare name
+    # sent the user hunting for a picker entry under the wrong spelling.
+    assert body["brain_ref"] == "local:ollama/my-student:latest"
 
     create = [c for c in fake_ollama["calls"]() if c[:1] == ["create"]]
     assert len(create) == 1

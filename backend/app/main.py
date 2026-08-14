@@ -2979,7 +2979,13 @@ def create_app(
         db.record_audit(current_principal(), "model_install",
                         f"{name} -> ollama:{ollama_name}")
         return {"name": name, "ollama_name": ollama_name,
-                "brain_ref": f"local:ollama/{ollama_name}",
+                # :latest, because that is what Ollama named it and what
+                # GET /brains will therefore list. Returning the bare name
+                # here sent the user looking for a picker entry that does
+                # not exist under that spelling (found at the 2026-08-14
+                # real gate, where install promised local:ollama/shot-tagger
+                # and the picker showed local:ollama/shot-tagger:latest).
+                "brain_ref": f"local:ollama/{ollama_name}:latest",
                 "output": output}
 
     # -- capacity watches ---------------------------------------------------------------

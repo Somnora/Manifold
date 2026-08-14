@@ -257,14 +257,33 @@ class BrainRegistry:
 
     @staticmethod
     async def _probe_models(url: str) -> list[str] | None:
-        """GET <base>/models; None = server not there, [] = there, no models."""
+        """GET <base>/models; None = server not there, [] = there, no models.
+
+        Defensive about the BODY, not just the status code, because this
+        parses a third party's JSON and a crash here 500s /brains - which
+        is the brain picker, the chat, Autopilot and the distill panel all
+        at once.
+
+        A freshly installed Ollama with no models pulled answers
+        `{"object": "list", "data": null}`. `.get("data", [])` does NOT
+        default there: the key exists and holds null, so the old code
+        iterated None and took the whole route down. Found at the
+        2026-08-14 real gate, on an Ollama installed minutes earlier by
+        following this project's own docs.
+        """
         try:
             async with httpx.AsyncClient(timeout=PROBE_TIMEOUT) as client:
                 resp = await client.get(url)
             if resp.status_code != 200:
                 return None
-            data = resp.json().get("data", [])
-            return [m.get("id", "") for m in data if m.get("id")]
+            body = resp.json()
+            if not isinstance(body, dict):
+                return []
+            data = body.get("data") or []
+            if not isinstance(data, list):
+                return []
+            return [m["id"] for m in data
+                    if isinstance(m, dict) and m.get("id")]
         except (httpx.HTTPError, ValueError):
             return None
 

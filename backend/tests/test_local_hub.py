@@ -488,3 +488,61 @@ def test_which_fallback_finds_cli_off_path(tmp_path, monkeypatch):
     plain = bin_dir / "codex"
     plain.write_text("not a program")
     assert brains_mod.which_with_fallback("codex") is None
+
+
+# -- what the real gate found -------------------------------------------------
+
+
+def test_probe_survives_a_server_that_answers_data_null(monkeypatch):
+    """A freshly installed Ollama with no models pulled answers
+    `{"object": "list", "data": null}`.
+
+    `.get("data", [])` does not default on that: the key EXISTS holding
+    null, so the old code iterated None and raised, which 500s /brains -
+    taking the brain picker, the chat, Autopilot and the distill panel
+    down together. Found at the 2026-08-14 real gate, on an Ollama
+    installed minutes earlier by following this project's own docs.
+
+    monkeypatch, not a hand-rolled save/restore of httpx.AsyncClient: the
+    first version of this test swapped the global and put it back in a
+    finally, which still leaked enough to fail an unrelated safety-hook
+    test later in the full run. Scoped patching is the house rule for a
+    reason.
+    """
+    import asyncio
+
+    import httpx
+
+    from app.brains import BrainRegistry
+
+    class FakeResponse:
+        status_code = 200
+
+        def __init__(self, body):
+            self._body = body
+
+        def json(self):
+            return self._body
+
+    def probe_with(body):
+        class FakeClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+
+            async def get(self, url):
+                return FakeResponse(body)
+
+        monkeypatch.setattr(httpx, "AsyncClient", lambda *a, **k: FakeClient())
+        return asyncio.run(BrainRegistry._probe_models("http://x/v1/models"))
+
+    # The exact shape that broke it: present, and null.
+    assert probe_with({"object": "list", "data": None}) == []
+    # Neighbouring shapes a third party could also answer.
+    assert probe_with({"object": "list"}) == []
+    assert probe_with({"data": "not a list"}) == []
+    assert probe_with({"data": [None, {"no_id": 1}, {"id": "llama3"}]}) == \
+        ["llama3"]
+    assert probe_with([]) == []
