@@ -1,7 +1,14 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { api, ApiError, type Brain, type DistillConfig } from "@/lib/api";
+import {
+  api,
+  ApiError,
+  type Brain,
+  type DistillConfig,
+  type Instance,
+  type StudentPreset,
+} from "@/lib/api";
 
 // Phase 84: draft the training config for a distillation run in plain words.
 // A training config is the YAML settings file a fine-tune reads: which base
@@ -9,13 +16,14 @@ import { api, ApiError, type Brain, type DistillConfig } from "@/lib/api";
 // A brain writes the draft, the backend checks it is valid YAML carrying the
 // keys a fine-tune needs, and it lands here as text to READ. Manifold does
 // not save it and does not train from it: both of those stay your move.
-// `connectedInstances` is only used to warn honestly: the persistent
-// filesystem is reachable through a running instance's file browser, so
-// with none connected there is nowhere to put the config yet.
+// `connected` carries the instances the config could be saved through: the
+// persistent filesystem is only reachable over a running instance's managed
+// connection, so with none connected there is nowhere to put the config yet
+// and the Save button says so instead of failing after the click.
 export function DistillConfigPanel({
-  connectedInstances,
+  connected,
 }: {
-  connectedInstances: number;
+  connected: Instance[];
 }) {
   const [open, setOpen] = useState(false);
   const [brains, setBrains] = useState<Brain[]>([]);
@@ -24,9 +32,12 @@ export function DistillConfigPanel({
   const [dataset, setDataset] = useState("");
   const [student, setStudent] = useState("");
   const [result, setResult] = useState<DistillConfig | null>(null);
+  const [presets, setPresets] = useState<StudentPreset[]>([]);
   const [copied, setCopied] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [saved, setSaved] = useState("");
 
   // Loaded when the panel is opened, not on every Jobs-page render: this is
   // a rarely-used drawer and the brain list costs a round trip.
@@ -39,6 +50,14 @@ export function DistillConfigPanel({
         setBrain((v) => v || list[0]?.ref || "");
       })
       .catch((e) => setError(e instanceof ApiError ? e.message : String(e)));
+    // The shelf the backend will validate base_model against. Fetched so the
+    // student field can offer exactly those ids: a free-text student that is
+    // not on the shelf is a guaranteed 422, and finding that out after a
+    // multi-minute brain call is a bad way to learn the rule.
+    api
+      .studentPresets()
+      .then(setPresets)
+      .catch(() => setPresets([]));
   }, [open]);
 
   const chosen = brains.find((b) => b.ref === brain);
@@ -64,14 +83,35 @@ export function DistillConfigPanel({
       const cfg = await api.distillConfig({
         spec: spec.trim(),
         brain,
-        ...(dataset.trim() ? { dataset: dataset.trim() } : {}),
-        ...(student.trim() ? { student: student.trim() } : {}),
+        dataset: dataset.trim(),
+        ...(student.trim() ? { student_model: student.trim() } : {}),
       });
       setResult(cfg);
+      setSaved("");
     } catch (err) {
       setError(err instanceof ApiError ? err.message : String(err));
     } finally {
       setBusy(false);
+    }
+  }
+
+  // Uploads through the same guarded file bridge the browser uses: a Blob
+  // becomes a File, and `dest` is the path distill.py suggested, so the
+  // config lands where axolotl-finetune mounts configs/. Nothing is saved
+  // until this is clicked - the draft above is text on a screen.
+  async function save() {
+    if (!result || connected.length === 0) return;
+    setSaving(true);
+    setError("");
+    try {
+      const name = result.suggested_path.split("/").pop() || "config.yaml";
+      const file = new File([result.yaml], name, { type: "text/yaml" });
+      await api.uploadFile(connected[0].id, file, result.suggested_path);
+      setSaved(`Saved to ${result.suggested_path} on ${connected[0].name}`);
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : String(err));
+    } finally {
+      setSaving(false);
     }
   }
 
@@ -136,24 +176,34 @@ export function DistillConfigPanel({
 
               <div className="flex flex-wrap gap-3">
                 <label className="block min-w-0 flex-1 text-xs font-medium text-zinc-600">
-                  Dataset file (optional)
+                  Training file
                   <input
                     className="mt-1 block w-full min-w-0 rounded border border-zinc-300 px-2.5 py-1.5 text-sm"
                     value={dataset}
                     onChange={(e) => setDataset(e.target.value)}
                     placeholder="kept-tags.jsonl"
-                    title="A file under <filesystem>/synthesized, which is where llm-synthesize and llm-judge write their training sets."
+                    title="A file under <filesystem>/synthesized, which is where llm-synthesize and llm-judge write their training sets. Required: the config names this exact path, so the backend refuses to guess it."
                   />
                 </label>
                 <label className="block min-w-0 flex-1 text-xs font-medium text-zinc-600">
                   Student model (optional)
-                  <input
-                    className="mt-1 block w-full min-w-0 rounded border border-zinc-300 px-2.5 py-1.5 text-sm"
+                  {/* A select, not free text: the backend validates
+                      base_model against this exact shelf, so anything else
+                      is a 422 the user would only discover after paying for
+                      a brain call. */}
+                  <select
+                    className="mt-1 block w-full min-w-0 max-w-full rounded border border-zinc-300 bg-white px-2.5 py-1.5 text-sm"
                     value={student}
                     onChange={(e) => setStudent(e.target.value)}
-                    placeholder="leave empty and the brain picks one"
                     title="The small open base model the LoRA trains on top of. Left empty, the brain recommends one that fits the GPU you described."
-                  />
+                  >
+                    <option value="">Let the brain pick</option>
+                    {presets.map((p) => (
+                      <option key={p.model_id} value={p.model_id}>
+                        {p.label} - {p.vram_gib} GB
+                      </option>
+                    ))}
+                  </select>
                 </label>
               </div>
 
@@ -161,10 +211,13 @@ export function DistillConfigPanel({
                 <p className="text-[11px] text-zinc-400">
                   Nothing here starts a training run. The draft comes back as
                   text to read.
+                  {!dataset.trim() && " Name the training file to continue."}
                 </p>
                 <button
                   onClick={draft}
-                  disabled={busy || spec.trim().length < 10 || !brain}
+                  disabled={
+                    busy || spec.trim().length < 10 || !brain || !dataset.trim()
+                  }
                   className="shrink-0 rounded bg-zinc-900 px-4 py-1.5 text-sm font-medium text-white hover:bg-zinc-700 disabled:opacity-50"
                 >
                   {busy
@@ -186,52 +239,72 @@ export function DistillConfigPanel({
               <div className="flex flex-wrap items-center gap-2 text-xs">
                 <span className="font-medium text-zinc-600">Student</span>
                 <span className="rounded bg-zinc-100 px-1.5 py-0.5 font-mono text-[11px] text-zinc-700">
-                  {result.student}
+                  {result.base_model}
                 </span>
                 <button
-                  onClick={() => copyYaml(result.config_yaml)}
+                  onClick={() => copyYaml(result.yaml)}
                   className="ml-auto shrink-0 rounded border border-zinc-300 px-2 py-0.5 text-xs text-zinc-700 hover:bg-zinc-50"
                 >
                   {copied ? "Copied" : "Copy YAML"}
                 </button>
               </div>
-              {result.notes && (
-                <p className="whitespace-pre-wrap text-xs text-zinc-600">
-                  {result.notes}
-                </p>
+              {result.advisories.length > 0 && (
+                <ul className="space-y-1 text-xs text-amber-700">
+                  {result.advisories.map((note) => (
+                    <li key={note}>{note}</li>
+                  ))}
+                </ul>
               )}
               {/* Read-only on purpose: this is a preview of what the brain
                   wrote, not an editor. Literal hex colors, as in the template
                   editor: the dark theme remaps the zinc scale, so
                   text-zinc-100 on bg-zinc-950 renders ink on ink. */}
               <pre className="max-h-80 overflow-auto whitespace-pre rounded border border-zinc-300 bg-[#09090b] p-3 font-mono text-xs leading-relaxed text-[#e4e4e7]">
-                {result.config_yaml}
+                {result.yaml}
               </pre>
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  onClick={save}
+                  disabled={saving || connected.length === 0}
+                  className="rounded border border-zinc-300 px-2.5 py-1 text-xs font-medium text-zinc-700 hover:bg-zinc-50 disabled:opacity-50"
+                  title={
+                    connected.length === 0
+                      ? "The filesystem is reached over an instance's managed connection, so one has to be running."
+                      : `Uploads to ${result.suggested_path} on ${connected[0].name}`
+                  }
+                >
+                  {saving ? "Saving..." : `Save to ${result.suggested_path}`}
+                </button>
+                {connected.length === 0 && (
+                  <span className="text-[11px] text-amber-700">
+                    No instance is connected, so there is nowhere to save it
+                    yet. Copy the YAML and keep it.
+                  </span>
+                )}
+                {saved && (
+                  <span className="text-[11px] text-emerald-700">{saved}</span>
+                )}
+              </div>
               <div className="rounded border border-zinc-200 bg-zinc-50 px-3 py-2 text-[11px] leading-relaxed text-zinc-600">
                 <p className="font-medium text-zinc-700">
-                  Manifold has not saved this and will not train from it.
+                  Saving does not train. Read it first.
                 </p>
                 <p className="mt-1">
-                  To use it: copy the YAML, save it on this machine as a
-                  .yaml file, then open Browse on a connected instance (from
-                  its card on Instances), navigate to{" "}
-                  <span className="font-mono">configs/</span> and choose
-                  Upload here. Once the file sits at{" "}
+                  Save puts the YAML on the persistent filesystem at{" "}
+                  <span className="font-mono">{result.suggested_path}</span>.
+                  To train from it, queue{" "}
+                  <span className="font-mono">axolotl-finetune</span> above
+                  with <span className="font-mono">config_path</span> set to
+                  that file name, and set the job&apos;s{" "}
+                  <span className="font-mono">output_dir</span> parameter to{" "}
                   <span className="font-mono">
-                    &lt;filesystem&gt;/configs/your-config.yaml
-                  </span>
-                  , queue <span className="font-mono">axolotl-finetune</span>{" "}
-                  above with <span className="font-mono">config_path</span>{" "}
-                  set to that file name. Read it before you do: it is a first
-                  draft from a model, and running it spends GPU time.
+                    {result.output_dir.replace("/data/output/", "")}
+                  </span>{" "}
+                  - the job flag wins over the{" "}
+                  <span className="font-mono">output_dir</span> in the YAML,
+                  so leaving it at its default puts the adapter somewhere
+                  else and the merge step will not find it.
                 </p>
-                {connectedInstances === 0 && (
-                  <p className="mt-1 text-amber-700">
-                    No instance is connected, so there is nowhere to upload it
-                    yet. Copy the YAML and keep it; the filesystem becomes
-                    reachable once an instance is running.
-                  </p>
-                )}
               </div>
             </div>
           )}

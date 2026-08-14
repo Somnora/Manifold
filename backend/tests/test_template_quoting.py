@@ -46,6 +46,18 @@ CASES = [
     ("lora-merge", "axolotlai/axolotl:main-latest", "MERGE_PY",
      {"adapter_dir": "distill-v1", "output_name": "merged",
       "base_model": "Qwen/Qwen3-8B"}, "Qwen/Qwen3-8B"),
+    # The Phase 84 templates belong in the SHARED harness, not only in their
+    # own module: this table is what a future template edit gets read
+    # against, and a shape that is only covered elsewhere is a shape the next
+    # editor will not know to preserve. llm-synthesize's entry above passes
+    # only its two original parameters, so its four appended positionals are
+    # exercised here through the templates that carry the same tail shape.
+    ("llm-judge", "python:3.11-slim", "PYCODE",
+     {"input_name": "kept-tags.jsonl", "criteria": "names the shot type"},
+     "names the shot type"),
+    ("llm-eval", "axolotlai/axolotl:main-latest", "EVAL_PY",
+     {"eval_name": "eval-d.jsonl", "student_path": "distilled",
+      "instruction": "tag the shot"}, "tag the shot"),
 ]
 
 

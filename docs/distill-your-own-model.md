@@ -209,11 +209,20 @@ gets a 502 that quotes what it actually said.
 
 Same thing from an agent: MCP `generate_training_config`.
 
-**It is review only.** Manifold does not save the config and never starts a
-training run from it. To use it: copy the YAML, save it locally, open Browse
-on a connected instance, go to `configs/`, upload it there, then queue
-`axolotl-finetune` pointing at that filename. Uploading needs a connected
-instance, because the persistent filesystem is only reachable through one.
+**It never trains.** Manifold hands you the config to read. **Save to
+configs/...** puts it on the persistent filesystem through the same guarded
+file bridge the browser uses; that button is disabled with a reason when no
+instance is connected, because the filesystem is only reachable through a
+running one. Training is still your move: queue `axolotl-finetune` pointing
+at that filename.
+
+**Set the job's `output_dir` to match the config.** `axolotl-finetune`
+passes `--output_dir` as a command-line flag, and the flag beats the
+`output_dir` inside the YAML. Leave the job parameter at its default and the
+adapter lands in `outputs/lora-out/` no matter what the file you just
+reviewed says, which surfaces as a confusing not-found at the merge step
+after you have paid for the whole training run. The review panel prints the
+exact value to use.
 
 You can also just write the config yourself. A working starting point:
 

@@ -283,13 +283,33 @@ env:
             evals.close()
     print(f"finished: {done} synthesized, {failed} failed -> {out_path}",
           flush=True)
+    # A green job holding an EMPTY training file is the worst thing this
+    # template can produce: every record dies in the per-record except above,
+    # the loop keeps going, the job exits 0, and nothing fails until axolotl
+    # chokes on the empty file an hour and a GPU later. An unreachable
+    # teacher, an expired key and a wrong model id all land here.
+    #
+    # This gate sits OUTSIDE the holdout branch on purpose. It used to live
+    # inside it, so the DEFAULT path (holdout_pct=0) - the one most runs take
+    # - had no gate at all. Found by the Phase 84 verifier on 2026-08-14 by
+    # pointing the teacher at a refused port and watching a zero-byte dataset
+    # exit 0.
+    if not done:
+        sys.exit(f"no rows were synthesized ({failed} failed), so {out_path} "
+                 f"is empty and there is nothing to train on. The first "
+                 f"error is in the log above: check that the teacher is "
+                 f"reachable FROM THE INSTANCE and that teacher_model names "
+                 f"a model it actually serves.")
+    if failed:
+        print(f"WARNING: {failed} of {done + held + failed} records failed "
+              f"after retries; the dataset is smaller than the input.",
+              flush=True)
     if hold_every:
-        print(f"holdout: {held} rows held back (every {hold_every}th generated "
-              f"row, {100.0 / hold_every:.0f}%) -> {eval_path}", flush=True)
-        # An empty half is not a holdout, it is a silent trap: axolotl would
-        # fail on an empty training file, or llm-eval would score 0/0 and
-        # print a meaningless 0%.
-        if not done or not held:
+        print(f"holdout: {held} rows held back (1 row in every {hold_every}, "
+              f"{100.0 / hold_every:.0f}%) -> {eval_path}", flush=True)
+        # An empty half is not a holdout, it is a silent trap: llm-eval would
+        # score 0/0 on it.
+        if not held:
             sys.exit(f"holdout produced an unusable split: {done} training "
                      f"rows and {held} eval rows. Generate more records or "
                      f"lower holdout_pct.")
