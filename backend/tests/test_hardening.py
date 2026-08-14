@@ -63,7 +63,11 @@ def test_dispatched_command_includes_pipefail(client):
     )
     conn = client.app.state.orchestrator.connections[instance_id]
     ssh = conn.ssh_connection()
-    wrapped = next(c for c in ssh.commands if "docker run" in c)
+    # "docker run" alone now also matches the GPU-readiness probe (its last
+    # stage walks through the container door on purpose); the dispatch is
+    # the one that carries the task container's --name.
+    wrapped = next(c for c in ssh.commands
+                   if "docker run" in c and "manifold-task-" in c)
     # Restart-proof shape: detached runner + exit-file wait, not a pipeline
     # that ties the container's life to the SSH session.
     assert "nohup bash -c" in wrapped

@@ -160,6 +160,38 @@ def test_probe_also_checks_the_container_runtime():
     assert "command -v nvidia-container-cli" in GPU_PROBE_COMMAND
 
 
+def test_probe_walks_through_the_container_door_itself():
+    """Field pass round 3 (2026-08-14 mini-gate): BOTH host-side stages read
+    healthy while a job dispatched at connect died with "out of bounds for
+    0 devices". The only probe that cannot be fooled is the path the job
+    takes, so the last stage runs a real container with --gpus all - guarded
+    by command -v docker, same fail-open rule as the toolkit stage."""
+    assert "docker run --rm --gpus all" in GPU_PROBE_COMMAND
+    assert "command -v docker" in GPU_PROBE_COMMAND
+    # Ordered: cheap host checks first, the container pull last, so the
+    # image fetch only happens once the driver is actually answering.
+    assert GPU_PROBE_COMMAND.index("nvidia-smi -q") \
+        < GPU_PROBE_COMMAND.index("docker run")
+
+
+def test_the_mini_gate_signature_now_triggers_the_retry():
+    """The exact torch wording the 2026-08-14 mini-gate died with. Every
+    signature already on the list missed it, so the job failed instead of
+    retrying after the runtime settled."""
+    from app.dispatcher import CUDA_RACE_SIGNATURES
+
+    line = "DP adjusted local rank 0 is out of bounds for 0 devices"
+    assert any(sig in line for sig in CUDA_RACE_SIGNATURES)
+
+
+def test_a_container_stage_failure_reads_as_not_ready():
+    """Exit != 0 from ANY stage is 'not ready', and the reason must not
+    blame nvidia-smi when docker may be the one still coming up."""
+    ready, reason = gpu_readiness(125, "")
+    assert not ready
+    assert "docker" in reason and "toolkit" in reason
+
+
 class RunTaskConn:
     """Enough of ManagedConnection for _run_task's fallback path."""
 

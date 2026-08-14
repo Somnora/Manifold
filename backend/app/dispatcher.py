@@ -58,9 +58,21 @@ class ParameterError(Exception):
 # "No CUDA GPUs are available" despite --gpus all. nvidia-container-cli talks
 # to the same library docker's --gpus path uses; probed only when installed
 # so a box without the toolkit stays fail-open.
+#
+# THE LAST STAGE WALKS THROUGH THE JOB'S OWN DOOR. The 2026-08-14 mini-gate
+# proved the two host-side checks are not sufficient: a job dispatched
+# seconds after connect died with "DP adjusted local rank 0 is out of bounds
+# for 0 devices" while both host probes read healthy. The only probe that
+# cannot be fooled is the exact path the job takes - `docker run --gpus all`
+# - so the final stage runs a real (tiny) container and asks the GPU to show
+# itself from inside. The NVIDIA runtime injects nvidia-smi into any image,
+# so plain ubuntu works; the image is fetched once and cached, and boxes
+# without docker skip the stage (fail-open, same rule as the toolkit stage).
 GPU_PROBE_COMMAND = (
     "nvidia-smi -q && "
-    "{ ! command -v nvidia-container-cli >/dev/null || nvidia-container-cli info; }"
+    "{ ! command -v nvidia-container-cli >/dev/null || nvidia-container-cli info; } && "
+    "{ ! command -v docker >/dev/null || "
+    "docker run --rm --gpus all ubuntu:24.04 nvidia-smi -L; }"
 )
 
 # Container stderr signatures of that same race, for the last-resort retry.
@@ -68,6 +80,9 @@ CUDA_RACE_SIGNATURES = (
     "No CUDA GPUs are available",
     "could not select device driver",
     "nvidia-container-cli: initialization error",
+    # torch's DataParallel wording for the same race - the exact line the
+    # 2026-08-14 mini-gate died with while every signature above missed it.
+    "out of bounds for 0 devices",
 )
 
 # Fabric states that mean CUDA is (or will trivially be) initializable.
@@ -85,7 +100,12 @@ def gpu_readiness(exit_code: int, output: str) -> tuple[bool, str]:
     - no Fabric section (PCIe boxes) or a settled state -> ready
     """
     if exit_code != 0:
-        return False, "nvidia-smi not answering yet (driver still coming up)"
+        # Any stage can be the one that failed (driver, toolkit, or the
+        # container-level check), so the reason names the probe, not one
+        # stage - a message blaming nvidia-smi when docker was the failure
+        # sends the reader to the wrong log.
+        return False, ("GPU not servable yet (driver, container toolkit, or "
+                       "docker --gpus still coming up)")
     in_fabric = False
     for line in output.splitlines():
         stripped = line.strip()
