@@ -68,6 +68,7 @@ from .model_client import ModelClient, RealModelClient
 from .sidecar_client import RealSidecarClient, SidecarClient, SidecarError
 from .ide_attach import remove_ssh_config_block
 from .providers import ProviderRegistry
+from .providers.base import ProviderCapacityError, ProviderError
 from .providers.base import ProviderUnavailable
 
 logger = logging.getLogger("manifold.orchestrator")
@@ -422,6 +423,15 @@ class Orchestrator:
         """
         mode = connection_mode or self.settings.default_connection_mode
         self._validate_mode(mode)
+
+        # Checked before the catalog call: this refusal costs nothing, needs
+        # no API, and is the more actionable message when both would apply.
+        if filesystem and provider != 'lambda':
+            raise LaunchRejected(
+                400,
+                f"{provider} launches are scratch-only for now: persistent "
+                f"filesystems are a Lambda feature (GCP Filestore is not "
+                f"wired up). Launch without a filesystem.")
 
         cloud_provider = self.providers.get_provider(provider)
         types = {t.name: t for t in await cloud_provider.list_instance_types()}
@@ -1544,6 +1554,22 @@ class Orchestrator:
                             hostname=plan.name,
                         ),
                     )
+                except ProviderCapacityError as err:
+                    # GCE "resource pool exhausted": same transient shape as
+                    # Lambda's insufficient-capacity, same treatment.
+                    logger.info(
+                        "launch %s: provider capacity for %s (attempt %d)",
+                        plan.launch_id, candidate, attempts)
+                    self.db.update_launch(
+                        plan.launch_id, status="retrying",
+                        error=f"attempt {attempts}: {err}")
+                    continue
+                except ProviderError as err:
+                    # Not transient (quota, bad config): the message already
+                    # carries the fix, so retrying would only obscure it.
+                    self.db.update_launch(
+                        plan.launch_id, status="failed", error=str(err))
+                    return None
                 except LambdaAPIError as err:
                     if err.is_capacity_error:
                         logger.info(

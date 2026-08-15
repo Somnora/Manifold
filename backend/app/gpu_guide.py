@@ -86,6 +86,33 @@ _FAMILIES: tuple[tuple[re.Pattern, FamilyNotes], ...] = tuple(
             ),
             note="Oldest architecture here; check your image supports it.",
         )),
+        (r"^L4 ", FamilyNotes(
+            family="L4",
+            era="Ada Lovelace, 2023",
+            good_for=(
+                "Google's efficiency card and the cheapest modern GPU on "
+                "the GCP shelf. Serves 7B at fp16 or ~30B at 4-bit like an "
+                "A10, with newer kernels and strong video/media work."
+            ),
+            step_up_when=(
+                "you need more than 24 GB in one card, or training speed "
+                "starts to matter - this card is built for inference."
+            ),
+        )),
+        (r"^T4 ", FamilyNotes(
+            family="T4",
+            era="Turing, 2018",
+            good_for=(
+                "The budget rung on GCP: fine for small serves, Whisper "
+                "batches and trying a workflow end to end for pocket "
+                "change."
+            ),
+            step_up_when=(
+                "you need bf16 or modern attention kernels - this card "
+                "predates both."
+            ),
+            note="Same generation as the RTX 6000; check image support.",
+        )),
         (r"^A6000", FamilyNotes(
             family="A6000",
             era="Ampere, 2020",

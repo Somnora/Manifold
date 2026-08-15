@@ -43,12 +43,16 @@ export function LaunchForm({ onLaunched }: { onLaunched: () => void }) {
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState("");
   const [provider, setProvider] = useState("lambda");
+  const [gcpQuota, setGcpQuota] = useState<{
+    quotas: { metric: string; limit: number; usage: number; scope: string }[];
+    request_url: string;
+  } | null>(null);
   const [loadError, setLoadError] = useState("");
 
   useEffect(() => {
     Promise.all([
       api.instanceTypes(provider),
-      api.regions(),
+      api.regions(provider),
       api.filesystems(),
       api.sshKeys(),
     ])
@@ -70,6 +74,20 @@ export function LaunchForm({ onLaunched }: { onLaunched: () => void }) {
       })
       .catch((e) => setLoadError(e.message));
   }, [provider]);
+
+  // The GCP quota read is separate from the catalog load: it can be slow or
+  // 503 (no ADC yet) without taking the form down, and it only matters
+  // under the GCP toggle.
+  useEffect(() => {
+    if (provider !== "gcp") {
+      setGcpQuota(null);
+      return;
+    }
+    api
+      .gcpQuota(region || undefined)
+      .then(setGcpQuota)
+      .catch(() => setGcpQuota(null));
+  }, [provider, region]);
 
   const selectedType = types[instanceType];
   const fsRegions = useMemo(
@@ -198,6 +216,42 @@ export function LaunchForm({ onLaunched }: { onLaunched: () => void }) {
           </button>
         </div>
       </div>
+
+      {provider === "gcp" && Object.keys(types).length > 0 && (
+        <div className="mb-4 space-y-2">
+          <p className="rounded-lg border border-zinc-200 bg-zinc-50 px-3 py-2 text-[11px] leading-relaxed text-zinc-600">
+            {Object.values(types).find((t) => t.price_basis)?.price_basis}
+            {" "}Launches are scratch-only for now (no persistent
+            filesystems on GCP yet).
+          </p>
+          {gcpQuota && (
+            <p className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-[11px] leading-relaxed text-amber-800">
+              {(() => {
+                const rows = gcpQuota.quotas.filter(
+                  (q) => q.scope !== "global" && q.limit > 0);
+                const global = gcpQuota.quotas.find(
+                  (q) => q.metric === "GPUS_ALL_REGIONS");
+                if (global && global.limit === 0)
+                  return "Your project's global GPU quota is 0, so no GPU launch can succeed yet. ";
+                if (rows.length === 0)
+                  return "No regional GPU quota here yet. ";
+                return `GPU quota here: ${rows
+                  .map((q) => `${q.metric} ${q.usage}/${q.limit}`)
+                  .join(", ")}. `;
+              })()}
+              <a
+                className="underline"
+                href={gcpQuota.request_url}
+                target="_blank"
+                rel="noreferrer"
+              >
+                Request an increase
+              </a>{" "}
+              - Google usually answers small requests in minutes to hours.
+            </p>
+          )}
+        </div>
+      )}
 
       {provider === "gcp" && Object.keys(types).length === 0 && (
         <p className="mb-4 rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-xs text-amber-800">

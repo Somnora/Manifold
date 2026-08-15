@@ -162,6 +162,8 @@ ROUTE_ROLES: dict[tuple[str, str], str] = {
     ("GET", "/model-presets"): "viewer",
     # Phase 86: the hardware ladder is reading the menu, nothing more.
     ("GET", "/gpu-guide"): "viewer",
+    # Phase 87: reading your own GCP quota is a viewer act.
+    ("GET", "/gcp/quota"): "viewer",
     ("GET", "/student-presets"): "viewer",
     ("GET", "/watches"): "viewer",
     ("GET", "/brains"): "viewer",

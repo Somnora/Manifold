@@ -4679,3 +4679,61 @@ Known cosmetic gap, deliberately not half-fixed: in mock mode the REGION
 dropdown still lists Lambda's regions under the GCP toggle (regions are
 not provider-scoped yet). That belongs to the real GCP phase, where zones
 replace regions properly.
+
+## 2026-08-15 — Phase 87: Google, for real
+
+**What ships:** `RealGCPProvider` implemented against google-cloud-compute
+over ADC; a curated shelf (gcp_catalog.py) of a dozen machine shapes from
+a $0.54/hr T4 to the 8x H100 a3 node, intersected at request time with ONE
+live acceleratorTypes.aggregatedList call for zone availability; launches
+on Ubuntu 22.04 with the SAME cloud-init rider Lambda boots (a new driver
+block guarded by `command -v nvidia-smi` no-ops where drivers exist);
+GET /gcp/quota and a launch-form strip showing GPU quota BEFORE the click;
+provider-scoped /regions; ProviderCapacityError so GCE resource-pool
+exhaustion retries exactly like Lambda capacity while quota errors fail
+with the console link and metric name in the message.
+
+**The decisions:**
+
+- *ADC, never a pasted key.* `gcloud auth application-default login` is a
+  browser OAuth into the user's own Google account; the SDK resolves it
+  natively and Manifold never sees a credential - the CLI-brains rule
+  applied to a cloud. Service-account files remain the headless fallback
+  via GOOGLE_APPLICATION_CREDENTIALS. Auth expiry is a NORMAL state and
+  maps to the one command that fixes it (hit live while building: the
+  owner's 21-day-old ADC token had expired, and the raw RefreshError
+  leaked through before the mapping existed).
+- *Curated shelf x live zones.* GCE has no "GPU types with prices" list;
+  inventing one dynamically means inventing prices. The shelf is code
+  (reviewable, dated), availability is Google's own answer, and prices
+  carry price_basis on every entry - the money rule extended to a second
+  provider. An entry whose accelerator appears nowhere is shown out of
+  capacity, never guessed.
+- *Labels are the ownership boundary.* Every launch carries
+  manifold=true and every list/get/terminate filters on it, so the
+  reconcile sweep can never adopt - and terminate can never name - a VM
+  Manifold did not create. In a project that also runs the owner's other
+  workloads, this is a safety rule, not a convenience.
+- *One instance id, no zone memory.* GCP ids are the instance NAME;
+  list/terminate find the zone via aggregatedList, so backend restarts
+  need no state Lambda rows do not already have.
+- *Quota is a product surface.* Fresh projects hold ZERO GPU quota, which
+  blocks first launches more often than anything code does. The form
+  shows the number before the click; the refusal links the request page
+  and names the metric.
+
+**What the suite caught before the gate could pay to:** GAPIC's
+aggregated_list does not promote `filter`/`project` to keywords - the
+TypeError from the bare-keyword call read as a transient provider outage
+and silently vetoed connection reaping (test_reconcile caught the
+behaviour change). Request objects everywhere now.
+
+**Awaiting the paid gate (blocked on a human browser step):** both gcloud
+logins on this machine have aged out, so live verification stops at
+"the error tells you exactly what to run". After `gcloud auth login` and
+`gcloud auth application-default login`: free reads (live catalog zones,
+real quota numbers), then - quota permitting - one g2-standard-4 L4
+(~$0.71/hr listed) through launch -> driver install -> gpu-smoke ->
+terminate. If quota is zero, the gate becomes proving the refusal chain:
+the form's warning, the launch error's console link, and the request
+flow. Compute API enablement on somnora-dev-01 also awaits that login.
