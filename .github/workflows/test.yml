@@ -75,7 +75,14 @@ jobs:
       # job needs uv too. Without it the backend never started, the seeding
       # curl hit nothing, and the step died on a JSON parse error three
       # commands downstream of the actual cause.
+      #
+      # Cache off: setup-uv's post-job cache prune ran while the
+      # backgrounded uvicorn still held the cache and failed with exit 2 -
+      # every real step green, the job red on cleanup. The backend is also
+      # killed at the end of its step now, but a cleanup that CAN fail the
+      # job buys nothing here worth that risk.
       - uses: astral-sh/setup-uv@v5
+        with: { enable-cache: false }
       - name: Build the static export
         working-directory: dashboard
         run: npm ci --no-fund --no-audit && npm run build
@@ -142,3 +149,6 @@ jobs:
             sleep 1
           done
           node e2e/job-pipeline.mjs
+          # The backend must not outlive the step: a uv-spawned process
+          # alive at post-job time is what broke the action's cleanup.
+          pkill -f "uvicorn app.main" || true
