@@ -28,7 +28,13 @@ await p.waitForTimeout(4000);
 // DATA, not against a number hardcoded from the author's machine.
 const api = process.env.API || "http://localhost:8000";
 const expected = await p.evaluate(async (base) => {
-  const r = await fetch(`${base}/tasks`);
+  // Same credential the app's own client sends. A bare fetch got 401 and
+  // reported "0 tasks" while the UI happily showed 43 - the check calling
+  // the product a liar because the check was the one unauthenticated.
+  const token = localStorage.getItem(`manifold-api-token:${base}`) || "";
+  const r = await fetch(`${base}/tasks`, {
+    headers: token ? { Authorization: `Bearer ${token}` } : {},
+  });
   const tasks = (await r.json()).tasks ?? [];
   return {
     total: tasks.length,
@@ -89,14 +95,21 @@ if (expected.chained > 0) {
 }
 
 // The minimap must not be an opaque slab over the jobs.
-const mm = await p.locator(".react-flow__minimap").first().boundingBox().catch(() => null);
+const hasMinimap = await p.locator(".react-flow__minimap").count() > 0;
+const mm = hasMinimap
+  ? await p.locator(".react-flow__minimap").first().boundingBox()
+  : null;
 if (mm) {
   const frac = (mm.width * mm.height) / (box.width * box.height);
   console.log(`  minimap covers ${(frac * 100).toFixed(1)}% of the canvas`);
   ok(frac < 0.10, "minimap is small enough not to cover the graph");
 } else ok(true, "no minimap needed at this size");
 
-await canvas.screenshot({ path: "/private/tmp/claude-501/pipeline-fixed.png" });
+try {
+  await canvas.screenshot({ path: process.env.SHOT || "pipeline.png" });
+} catch (e) {
+  console.log("  (screenshot skipped:", e.message.split("\n")[0], ")");
+}
 await b.close();
 console.log(fail.length ? `\n${fail.length} FAILED` : "\nALL CHECKS PASSED");
 process.exit(fail.length ? 1 : 0);
