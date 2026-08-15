@@ -10,6 +10,12 @@ import { usePolling } from "@/lib/usePolling";
 // tool call already lands in the audit log with actor "mcp". Recent call =
 // an agent is working. Click-through lands on Activity, where each call
 // and its note are listed.
+//
+// The one state that must never be silent is NEVER-CONNECTED (Phase 88):
+// a user told their agent "Manifold is open for you to use" while no MCP
+// call had ever reached this backend, and neither side had anywhere to
+// see that. Zero all-time audit rows is a knowable fact, so it gets a
+// chip - linking to the Settings card with the one-line connect command.
 const ACTIVE_SECONDS = 5 * 60;      // teal: an agent is working right now
 const RECENT_SECONDS = 60 * 60;     // grey: worked within the hour
 
@@ -25,8 +31,23 @@ function agoLabel(seconds: number): string {
 
 export function McpChip() {
   const { data: entries } = usePolling(() => api.audit("mcp", 1), 10000);
-  const last = entries?.[0];
-  if (!last) return null;
+  if (!entries) return null;          // first poll still in flight
+  const last = entries[0];
+  if (!last) {
+    // Never connected: say so where the user is looking, with the fix
+    // one click away. (Once an agent HAS connected, quiet periods go back
+    // to showing nothing - staleness is noise, absence is a trap.)
+    return (
+      <Link
+        href="/settings#connect-agent"
+        title="No MCP call has ever reached this backend. Click for the one-line command that connects Claude Code (or any MCP client)."
+        className="flex h-8 items-center gap-1.5 rounded border border-dashed border-zinc-300 px-2.5 font-mono text-xs text-zinc-400 transition-colors hover:border-zinc-400 hover:text-zinc-600"
+      >
+        <span className="h-1.5 w-1.5 rounded-full bg-zinc-300" />
+        no agent connected
+      </Link>
+    );
+  }
 
   const seconds = age(last.at);
   if (seconds > RECENT_SECONDS) return null;   // stale: no chip, no noise

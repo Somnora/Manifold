@@ -19,6 +19,7 @@ dependencies = [
 
 [project.scripts]
 manifold-mcp = "app.mcp_server:main"
+manifold-doctor = "app.doctor:main"
 
 [dependency-groups]
 dev = [

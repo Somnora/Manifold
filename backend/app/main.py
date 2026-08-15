@@ -3850,6 +3850,14 @@ def create_default_app() -> FastAPI:
     except PolicyError as exc:
         raise SystemExit(f"manifold: refusing to start: {exc}") from exc
 
+    # Phase 88: leave the discovery breadcrumb (~/.config/manifold) so an
+    # agent probing the filesystem finds the running product in seconds
+    # instead of a lost session. Best-effort by contract; only the REAL
+    # entry point writes it - create_app stays side-effect-free for tests.
+    from .breadcrumb import write_breadcrumb
+    port = os.environ.get("MANIFOLD_PORT", "8000")
+    write_breadcrumb(f"http://127.0.0.1:{port}")
+
     return create_app(mock=mock, lambda_client=lambda_client,
                       mock_seed_days=seed_days if mock else 0,
                       policy=policy)

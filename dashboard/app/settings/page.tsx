@@ -4,6 +4,7 @@ import { useState } from "react";
 import { api, ApiError } from "@/lib/api";
 import { usePolling } from "@/lib/usePolling";
 import { Badge } from "@/components/Badge";
+import { ConnectAgentPanel } from "@/components/ConnectAgentPanel";
 import { PolicyCard } from "@/components/PolicyCard";
 import { PolicySettings } from "@/components/PolicySettings";
 import { PrincipalsPanel } from "@/components/PrincipalsPanel";
@@ -89,6 +90,8 @@ export default function SettingsPage() {
       <LambdaKeyForm onSaved={refresh} />
       <GcpConfigForm onSaved={refresh} />
       <S3KeysForm onSaved={refresh} />
+
+      <ConnectAgentPanel envPath={status?.env_path} />
 
       <PrincipalsPanel />
 

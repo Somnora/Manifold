@@ -11,6 +11,10 @@ ONLY the installed app - no dev checkout, no uv. The bridge is the same
 HTTP-only thin client as `uv run manifold-mcp`; it needs the app (or any
 backend) already running to answer.
 
+`manifold-backend --doctor` prints the end-to-end wiring checklist
+(backend up? token accepted? registered in which agent configs, at what
+scope?) and exits nonzero when an agent would be blocked. See app/doctor.py.
+
 MANIFOLD_MOCK=1 works here exactly as in development - the packaged app can
 be demoed with zero credentials and zero spend.
 """
@@ -80,6 +84,10 @@ def run_mcp() -> None:
 def main() -> None:
     if "--mcp" in sys.argv[1:]:
         run_mcp()
+        return
+    if "--doctor" in sys.argv[1:]:
+        from app import doctor
+        doctor.main()
         return
     if os.environ.get("MANIFOLD_PARENT_WATCHDOG") == "1":
         _watch_parent()
