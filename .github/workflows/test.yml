@@ -71,6 +71,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with: { node-version: 22 }
+      # The pipeline check drives the UI against a real backend, so this
+      # job needs uv too. Without it the backend never started, the seeding
+      # curl hit nothing, and the step died on a JSON parse error three
+      # commands downstream of the actual cause.
+      - uses: astral-sh/setup-uv@v5
       - name: Build the static export
         working-directory: dashboard
         run: npm ci --no-fund --no-audit && npm run build
@@ -95,14 +100,23 @@ jobs:
       # demo history gives the graph something to lay out.
       - name: Check the job pipeline lays out and fits
         run: |
-          cd backend && uv sync --dev >/dev/null 2>&1 || true
-          MANIFOLD_MOCK=1 MANIFOLD_MOCK_SEED_DAYS=2 \
+          cd backend
+          uv sync --dev
+          MANIFOLD_MOCK=1 \
             uv run uvicorn app.main:create_default_app --factory --port 8000 \
-            >/dev/null 2>&1 &
-          for i in $(seq 1 40); do
-            curl -sf -o /dev/null http://127.0.0.1:8000/health && break
+            > /tmp/manifold-backend.log 2>&1 &
+          up=""
+          for i in $(seq 1 60); do
+            curl -sf -o /dev/null http://127.0.0.1:8000/health && { up=1; break; }
             sleep 1
           done
+          # Fail HERE, naming the cause, rather than sliding into a seeding
+          # error that points at the wrong thing.
+          if [ -z "$up" ]; then
+            echo "backend never came up; its log:" >&2
+            tail -30 /tmp/manifold-backend.log >&2
+            exit 1
+          fi
           cd ../dashboard
           python3 -m http.server 3000 --bind 127.0.0.1 --directory out \
             >/dev/null 2>&1 &
