@@ -4786,3 +4786,49 @@ Also observed and filed: the instance card carries no `provider` field
 
 Manifold's first multi-cloud day ends with both providers real: Lambda
 $5.10 across five gates, GCP $0.18 across one.
+
+## 2026-08-15 — The job pipeline was showing a clipped sliver of a 6,150px column
+
+Reported with screenshots: cards cut off top and bottom, a black rectangle
+sitting over them, and scrolling made it worse. Five separate bugs, and
+the live backend's own data explains the shape of all of them - 43 tasks,
+41 of them with no `depends_on` at all.
+
+**The geometry.** Independent jobs all landed in column 0, one per row, at
+150px each: a 6,150px-tall column inside a 400px canvas. React Flow's
+default `minZoom` is 0.5, so `fitView` could not shrink it (it needed
+0.27) and silently gave up - leaving the middle band on screen. Fixed on
+both sides: `minZoom={0.04}`, and isolated jobs are now GRIDDED rather
+than stacked. That is honest rather than cosmetic: for a job with no
+parents and no children, the x axis carries no dependency meaning, so
+wrapping it into a grid states nothing false. Jobs that DO participate in
+a chain keep strict `x = depth`, so "further right" still always means
+"runs later".
+
+**`fitView` is a mount-time prop, not a subscription.** The panel polls
+every 4 seconds; nodes arriving later were never re-fitted. Now re-fitted
+inside a rAF when the node/status SIGNATURE changes - not on object
+identity, which changes every poll and would yank the viewport out from
+under someone reading it.
+
+**The black rectangle was the MiniMap**, 200x150 on a 400px canvas
+(a quarter of the view) with `!bg-zinc-950` on a zinc-950 canvas. It now
+appears only above 12 nodes, at 132x92, coloured by task status so a red
+cluster is visible at a glance - and its background is a LITERAL hex,
+because the dark theme remaps the zinc scale and `bg-zinc-900` rendered as
+a light panel against the dark canvas (the trap the template editor
+already documents).
+
+**The label was untrue.** "An arrow means runs after" - the edges carried
+no `markerEnd` at all, so nothing on screen was ever an arrow. They have
+arrowheads now. Isolated nodes also no longer render a target handle: 41
+dangling connector dots read as "these connect somehow", which is the
+exact false impression this panel was rebuilt once already to stop making.
+
+Verified in a real browser against the real 43-task backend, not by
+reading the diff: every node inside the canvas (43/43), 6 columns, markers
+present, minimap 5.4% of the canvas. `dashboard/e2e/job-pipeline.mjs`,
+now a CI step beside the modal check. Note the harness must serve the
+export on port 3000 exactly - on any other port the dashboard calls
+ITSELF for the API and renders an empty graph, which looks identical to a
+broken fix.
