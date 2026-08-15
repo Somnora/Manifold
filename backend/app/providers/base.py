@@ -13,6 +13,16 @@ class ProviderError(Exception):
     """
     pass
 
+class ProviderCapacityError(ProviderError):
+    """The provider has no capacity for this request RIGHT NOW.
+
+    Transient by definition, so the launch retry loop treats it exactly
+    like Lambda's insufficient-capacity error: back off and try again.
+    Quota exhaustion is NOT this class - quota does not come back on its
+    own, so it raises plain ProviderError with the fix in the message.
+    """
+
+
 class ProviderUnavailable(ProviderError):
     """A provider could not be READ, so its silence proves nothing.
 

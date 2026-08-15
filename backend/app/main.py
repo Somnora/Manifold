@@ -90,6 +90,7 @@ from .templates import load_templates
 from .ide_attach import write_ssh_config_block, get_ide_urls
 from .terminal_sessions import TerminalSession, TerminalSessionManager
 from .providers import ProviderRegistry, LambdaProvider, GCPProvider, MockGCPProvider, RealGCPProvider
+from .providers.base import ProviderError, ProviderUnavailable
 from .subagent_engine import engine, NoHealthyEndpoint, SubagentDispatchError
 
 logger = logging.getLogger("manifold.main")
@@ -598,7 +599,30 @@ def create_app(
     if mock:
         providers.register('gcp', MockGCPProvider())
     else:
-        providers.register('gcp', RealGCPProvider(settings.gcp.project_id, settings.gcp.default_zone, settings.gcp.credentials_file))
+        def _local_public_key(_settings=settings) -> str:
+            """The local SSH public key, for GCE instance metadata.
+
+            <private_key_path>.pub when it exists; otherwise derived from
+            the private key itself (asyncssh is already a dependency). GCE
+            takes key MATERIAL, not a registered name like Lambda - and it
+            is the same key pair ManagedConnection dials with, so a GCP box
+            is reachable the moment it boots."""
+            from pathlib import Path
+            priv = Path(_settings.ssh.private_key_path).expanduser()
+            pub = priv.with_name(priv.name + ".pub")
+            try:
+                if pub.exists():
+                    return pub.read_text().strip()
+                import asyncssh
+                key = asyncssh.read_private_key(str(priv))
+                return key.export_public_key().decode().strip()
+            except Exception:
+                return ""
+
+        providers.register('gcp', RealGCPProvider(
+            settings.gcp.project_id, settings.gcp.default_zone,
+            settings.gcp.credentials_file,
+            public_key_fn=_local_public_key))
     orchestrator = Orchestrator(
         settings, providers, db,
         connect_fn=connect_fn, sidecar_factory=sidecar_factory,
@@ -1071,6 +1095,10 @@ def create_app(
             raise HTTPException(
                 422, f"Unknown provider '{provider}'. Registered: {known}.")
         specs = await cloud.list_instance_types()
+        basis = ""
+        if provider == "gcp":
+            from .providers.gcp_catalog import PRICE_BASIS
+            basis = PRICE_BASIS
         return {
             t.name: {
                 "description": t.description,
@@ -1078,6 +1106,9 @@ def create_app(
                     f"{t.gpu_type} ({t.gpu_ram_gb} GB)"
                     if t.gpus and t.gpu_type else "N/A"),
                 "price_usd_per_hour": t.price_cents_per_hour / 100,
+                # Dated list price, not a live meter: the label rides every
+                # entry so no screen can show the number without it.
+                **({"price_basis": basis} if basis else {}),
                 # storage size is not part of the cross-provider spec;
                 # 0 is honest here where a guess would not be.
                 "specs": {"vcpus": t.vcpus, "memory_gib": t.ram_gb,
@@ -1103,6 +1134,31 @@ def create_app(
         from . import gpu_guide
         return gpu_guide.build_guide(await _catalog_for(provider))
 
+    @app.get("/gcp/quota")
+    async def gcp_quota(region: str = ""):
+        """GPU quota for the operator's GCP project, global + one region.
+
+        Fresh projects hold ZERO GPU quota, and that - not code - is what
+        blocks a first GCP launch. The launch form shows this number before
+        the click; the error after the click links the request page."""
+        cloud = orchestrator.providers.get_provider("gcp")
+        fetch = getattr(cloud, "gpu_quota", None)
+        if fetch is None:
+            return {"quotas": [], "project": ""}
+        from .providers.gcp_catalog import zone_to_region
+        target = zone_to_region(region) if region else "us-central1"
+        try:
+            rows = await fetch(target)
+        except ProviderUnavailable as exc:
+            raise HTTPException(503, str(exc))
+        except ProviderError as exc:
+            raise HTTPException(502, str(exc))
+        return {"quotas": rows,
+                "project": getattr(cloud, "project_id", ""),
+                "request_url": (
+                    f"https://console.cloud.google.com/iam-admin/quotas"
+                    f"?project={getattr(cloud, 'project_id', '')}")}
+
     @app.get("/launch-options")
     async def launch_options_route():
         """Launchable (type, region, filesystem) targets that Lambda can
@@ -1118,7 +1174,17 @@ def create_app(
         return options
 
     @app.get("/regions")
-    async def list_regions():
+    async def list_regions(provider: str = "lambda"):
+        if provider != "lambda":
+            # A provider's region list is ITS OWN: for GCP these are zones,
+            # taken from the same live catalog the launch form shows, so
+            # the dropdown can never offer a place the shelf is not.
+            zones: list[str] = []
+            for rung in (await _catalog_for(provider)).values():
+                for z in rung["regions_with_capacity"]:
+                    if z not in zones:
+                        zones.append(z)
+            return {"regions": [{"code": z, "name": z} for z in sorted(zones)]}
         """The full region universe with human names, so the launch form can
         show every region and grey out the ones a chosen GPU can't use.
 

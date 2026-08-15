@@ -27,6 +27,24 @@ exec > /var/log/manifold-init.log 2>&1
 
 export DEBIAN_FRONTEND=noninteractive
 
+# --- NVIDIA driver (Phase 87) ---------------------------------------------
+# Lambda images ship the driver, so this whole block no-ops there - the
+# `command -v` guard is the provider switch, not a template flag. Stock GCE
+# Ubuntu ships NO driver, and installing one is the boot-time price of
+# using a plain Ubuntu image (chosen because it consumes cloud-init
+# user-data, the same rider Lambda boots with). The -gcp package carries
+# prebuilt kernel modules for GCE's kernel; the fallback DKMS-builds on
+# anything else. Takes several minutes: the dispatcher's GPU probe holds
+# jobs until a container can actually see the card, so slow is safe.
+if ! command -v nvidia-smi >/dev/null; then
+  apt-get update -qq
+  apt-get install -y -qq linux-modules-nvidia-570-server-gcp \
+    nvidia-driver-570-server \
+    || apt-get install -y -qq nvidia-driver-570-server \
+    || apt-get install -y -qq nvidia-driver-550-server
+  modprobe nvidia || true
+fi
+
 # --- Docker + NVIDIA Container Toolkit (Lambda images ship the driver) ----
 if ! command -v docker >/dev/null; then
   curl -fsSL https://get.docker.com | sh

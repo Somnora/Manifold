@@ -98,6 +98,9 @@ export type InstanceTypeInfo = {
   description: string;
   gpu_description: string;
   price_usd_per_hour: number;
+  // Present when the price is a dated list price rather than a live meter
+  // (GCP v1). The string IS the honesty label; show it near the number.
+  price_basis?: string;
   specs: { vcpus: number; memory_gib: number; storage_gib: number; gpus: number };
   regions_with_capacity: string[];
 };
@@ -647,8 +650,19 @@ export const api = {
   instanceTypes: (provider?: string) =>
     request<Record<string, InstanceTypeInfo>>(`/instance-types${provider ? `?provider=${provider}` : ""}`),
 
-  regions: () =>
-    request<{ regions: Region[] }>("/regions").then((r) => r.regions),
+  regions: (provider?: string) =>
+    request<{ regions: Region[] }>(
+      `/regions${provider ? `?provider=${provider}` : ""}`,
+    ).then((r) => r.regions),
+
+  // Phase 87: the number that actually gates a first GCP launch. Fresh
+  // projects hold ZERO GPU quota, so the form shows it before the click.
+  gcpQuota: (region?: string) =>
+    request<{
+      quotas: { metric: string; limit: number; usage: number; scope: string }[];
+      project: string;
+      request_url: string;
+    }>(`/gcp/quota${region ? `?region=${region}` : ""}`),
 
   createFilesystem: (name: string, region: string) =>
     request<Filesystem>("/filesystems", {
