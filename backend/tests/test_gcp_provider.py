@@ -234,3 +234,16 @@ async def test_expired_adc_reads_as_the_command_that_fixes_it():
         await bad_auth()
     assert "gcloud auth application-default login" in str(exc.value)
     assert "expired" in str(exc.value)
+
+
+def test_instance_cards_carry_their_provider(client):
+    """A mixed fleet is ambiguous exactly when it matters - the GCE gate
+    had to infer the provider from the id shape. Every card says whose
+    cloud it is, launch row first, 'lambda' only as the pre-field
+    fallback."""
+    from tests.test_reconcile import launch_connected
+
+    _, instance_id = launch_connected(client)
+    card = next(i for i in client.get("/instances").json()["instances"]
+                if i["id"] == instance_id)
+    assert card["provider"] == "lambda"

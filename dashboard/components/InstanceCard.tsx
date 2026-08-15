@@ -222,6 +222,14 @@ export function InstanceCard({
           <p className="mt-1 text-sm text-zinc-500">
             {instance.gpu_description || instance.instance_type} in{" "}
             {instance.region} at {formatMoney(instance.hourly_rate_usd)}/hr
+            {/* Which cloud, said only when it is not the default: a fleet
+                of Lambda boxes needs no label, a mixed fleet needs it
+                exactly where the money line is. */}
+            {instance.provider && instance.provider !== "lambda" && (
+              <span className="ml-1.5 rounded bg-sky-100 px-1.5 py-0.5 font-mono text-[10px] uppercase text-sky-700">
+                {instance.provider}
+              </span>
+            )}
           </p>
         </div>
         <div

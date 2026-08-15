@@ -1340,6 +1340,14 @@ class Orchestrator:
             launch = self.db.find_launch_by_instance(inst.id)
             result.append({
                 "id": inst.id,
+                # Which cloud runs this box. The launch row is the primary
+                # source; an ADOPTED instance has no row, so the provider
+                # object's own stamp is the fallback, and only then lambda
+                # (the sole provider that predates the field). A mixed fleet
+                # without this is ambiguous exactly when it matters - the
+                # 2026-08-15 GCE gate had to infer it from the id shape.
+                "provider": ((launch.get("provider") if launch else None)
+                             or getattr(inst, "provider", None) or "lambda"),
                 "name": aliases.get(inst.id) or inst.name,
                 "status": inst.status,
                 "ip": inst.ip,

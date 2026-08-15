@@ -40,6 +40,15 @@ whole ladder, from a single A10 to an 8x B200 node: what each card is for,
 when to step up, and what fits on it - with live provider prices and the
 capability arithmetic labelled as arithmetic, never asserted.
 
+**Two clouds, one door.** Lambda is the first-class provider. Google Cloud
+works through the same guarded backend: launches ride your own
+`gcloud auth application-default login` (a browser OAuth - no API key ever
+touches Manifold), the catalog shows live zone availability with dated
+list prices labelled as such, and your GPU quota appears on the launch
+form before you click, because fresh GCP projects hold zero and that
+blocks more first launches than anything else. New and scratch-only for
+now; see docs/gcp.md.
+
 ## Why it exists
 
 Renting a GPU is easy. Renting one *safely* is not. Manifold's backend is
