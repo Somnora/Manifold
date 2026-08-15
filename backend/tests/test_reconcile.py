@@ -269,7 +269,26 @@ async def test_adopted_connection_is_reaped_when_a_provider_is_unavailable(
     every adopted connection, leaving supervisors reconnect-looping at dead
     hosts forever."""
     instance_id = await _live_instance(mock_client)
-    gcp = RealGCPProvider(project_id="my-proj", default_zone="us-central1-a")
+
+    class _UnavailableProvider(RealGCPProvider):
+        """The contract under test, without the network.
+
+        This used to construct a real RealGCPProvider with a fake project
+        and rely on the STUB raising ProviderUnavailable. Once Phase 87
+        made the provider real, the test's verdict depended on the
+        developer's gcloud state: expired ADC raised the mapped
+        ProviderUnavailable (pass), a VALID login reached Google's live
+        API and got a 403 for the fake project (fail). A test whose result
+        changes when the developer signs into gcloud is reaching the real
+        network, which the mocks-only rule exists to prevent.
+        """
+
+        async def list_instances(self, *, fresh: bool = False):
+            from app.providers.base import ProviderUnavailable
+            raise ProviderUnavailable("this provider cannot be read")
+
+    gcp = _UnavailableProvider(project_id="my-proj",
+                               default_zone="us-central1-a")
     orch = _orchestrator(settings, db, mock_client, extra=[("gcp", gcp)])
     _adopt(orch, mock_client, instance_id)
 

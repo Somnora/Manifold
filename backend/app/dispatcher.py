@@ -1005,7 +1005,13 @@ class Dispatcher:
         if not filesystem:
             self._finish_task(
                 task_id, exit_code=-1, output_paths=[],
-                error=f"no filesystem recorded for instance {instance_id}",
+                error=(
+                    f"instance {instance_id} is scratch-only (launched "
+                    f"without a filesystem), and this template mounts "
+                    f"persistent storage, so there is nowhere to put its "
+                    f"files. Launch an instance with a filesystem attached "
+                    f"to run it - or use a template that only touches "
+                    f"ephemeral scratch."),
             )
             return
 

@@ -4737,3 +4737,52 @@ real quota numbers), then - quota permitting - one g2-standard-4 L4
 terminate. If quota is zero, the gate becomes proving the refusal chain:
 the form's warning, the launch error's console link, and the request
 flow. Compute API enablement on somnora-dev-01 also awaits that login.
+
+## 2026-08-15 — The GCE gate: $0.18, the chain proven, three lessons encoded
+
+One g2-standard-4 (1x L4, $0.71/hr listed) in us-central1-a, launched
+through the guarded backend with a 1.5h ceiling, terminated clean, and
+Google's own instance list confirmed empty afterwards. First real dollars
+on the second provider: $0.18.
+
+**Proven live:** the ADC auth path (after the owner's browser re-login);
+the Compute API enable; the live catalog joining the curated shelf to 44
+real zones for the L4; quota through the product (NVIDIA_L4_GPUS 0/16 -
+this project has real quota, so the full launch could run); launch ->
+boot -> managed SSH connection into a GCE box; and finally
+`docker run --gpus all` printing "GPU 0: NVIDIA L4" from inside a
+container - the exact path every Manifold job takes.
+
+**Lesson 1: never pin a driver series.** The guessed 570 had no module
+build for the running kernel while 535/565/580/595 all did - and the
+meta-package fallback installed modules for the NEXT kernel, loadable
+only after a reboot nobody asked for (modprobe: FATAL, silently
+swallowed by `|| true`). The block now discovers the newest series with
+prebuilt modules for `uname -r` exactly, with DKMS as the last resort.
+Verified by repairing the live box with the discovered pair (580) and
+watching the L4 appear.
+
+**Lesson 2: group membership does not reach open sessions.** cloud-init
+does `usermod -aG docker ubuntu`, but the managed connection is usually
+established while the script is still running - on GCE (where the image
+does not pre-add the group, unlike Lambda) that session got "permission
+denied" on the docker socket forever, and every dispatched job would
+have too. Fixed with an ACL on the socket, which is checked at open()
+time rather than session start, applied after the docker restart that
+recreates the socket. The residual: a docker-daemon restart mid-life
+drops the ACL until the next boot; filed, not hidden.
+
+**Lesson 3: the scratch-only refusal now explains itself.** gpu-smoke
+mounts persistent storage, the GCE box was scratch-only, and the refusal
+read "no filesystem recorded for instance ..." - correct behaviour
+(Phase 39's rule doing its job) wearing an opaque message. It now names
+the cause and both ways out. This also means the T+0 probe test could
+not run through a template on this box - the container chain was proven
+through the product's run route instead; a template-path GCE probe test
+belongs to the Filestore phase, said plainly.
+
+Also observed and filed: the instance card carries no `provider` field
+(the gate's poll had to infer it), worth adding for a mixed fleet.
+
+Manifold's first multi-cloud day ends with both providers real: Lambda
+$5.10 across five gates, GCP $0.18 across one.

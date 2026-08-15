@@ -93,7 +93,12 @@ def test_scratch_only_jobs_need_a_filesystem(client):
             break
         time.sleep(0.02)
     assert task["status"] == "failed"
-    assert "no filesystem" in (task["error"] or "")
+    # The refusal must explain itself: the cause (scratch-only), the
+    # template's need (persistent storage), and both ways out - the old
+    # "no filesystem recorded" was correct behaviour wearing an opaque
+    # message, found live at the 2026-08-15 GCE gate.
+    assert "scratch-only" in (task["error"] or "")
+    assert "persistent storage" in (task["error"] or "")
 
 
 def test_scratch_only_termination_still_protects_data(client, mock_client):

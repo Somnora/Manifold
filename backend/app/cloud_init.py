@@ -38,10 +38,24 @@ export DEBIAN_FRONTEND=noninteractive
 # jobs until a container can actually see the card, so slow is safe.
 if ! command -v nvidia-smi >/dev/null; then
   apt-get update -qq
-  apt-get install -y -qq linux-modules-nvidia-570-server-gcp \
-    nvidia-driver-570-server \
-    || apt-get install -y -qq nvidia-driver-570-server \
-    || apt-get install -y -qq nvidia-driver-550-server
+  # Discover, never guess: prebuilt module packages exist per (driver
+  # series x exact kernel build), and the series line moves. The 2026-08-15
+  # gate booted a kernel with 535/565/580/595 builds available and 570 -
+  # the hardcoded guess - absent; worse, the meta-package installed modules
+  # for the NEXT kernel, loadable only after a reboot nobody asked for.
+  # So: newest series that has modules for the RUNNING kernel, exactly.
+  KVER="$(uname -r)"
+  SERIES="$(apt-cache search linux-modules-nvidia- 2>/dev/null \
+    | grep -oE "linux-modules-nvidia-[0-9]+-server-$KVER" \
+    | sed -E "s/linux-modules-nvidia-([0-9]+)-server-.*/\\1/" \
+    | sort -rn | head -1)"
+  if [ -n "$SERIES" ]; then
+    apt-get install -y -qq "linux-modules-nvidia-$SERIES-server-$KVER" \
+      "nvidia-driver-$SERIES-server"
+  else
+    # No prebuilt modules for this kernel at all: DKMS builds its own.
+    apt-get install -y -qq nvidia-driver-550-server
+  fi
   modprobe nvidia || true
 fi
 
@@ -68,6 +82,14 @@ fi
 # Idempotent, so safe to run unconditionally.
 nvidia-ctk runtime configure --runtime=docker || echo "manifold: WARNING nvidia-ctk configure failed"
 systemctl restart docker || true
+# Group membership only reaches NEW login sessions, and Manifold's managed
+# SSH connection is usually established while this script is still running
+# - so on images where ubuntu was NOT already in the docker group (GCE;
+# Lambda bakes it in), that live session got "permission denied" on the
+# docker socket forever. An ACL is checked at open() time, not session
+# start, so it fixes the already-open session too. Placed after the docker
+# restart because restarting the daemon recreates the socket.
+setfacl -m u:ubuntu:rw /var/run/docker.sock || true
 # Boot-time proof that GPU containers work, recorded in this init log (view
 # it from the in-app Terminal: cat /var/log/manifold-init.log). Also warms
 # the base image gpu-smoke uses.

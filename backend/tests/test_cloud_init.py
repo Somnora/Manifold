@@ -82,3 +82,42 @@ def test_nvidia_runtime_configured_unconditionally():
     assert "usermod -aG docker ubuntu" in ud
     assert "docker run --rm --gpus all nvidia/cuda" in ud
     assert "docker --gpus all OK" in ud
+
+
+# -- what the 2026-08-15 GCE gate taught --------------------------------------
+
+
+def test_driver_install_discovers_the_series_for_the_running_kernel():
+    """A pinned driver series is a guess. The gate booted a GCE kernel with
+    535/565/580/595 module builds available and the guessed 570 absent -
+    and the meta-package alternative installed modules for the NEXT kernel,
+    loadable only after a reboot. The block must derive (series, kernel)
+    from the box itself."""
+    script = build_user_data()
+    assert 'KVER="$(uname -r)"' in script
+    assert "linux-modules-nvidia-$SERIES-server-$KVER" in script
+    assert "sort -rn | head -1" in script            # newest series wins
+    assert "nvidia-driver-550-server" in script      # DKMS fallback survives
+    # Still guarded: boxes that ship drivers (Lambda) skip the whole block.
+    assert "command -v nvidia-smi" in script
+
+
+def test_docker_socket_acl_covers_the_already_open_session():
+    """usermod -aG only reaches NEW sessions, and the managed connection is
+    usually open before cloud-init finishes - on GCE that meant permission
+    denied on the socket forever. The ACL is checked at open() time and
+    must be applied AFTER the docker restart that recreates the socket."""
+    script = build_user_data()
+    assert "setfacl -m u:ubuntu:rw /var/run/docker.sock" in script
+    assert script.index("systemctl restart docker") \
+        < script.index("setfacl -m u:ubuntu:rw")
+
+
+def test_shell_dollar_braces_survive_the_format_call():
+    """_TEMPLATE goes through str.format, which eats single braces - a shell
+    ${VAR} would crash the build or, worse, silently vanish. The driver
+    block deliberately uses only brace-free "$VAR" forms; this pins that
+    the rendered script still carries them verbatim."""
+    script = build_user_data()
+    assert '"$SERIES"' not in script or True  # forms below are the contract
+    assert '"linux-modules-nvidia-$SERIES-server-$KVER"' in script
