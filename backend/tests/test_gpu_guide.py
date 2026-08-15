@@ -174,3 +174,33 @@ def test_route_serves_the_guide_from_the_live_catalog(client):
     for rung in body["rungs"]:
         assert rung["price_usd_per_hour"] == \
             types[rung["instance_type"]]["price_usd_per_hour"]
+
+
+# -- the provider parameter ---------------------------------------------------
+#
+# Found by the owner toggling Lambda/Google and seeing IDENTICAL lists: the
+# dashboard sent ?provider= and the route ignored it, so Google's tab showed
+# Lambda's catalog, prices and availability under Google's name. These pin
+# the repaired contract: every catalog answer is the NAMED provider's data.
+
+
+def test_gcp_catalog_is_empty_in_real_mode_not_lambdas(client):
+    """The real GCP provider is an explicit stub; its catalog degrades to
+    empty. Empty is the truth ("you cannot launch GCP types yet") - showing
+    Lambda's numbers under Google's name was the lie."""
+    lam = client.get("/instance-types").json()
+    gcp = client.get("/instance-types?provider=gcp").json()
+    assert len(lam) > 0
+    assert gcp == {}
+
+
+def test_gpu_guide_follows_the_provider_toggle(client):
+    assert len(client.get("/gpu-guide").json()["rungs"]) > 0
+    assert client.get("/gpu-guide?provider=gcp").json()["rungs"] == []
+
+
+def test_an_unknown_provider_is_refused_by_name(client):
+    resp = client.get("/instance-types?provider=aws")
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert "aws" in detail and "lambda" in detail and "gcp" in detail

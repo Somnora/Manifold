@@ -4646,3 +4646,36 @@ stopwatch, not the product.
 **Only ClusterPanel was affected.** Onboarding and TokenGate also use
 `fixed inset-0`, but their blur is on the fixed element itself (which does
 not trap it) and both mount near the root, so they were left alone.
+
+## 2026-08-14 — The Google toggle was showing Lambda's catalog under Google's name
+
+Caught by the owner: flipping the provider toggle between Lambda and
+Google Cloud changed nothing - same GPUs, same prices, same availability.
+The dashboard has sent `?provider=` since the toggle appeared, and
+`/instance-types` accepted no parameters at all, so every answer was
+`lambda_client.list_instance_types()` regardless. In a product whose rule
+is that a number on a spend screen is provider data or absent, relabelling
+one provider's numbers as another's was the worst available bug - worse
+than the stub itself, whose own design notes say "an empty catalog says
+exactly that". The intent was right and the route never asked.
+
+Fixed by routing both `/instance-types` and `/gpu-guide` through the
+provider registry: Lambda keeps its original field-complete path
+(unchanged days after launch on purpose); any other provider's catalog is
+serialized from its own `CloudInstanceTypeSpec`s; unknown providers 422
+naming the registered ones. Real-mode GCP therefore shows an EMPTY catalog
+- the truth - and the launch form says why in an amber banner ("Manifold
+cannot list, launch, or bill GCP machines... Lambda is the working
+provider"). Mock mode shows the mock GCP catalog (a2/g2 machines), which
+is now visibly DIFFERENT from Lambda's - the two lists disagreeing is how
+a demo proves the seam is real. The hardware ladder follows the toggle and
+refetches on change, because a cached ladder from the other provider is
+the same mislabelling one component over.
+
+Pinned by tests: real-mode GCP catalog == {}, the guide follows the
+toggle, and an unknown provider is refused by name.
+
+Known cosmetic gap, deliberately not half-fixed: in mock mode the REGION
+dropdown still lists Lambda's regions under the GCP toggle (regions are
+not provider-scoped yet). That belongs to the real GCP phase, where zones
+replace regions properly.

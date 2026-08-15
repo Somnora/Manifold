@@ -13,23 +13,31 @@ import { formatMoney } from "@/lib/format";
 export function HardwareGuide({
   onPick,
   current,
+  provider,
 }: {
   // Selecting a rung IS choosing a GPU: the guide fills the form field so
   // learning and acting are the same motion.
   onPick: (instanceType: string) => void;
   current: string;
+  // The ladder must be the SELECTED provider's ladder. Showing Lambda's
+  // rungs under the Google toggle is the exact mislabelling this page was
+  // caught doing with the catalog.
+  provider?: string;
 }) {
   const [open, setOpen] = useState(false);
   const [guide, setGuide] = useState<GpuGuide | null>(null);
   const [error, setError] = useState("");
 
   useEffect(() => {
-    if (!open || guide) return;
+    if (!open) return;
+    setGuide(null);
     api
-      .gpuGuide()
+      .gpuGuide(provider)
       .then(setGuide)
       .catch((e) => setError(e instanceof ApiError ? e.message : String(e)));
-  }, [open, guide]);
+    // Refetched on provider change, not cached across it: a stale ladder
+    // from the other provider is the bug this parameter exists to prevent.
+  }, [open, provider]);
 
   const fitsLine = (r: GpuRung) =>
     r.fits
@@ -53,7 +61,13 @@ export function HardwareGuide({
         </p>
       )}
 
-      {open && guide && (
+      {open && guide && guide.rungs.length === 0 && (
+        <p className="mt-2 rounded border border-zinc-200 bg-zinc-50 px-3 py-2 text-[11px] text-zinc-500">
+          This provider has no GPU catalog to show yet.
+        </p>
+      )}
+
+      {open && guide && guide.rungs.length > 0 && (
         <div className="mt-2 space-y-2">
           {guide.rungs.map((r) => (
             <div

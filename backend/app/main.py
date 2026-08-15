@@ -1037,22 +1037,62 @@ def create_app(
 
     # -- instances ----------------------------------------------------------------
 
-    @app.get("/instance-types")
-    async def instance_types():
-        types = await lambda_client.list_instance_types()
-        return {
-            name: {
-                "description": t.description,
-                "gpu_description": t.gpu_description,
-                "price_usd_per_hour": t.price_cents_per_hour / 100,
-                "specs": t.specs,
-                "regions_with_capacity": t.regions_with_capacity,
+    async def _catalog_for(provider: str) -> dict:
+        """The instance-type catalog for ONE provider, one response shape.
+
+        The dashboard has sent ?provider= since the GCP toggle appeared, and
+        this route ignored it - so selecting Google Cloud showed LAMBDA's
+        catalog, prices and availability with Google's name above it. In a
+        product whose rule is that a number on a spend screen is provider
+        data or absent, that was the worst available bug. Found by the owner
+        toggling the two and seeing identical lists (2026-08-14).
+
+        Lambda keeps its original, field-complete path. Everything else goes
+        through the provider registry, whose GCP stub returns an EMPTY
+        catalog in real mode - "you cannot launch GCP types yet" said as
+        data - and a small, clearly-GCP-shaped catalog in mock mode.
+        """
+        if provider == "lambda":
+            types = await lambda_client.list_instance_types()
+            return {
+                name: {
+                    "description": t.description,
+                    "gpu_description": t.gpu_description,
+                    "price_usd_per_hour": t.price_cents_per_hour / 100,
+                    "specs": t.specs,
+                    "regions_with_capacity": t.regions_with_capacity,
+                }
+                for name, t in sorted(types.items())
             }
-            for name, t in sorted(types.items())
+        try:
+            cloud = orchestrator.providers.get_provider(provider)
+        except ValueError:
+            known = ", ".join(sorted(n for n, _ in orchestrator.providers.items()))
+            raise HTTPException(
+                422, f"Unknown provider '{provider}'. Registered: {known}.")
+        specs = await cloud.list_instance_types()
+        return {
+            t.name: {
+                "description": t.description,
+                "gpu_description": (
+                    f"{t.gpu_type} ({t.gpu_ram_gb} GB)"
+                    if t.gpus and t.gpu_type else "N/A"),
+                "price_usd_per_hour": t.price_cents_per_hour / 100,
+                # storage size is not part of the cross-provider spec;
+                # 0 is honest here where a guess would not be.
+                "specs": {"vcpus": t.vcpus, "memory_gib": t.ram_gb,
+                          "storage_gib": 0, "gpus": t.gpus},
+                "regions_with_capacity": list(t.regions_available),
+            }
+            for t in sorted(specs, key=lambda x: x.name)
         }
 
+    @app.get("/instance-types")
+    async def instance_types(provider: str = "lambda"):
+        return await _catalog_for(provider)
+
     @app.get("/gpu-guide")
-    async def gpu_guide_route():
+    async def gpu_guide_route(provider: str = "lambda"):
         """The hardware ladder: curated notes joined to live catalog numbers.
 
         Words from gpu_guide.py, numbers from the provider via the SAME
@@ -1061,18 +1101,7 @@ def create_app(
         second price path to go stale.
         """
         from . import gpu_guide
-        types = await lambda_client.list_instance_types()
-        serialized = {
-            name: {
-                "description": t.description,
-                "gpu_description": t.gpu_description,
-                "price_usd_per_hour": t.price_cents_per_hour / 100,
-                "specs": t.specs,
-                "regions_with_capacity": t.regions_with_capacity,
-            }
-            for name, t in types.items()
-        }
-        return gpu_guide.build_guide(serialized)
+        return gpu_guide.build_guide(await _catalog_for(provider))
 
     @app.get("/launch-options")
     async def launch_options_route():

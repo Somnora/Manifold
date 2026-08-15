@@ -955,7 +955,8 @@ export const api = {
       { method: "POST", body: JSON.stringify(body), timeoutMs: 10 * 60_000 },
     ),
 
-  gpuGuide: () => request<GpuGuide>("/gpu-guide"),
+  gpuGuide: (provider?: string) =>
+    request<GpuGuide>(`/gpu-guide${provider ? `?provider=${provider}` : ""}`),
 
   studentPresets: () =>
     request<{ presets: StudentPreset[] }>("/student-presets").then(

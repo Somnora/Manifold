@@ -199,6 +199,15 @@ export function LaunchForm({ onLaunched }: { onLaunched: () => void }) {
         </div>
       </div>
 
+      {provider === "gcp" && Object.keys(types).length === 0 && (
+        <p className="mb-4 rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+          Google Cloud is not wired up yet: Manifold cannot list, launch, or
+          bill GCP machines, so there is nothing to show here. This toggle
+          exists so the provider seam is real and testable. Lambda is the
+          working provider.
+        </p>
+      )}
+
       {/* GPU gets its own full-width row: price is the primary decision
           variable and must never be truncated. Each option LEADS with the
           full $/hr, then the GPU name + VRAM, so even a narrow closed control
@@ -222,6 +231,7 @@ export function LaunchForm({ onLaunched }: { onLaunched: () => void }) {
         <HardwareGuide
           current={instanceType}
           onPick={(t) => setInstanceType(t)}
+          provider={provider}
         />
       </label>
 
