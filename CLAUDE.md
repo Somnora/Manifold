@@ -46,6 +46,8 @@ npm run dev     # then open http://localhost:3000
   - `preferences.py` — the Settings-page policies (approval gates, notification toggles, data safety). config.yaml holds the DEFAULTS; the user's choices live in SQLite and override them. Never secrets.
   - `policy.py` — the launch policy (policy.yaml): reviewable allowlists/caps per role, enforced in the orchestrator, binding everyone incl. the owner. Missing = permissive; invalid = refuses to boot.
   - `notifications.py` — `NotificationCenter`: in-app bell rows + an OS ping (macOS/Linux). Sender is injected, so tests and mock mode stay silent.
+  - `doctor.py` — `manifold-backend --doctor` / `uv run manifold-doctor`: outside-in wiring checklist (backend up, token accepted, registered in which agent configs at what scope); exits nonzero when an agent would be blocked
+  - `breadcrumb.py` — writes `~/.config/manifold/manifold.json` on boot (best-effort, no secrets) so agents discover the running product by probing the filesystem
   - `data_safety.py` — pure rescue decisions: what is in scope, what fits the transfer budget, path confinement. No I/O; the transport lives in the orchestrator.
   - `db.py` — SQLite schema and queries
   - `main.py` — app factory + routes only; no business logic in routes

@@ -4832,3 +4832,58 @@ now a CI step beside the modal check. Note the harness must serve the
 export on port 3000 exactly - on any other port the dashboard calls
 ITSELF for the API and renders an empty graph, which looks identical to a
 broken fix.
+
+## 2026-08-15 — Phase 88: "installed" and "connected" stopped being indistinguishable
+
+An agent in ANOTHER repo was told "Manifold is open for you to use",
+found no manifold entry in its MCP registry, nothing on PATH, nothing in
+~/.config, fell back to a stale hand-pasted instance IP, and lost the
+session — while the app ran the whole time. Its forensic writeup is the
+spec for this phase. Root cause found on OUR side: the Claude Code
+registration was directory-scoped (`claude mcp add` defaults to local
+scope), so from every other repo manifold read as "not installed". The
+docs even said "in this project" — technically true, pragmatically a trap.
+
+**What shipped, ranked by the writeup's own leverage ordering:**
+
+1. **The dashboard says when NO agent has ever connected.** McpChip's
+   empty state was `return null` — silent in exactly the state that
+   burned the session. Zero all-time `mcp` audit rows is a knowable fact
+   (the audit log is never pruned), so it now renders a dashed "no agent
+   connected" chip linking to Settings → Connect an agent: live
+   last-call status plus copy-able registration commands. Honesty
+   constraint kept: the bridge is a stateless HTTP client, so we report
+   activity facts, never a fake "connected" light. Staleness (>1h) still
+   hides the chip — an agent HAS connected, quiet is noise; absence is a
+   trap. Alternative considered: a real connection registry keyed by
+   handshake. Rejected — it would claim liveness the stateless bridge
+   cannot back.
+
+2. **`--doctor`, self-verifying wiring** (`manifold-backend --doctor` /
+   `uv run manifold-doctor`). Reports backend up (mock/real), token
+   present AND accepted (presence/status only, value never printed),
+   which agent configs register manifold at what scope — including the
+   "every registration is directory-scoped" warning that names this
+   incident's exact shape — instances running, breadcrumb present. Exits
+   nonzero when an agent would be blocked. Lives in `app/doctor.py`, an
+   outside-in HTTP client like the bridge; NOT wired into mcp_server.py,
+   whose import allowlist (test_mcp.py) stays untouched.
+
+3. **The discovery breadcrumb**: every backend boot best-effort writes
+   `~/.config/manifold/manifold.json` — what Manifold is, the API URL,
+   health-check, register + doctor one-liners. ~/.config on ALL
+   platforms including macOS, deliberately: Application Support is where
+   the app's state lives, ~/.config is where agents probe (the incident
+   agent probed it and found nothing). Written by create_default_app
+   only, so create_app stays side-effect-free for tests; no secrets;
+   MANIFOLD_NO_BREADCRUMB=1 opts out. Alternative considered: a
+   `manifold` CLI on PATH. Deferred — a macOS app cannot cleanly install
+   to PATH without user action, and doctor + breadcrumb deliver most of
+   the value free.
+
+4. **Docs default to `--scope user`** with the incident as the stated
+   reason.
+
+Writeup item not shipped here: the stale hand-copied IP lived in the
+owner's own rh3d skill files, outside this repo; Manifold already offers
+the fix twice (live `list_instances`, and tailscale MagicDNS names).

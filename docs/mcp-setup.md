@@ -56,8 +56,17 @@ the binary lives inside the app bundle, so registering in Claude Code is
 one command:
 
 ```bash
-claude mcp add manifold -- "/Applications/Manifold.app/Contents/MacOS/manifold-backend" --mcp
+claude mcp add manifold --scope user -- "/Applications/Manifold.app/Contents/MacOS/manifold-backend" --mcp
 ```
+
+`--scope user` matters: without it, Claude Code registers the server for
+sessions started in the **current directory only**, which from every
+other repo is indistinguishable from "not installed". That exact
+confusion once cost a working session (an agent was told "Manifold is
+open for you to use", found no manifold entry in its own registry, and
+lost the session to filesystem archaeology while the app ran the whole
+time). For a machine-wide tool like Manifold, user scope is the right
+default; drop it only if you deliberately want per-project registration.
 
 Claude Desktop (`~/Library/Application Support/Claude/claude_desktop_config.json`):
 
@@ -82,11 +91,12 @@ still works and behaves identically - it is the same bridge.
 From the repo root:
 
 ```bash
-claude mcp add manifold -- uv run --directory "$(pwd)/backend" manifold-mcp
+claude mcp add manifold --scope user -- uv run --directory "$(pwd)/backend" manifold-mcp
 ```
 
-Then in any Claude Code session in this project: "launch a 1x A10 in
-us-east-1 with the manifold-data filesystem" and watch it use the tools.
+Then in any Claude Code session — any directory, thanks to `--scope
+user` (see the note above) — "launch a 1x A10 in us-east-1 with the
+manifold-data filesystem" and watch it use the tools.
 
 ## Registering in Claude Desktop
 
@@ -139,6 +149,38 @@ Add to `~/.gemini/settings.json` (create it if needed):
 ```
 
 `/mcp` inside gemini lists the tools once it connects.
+
+## Is it actually connected? (doctor + breadcrumb)
+
+"Manifold is installed" and "Manifold is connected to this agent
+session" are different states. Two things make the difference visible:
+
+**The doctor.** One command verifies the whole chain and exits nonzero
+when an agent would be blocked:
+
+```bash
+"/Applications/Manifold.app/Contents/MacOS/manifold-backend" --doctor   # installed app
+uv run manifold-doctor                                                  # dev checkout, from backend/
+```
+
+It reports: is a backend answering (mock or real)? does a token exist
+and does the backend accept it (presence and status only — the value is
+never printed)? which agent configs register manifold (Claude Code
+including per-directory scopes, Claude Desktop, Codex, Gemini CLI), and
+at what scope? what is running right now? Each FAIL line carries the
+exact command that fixes it.
+
+**The breadcrumb.** On every boot the backend writes
+`~/.config/manifold/manifold.json` (all platforms — that is where agents
+probe): what Manifold is, where the API answers, the health-check curl,
+and the one-line register + doctor commands. An agent that has never
+heard of Manifold finds it there in seconds. No secrets, ever;
+`MANIFOLD_NO_BREADCRUMB=1` opts out.
+
+The dashboard shows the same truth: until the first MCP call ever
+reaches the backend, the header carries a "no agent connected" chip
+linking to Settings → Connect an agent, which holds the copy-able
+registration commands and the live last-call status.
 
 ## The tools
 
