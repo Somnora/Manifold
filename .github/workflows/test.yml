@@ -54,3 +54,38 @@ jobs:
       - name: Typecheck and build
         working-directory: dashboard
         run: npm run build
+
+  # The only browser-level check in the repo. It exists because `tsc` and
+  # `next build` both pass while a dialog is invisible: the Launch Swarm
+  # modal was trapped inside a backdrop-blurred card (a CSS containing
+  # block), clipped to a sliver and scrolling away with the page. Nothing
+  # in the type system or the bundler can see that.
+  #
+  # playwright is installed ad hoc rather than added to package.json on
+  # purpose: `npm ci` is the step that proves the committed lockfile is
+  # installable, and a lockfile drifting out of sync is what kept this
+  # repo's CI red for three weeks. This job must not put that at risk.
+  modal:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - name: Build the static export
+        working-directory: dashboard
+        run: npm ci --no-fund --no-audit && npm run build
+      - name: Install a browser
+        working-directory: dashboard
+        run: |
+          npm i --no-save --no-fund --no-audit playwright@1.62
+          npx playwright install --with-deps chromium
+      - name: Serve it and check the dialog escapes its parent
+        working-directory: dashboard
+        run: |
+          npx --yes serve out -l 3111 >/dev/null 2>&1 &
+          # Wait for the static server rather than sleeping a guessed number.
+          for i in $(seq 1 30); do
+            curl -sf -o /dev/null http://127.0.0.1:3111/ && break
+            sleep 1
+          done
+          BASE=http://127.0.0.1:3111 node e2e/modal-portal.mjs

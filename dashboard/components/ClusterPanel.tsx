@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { api, ApiError, type Cluster, type ClusterNode, type InstanceTypeInfo, type Region, type Filesystem } from "@/lib/api";
+import { ModalPortal } from "@/components/ModalPortal";
 import { usePolling } from "@/lib/usePolling";
 import { motion, AnimatePresence } from "framer-motion";
 import { Terminal, Server, Cpu, Database, Network, Power, RefreshCw, Layers } from "lucide-react";
@@ -366,7 +367,13 @@ export function ClusterPanel() {
       {/* Launch Modal */}
       <AnimatePresence>
         {showLaunchModal && (
-          <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+          // Through a portal to <body>: this panel is backdrop-blurred and
+          // overflow-hidden, which made it the containing block for a
+          // `fixed` child and then clipped it to a sliver. See ModalPortal.
+          <ModalPortal
+            onClose={() => setShowLaunchModal(false)}
+            labelledBy="launch-swarm-title"
+          >
             <motion.div
               initial={{ opacity: 0 }}
               animate={{ opacity: 1 }}
@@ -378,10 +385,13 @@ export function ClusterPanel() {
               initial={{ opacity: 0, scale: 0.95, y: 10 }}
               animate={{ opacity: 1, scale: 1, y: 0 }}
               exit={{ opacity: 0, scale: 0.95, y: 10 }}
-              className="relative w-full max-w-lg rounded-2xl border border-zinc-200 bg-white p-6 shadow-xl overflow-hidden"
+              // max-h + overflow-y-auto: a tall dialog on a short window
+              // must scroll ITSELF rather than run off the screen, which is
+              // the other half of "I cannot reach the Launch button".
+              className="relative z-10 my-auto max-h-[calc(100vh-2rem)] w-full max-w-lg overflow-y-auto rounded-2xl border border-zinc-200 bg-white p-6 shadow-xl"
             >
               <div className="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-emerald-500 to-teal-400" />
-              <h3 className="text-lg font-semibold text-zinc-900 mb-1">Launch Swarm</h3>
+              <h3 id="launch-swarm-title" className="text-lg font-semibold text-zinc-900 mb-1">Launch Swarm</h3>
               <p className="text-xs text-zinc-500 mb-5">Provision a high-density multi-node GPU cluster.</p>
 
               {formErr && (
@@ -509,7 +519,7 @@ export function ClusterPanel() {
                 </div>
               </form>
             </motion.div>
-          </div>
+          </ModalPortal>
         )}
       </AnimatePresence>
     </div>

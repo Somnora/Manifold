@@ -4593,3 +4593,56 @@ numbers beside it remain labelled arithmetic.
 Termination clean (rescue hook ran, nothing unsaved), zero orphans, test
 files removed from both ends. Gate total per the spend page: $2.00.
 Running total for all real-hardware gates: $5.10.
+
+## 2026-08-14 — The Launch Swarm dialog was trapped inside its own card
+
+Reported from a screen recording: opening "Launch Swarm" showed a
+horizontal sliver of a dialog inside the Elastic GPU Clusters card, and
+scrolling made it disappear. Unusable.
+
+**Cause, one line of CSS.** The panel is
+`relative overflow-hidden ... backdrop-blur-md`. An element with a
+`backdrop-filter` (like `transform`, `filter`, `perspective` or a
+`will-change` naming them) becomes the CONTAINING BLOCK for its
+`position: fixed` descendants. So the dialog - correctly written as
+`fixed inset-0` - was positioned against the panel instead of the
+viewport, and then `overflow-hidden` clipped it to the panel's box.
+Measured in a real browser: `backdropFilter: blur(12px)`,
+`overflow: hidden`, and the dialog sliding 140px when the page scrolled.
+
+**Fix: a portal, not a style tweak.** Deleting the blur would have fixed
+this one card and left the trap armed for the next component to walk into
+- and this bug is invisible to every check the repo had, because `tsc` and
+`next build` both pass while a dialog is unreachable. `ModalPortal` renders
+through `createPortal` to `<body>`, so the dialog is no longer a descendant
+of anything in the page and no ancestor styling can position or clip it,
+whatever gets added to those cards later. It also owns the things every
+modal needs and none should re-implement: Escape to close, backdrop click,
+and a scroll lock on the page behind (scrolling under the old dialog is
+what made it "disappear"). The dialog itself gained
+`max-h-[calc(100vh-2rem)] overflow-y-auto` so a tall form scrolls ITSELF on
+a short window rather than putting its buttons off-screen.
+
+Hydration is detected with `useSyncExternalStore`, not
+`useEffect(() => setMounted(true))`: the dashboard is a static export, so
+the portal target does not exist at prerender time, and the effect version
+schedules a cascading render that the lint rule correctly rejects.
+
+**The check is real.** `dashboard/e2e/modal-portal.mjs` drives a headless
+Chromium: opens the dialog, asserts it is not a descendant of the panel,
+that its box fits the viewport, that it does not move when the page
+scrolls, that the page behind is locked, and that Escape closes it. It was
+run against the PRE-FIX component and FAILED 5 of them - a check that
+cannot fail proves nothing. Now a CI job (`modal`).
+
+Two things learned while writing it, both worth keeping: run it against the
+static export, because `next dev` refuses cross-origin asset requests from
+127.0.0.1 (bundles 403, React never hydrates, clicks silently do nothing,
+and it looks exactly like a broken fix); and wait for framer-motion's
+entrance to settle before measuring, or the animation's own tail reads as
+scroll movement - the first "failure" on the fixed build was my
+stopwatch, not the product.
+
+**Only ClusterPanel was affected.** Onboarding and TokenGate also use
+`fixed inset-0`, but their blur is on the fixed element itself (which does
+not trap it) and both mount near the root, so they were left alone.
