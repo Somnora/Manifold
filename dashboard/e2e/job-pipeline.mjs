@@ -24,6 +24,22 @@ await p.addInitScript((t) => localStorage.setItem("manifold-api-token:http://loc
 await p.goto("http://localhost:3000/", { waitUntil: "networkidle" });
 await p.waitForTimeout(4000);
 
+// What the backend says exists - the check measures the UI against the
+// DATA, not against a number hardcoded from the author's machine.
+const api = process.env.API || "http://localhost:8000";
+const expected = await p.evaluate(async (base) => {
+  const r = await fetch(`${base}/tasks`);
+  const tasks = (await r.json()).tasks ?? [];
+  return {
+    total: tasks.length,
+    chained: tasks.filter((t) => (t.depends_on ?? []).length > 0).length,
+  };
+}, api);
+console.log("  backend reports:", JSON.stringify(expected));
+ok(expected.total > 0,
+   "precondition: the backend has tasks to draw (seed some, else this " +
+   "check silently passes on an empty graph)");
+
 const canvas = p.locator(".react-flow").first();
 await canvas.waitFor({ timeout: 20000 });
 await canvas.scrollIntoViewIfNeeded();
@@ -52,13 +68,25 @@ const geom = await p.evaluate(() => {
 });
 console.log("  geometry:", JSON.stringify(geom));
 
-ok(geom.count > 20, `all jobs rendered (${geom.count} nodes)`);
+ok(geom.count === expected.total,
+   `every job rendered (${geom.count}/${expected.total})`);
 ok(geom.inside === geom.count,
    `every node is inside the canvas (${geom.inside}/${geom.count}) - nothing clipped`);
-ok(geom.distinctColumns > 1,
-   `independent jobs are gridded, not one column (${geom.distinctColumns} columns)`);
-ok(geom.markers > 0, "edges carry arrowheads (the label says 'an arrow means runs after')");
-ok(geom.edges > 0, `dependency edges drawn (${geom.edges})`);
+// The grid only kicks in once there are enough independent jobs to wrap.
+const isolated = expected.total - expected.chained;
+if (isolated >= 4) {
+  ok(geom.distinctColumns > 1,
+     `independent jobs are gridded, not one column (${geom.distinctColumns} columns)`);
+} else {
+  console.log(`SKIP  grid check: only ${isolated} independent jobs`);
+}
+if (expected.chained > 0) {
+  ok(geom.edges > 0, `dependency edges drawn (${geom.edges})`);
+  ok(geom.markers > 0,
+     "edges carry arrowheads (the label says 'an arrow means runs after')");
+} else {
+  console.log("SKIP  arrow checks: no chained jobs in this backend");
+}
 
 // The minimap must not be an opaque slab over the jobs.
 const mm = await p.locator(".react-flow__minimap").first().boundingBox().catch(() => null);
