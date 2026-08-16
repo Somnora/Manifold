@@ -183,6 +183,26 @@ DEFAULT_API_BRAINS = (
 
 
 @dataclass(frozen=True)
+class DiagnosticsSettings:
+    """What the backend writes down about its own health.
+
+    Exists because an intermittent freeze was reported three times and
+    investigated with nothing to go on: uvicorn logs to the terminal it was
+    launched in, so every freeze erased its own evidence. See
+    diagnostics.py for what each of these answers.
+    """
+    # Mirror logs into DATA_ROOT/logs/manifold.log (rotating, bounded).
+    log_to_file: bool = True
+    # Log any request at or over this many seconds, with its path. The
+    # dashboard gives up at 30s, so this must be well under that to catch
+    # the call it gave up on.
+    slow_request_seconds: float = 5.0
+    # Log when the event loop oversleeps by this much: the signature of a
+    # synchronous call blocking every request at once. 0 disables.
+    loop_lag_seconds: float = 1.0
+
+
+@dataclass(frozen=True)
 class HubSettings:
     # Local model servers to probe for brains (Ollama, LM Studio, ...).
     local_endpoints: tuple[LocalBrainEndpoint, ...] = DEFAULT_LOCAL_ENDPOINTS
@@ -293,6 +313,8 @@ class Settings:
     autopilot: AutopilotSettings = field(default_factory=AutopilotSettings)
     hub: HubSettings = field(default_factory=HubSettings)
     telemetry: TelemetrySettings = field(default_factory=TelemetrySettings)
+    diagnostics: DiagnosticsSettings = field(
+        default_factory=DiagnosticsSettings)
     server: ServerSettings = field(default_factory=ServerSettings)
     idle_spend: IdleSpendSettings = field(default_factory=IdleSpendSettings)
     auto_manage: AutoManageSettings = field(default_factory=AutoManageSettings)
@@ -400,6 +422,7 @@ def load_settings(
     autopilot = raw.get("autopilot", {})
     hub = raw.get("hub", {})
     telemetry = raw.get("telemetry", {})
+    diagnostics = raw.get("diagnostics", {})
     server = raw.get("server", {})
     idle_spend = raw.get("idle_spend", {})
     auto_manage = raw.get("auto_manage", {})
@@ -487,6 +510,12 @@ def load_settings(
         ),
         telemetry=TelemetrySettings(
             sample_seconds=float(telemetry.get("sample_seconds", 30)),
+        ),
+        diagnostics=DiagnosticsSettings(
+            log_to_file=bool(diagnostics.get("log_to_file", True)),
+            slow_request_seconds=float(
+                diagnostics.get("slow_request_seconds", 5.0)),
+            loop_lag_seconds=float(diagnostics.get("loop_lag_seconds", 1.0)),
         ),
         server=ServerSettings(
             allow_plaintext_lan=bool(server.get("allow_plaintext_lan",

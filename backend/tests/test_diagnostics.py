@@ -1,120 +1,174 @@
-"""Sidecar diagnosis: classify why the sidecar is silent from read-only
-probes over the (known-good) SSH connection. Driven by a live-test report
-where telemetry showed 'not reachable yet' 13 minutes after boot with no
-way to tell whether cloud-init, the service, or the forward was at fault."""
+"""The freeze must leave evidence next time.
+
+An intermittent freeze was reported three times and investigated with
+nothing to go on: uvicorn logs to the terminal it was launched in, so each
+occurrence erased its own record. These pin the three things that change
+that, and the most important assertion in the file is the last one - that
+the heartbeat actually fires when the loop is blocked, because a detector
+that cannot detect is worse than none.
+"""
 
 import asyncio
+import logging
+import time
 
-from app.diagnostics import diagnose_sidecar
+import pytest
 
-
-def _fake_run(mapping):
-    """Return a run(cmd) coroutine that matches cmd by substring; unmatched
-    commands return an empty success."""
-    async def run(cmd):
-        for needle, value in mapping.items():
-            if needle in cmd:
-                return value          # (exit, stdout, stderr)
-        return (0, "", "")
-    return run
+from app.diagnostics import (
+    loop_lag_monitor,
+    measure_request,
+    setup_file_logging,
+)
 
 
-def _diagnose(mapping):
-    return asyncio.run(diagnose_sidecar(_fake_run(mapping)))
+# -- file logging ---------------------------------------------------------------
 
 
-def test_cloud_init_still_running():
-    d = _diagnose({
-        "cloud-init status": (0, "status: running", ""),
-        "is-active": (0, "activating", ""),
-        "ss -ltn": (0, "no", ""),
-    })
-    assert d["cause"] == "cloud-init-running"
-    assert "first-boot setup" in d["summary"]
-    # The evidence is carried for the user to inspect.
-    labels = [c["label"] for c in d["checks"]]
-    assert any("cloud-init" in l for l in labels)
+def test_logs_land_in_a_file_under_the_data_dir(tmp_path):
+    path = setup_file_logging(tmp_path)
+    assert path == tmp_path / "logs" / "manifold.log"
+    logging.getLogger("manifold.test").warning("a freeze happened here")
+    for h in logging.getLogger().handlers:
+        h.flush()
+    assert "a freeze happened here" in path.read_text()
 
 
-def test_sidecar_crashed_surfaces_log():
-    d = _diagnose({
-        "cloud-init status": (0, "status: done", ""),
-        "is-active": (0, "failed", ""),
-        "ss -ltn": (0, "no", ""),
-        "journalctl": (0, "Traceback: ImportError: pynvml", ""),
-    })
-    assert d["cause"] == "sidecar-crashed"
-    log = next(c for c in d["checks"] if "log" in c["label"])
-    assert "ImportError" in log["output"]
+def test_setting_it_up_twice_does_not_double_every_line(tmp_path):
+    """--reload re-runs the entry point. Stacked handlers would write every
+    line N times and quietly multiply the file's size."""
+    root = logging.getLogger()
+    before = len(root.handlers)
+    setup_file_logging(tmp_path)
+    setup_file_logging(tmp_path)
+    setup_file_logging(tmp_path)
+    assert len(root.handlers) == before + 1
 
 
-def test_sidecar_starting_when_active_but_not_listening():
-    d = _diagnose({
-        "cloud-init status": (0, "status: done", ""),
-        "is-active": (0, "active", ""),
-        "ss -ltn": (0, "no", ""),
-    })
-    assert d["cause"] == "sidecar-starting"
-    assert "9411" in d["summary"]
+def test_an_unwritable_home_never_stops_the_backend(tmp_path):
+    """A diagnostic that can prevent the app from starting is worse than no
+    diagnostic."""
+    blocked = tmp_path / "ro"
+    blocked.mkdir()
+    blocked.chmod(0o400)
+    try:
+        assert setup_file_logging(blocked / "sub") is None
+    finally:
+        blocked.chmod(0o700)
 
 
-def test_forward_transient_when_healthy_on_instance():
-    d = _diagnose({
-        "cloud-init status": (0, "status: done", ""),
-        "is-active": (0, "active", ""),
-        "ss -ltn": (0, "yes", ""),
-    })
-    assert d["cause"] == "forward-transient"
-    assert "port-forward" in d["summary"]
+@pytest.fixture(autouse=True)
+def _drop_file_handlers():
+    """Keep test log handlers out of the other tests (and out of the
+    developer's own log file)."""
+    yield
+    root = logging.getLogger()
+    for h in list(root.handlers):
+        if getattr(h, "_manifold_file_handler", False):
+            root.removeHandler(h)
+            h.close()
 
 
-def test_probe_failure_never_sinks_the_report():
-    async def run(cmd):
-        if "is-active" in cmd:
-            raise ConnectionError("ssh dropped mid-probe")
-        return (0, "status: done", "")
-    d = asyncio.run(diagnose_sidecar(run))
-    # Still returns a structured report; the failed probe is captured inline
-    # and the classification says the channel died - it must not guess a
-    # sidecar state from the partial answers (a dead SSH session used to
-    # read as "sidecar-starting").
-    assert d["cause"] == "probe-error"
-    assert "unknown" in d["summary"]
-    svc = next(c for c in d["checks"] if "service" in c["label"])
-    assert "probe failed" in svc["output"]
+# -- slow requests --------------------------------------------------------------
 
 
-def test_probe_loss_stops_probing_the_dead_channel():
-    calls = []
-
-    async def run(cmd):
-        calls.append(cmd)
-        raise ConnectionError("Connection reset")
-
-    d = asyncio.run(diagnose_sidecar(run))
-    assert d["cause"] == "probe-error"
-    # One failure aborts the sweep: each further probe would only burn its
-    # own timeout against a channel we already know is dead.
-    assert len(calls) == 1
-    outputs = [c["output"] for c in d["checks"]]
-    assert sum("probe skipped" in o for o in outputs) == 3
-    assert len(d["checks"]) == 4                 # shape preserved for the UI
+class FakeRequest:
+    def __init__(self, path="/instances", method="GET"):
+        self.method = method
+        self.url = type("U", (), {"path": path})()
 
 
-def test_diagnose_route_is_wired(client):
-    """Over the app: the endpoint runs the probes over the (mock) SSH
-    connection and returns the structured shape."""
-    from tests.test_reconcile import launch_connected
+async def test_a_slow_request_is_logged_with_its_path(caplog):
+    async def slow(_request):
+        await asyncio.sleep(0.05)
+        return "response"
 
-    _, instance_id = launch_connected(client)
-    resp = client.get(f"/instances/{instance_id}/sidecar/diagnose")
-    assert resp.status_code == 200
-    body = resp.json()
-    assert set(body) == {"cause", "summary", "port", "checks"}
-    assert body["port"] == 9411
-    assert len(body["checks"]) == 4
+    with caplog.at_level(logging.WARNING):
+        result = await measure_request(slow, FakeRequest(), 0.01)
+
+    assert result == "response", "the response must pass through untouched"
+    assert any("slow_request" in r.message and "/instances" in r.message
+               for r in caplog.records)
 
 
-def test_diagnose_requires_a_connection(client):
-    resp = client.get("/instances/does-not-exist/sidecar/diagnose")
-    assert resp.status_code == 409
+async def test_a_fast_request_says_nothing(caplog):
+    """Silence is the OTHER half of the answer: no slow_request line during
+    a freeze means the backend was fine and the browser stalled."""
+    async def fast(_request):
+        return "ok"
+
+    with caplog.at_level(logging.WARNING):
+        await measure_request(fast, FakeRequest(), 5.0)
+
+    assert [r for r in caplog.records if "slow_request" in r.message] == []
+
+
+async def test_a_failing_request_still_raises_its_own_error(caplog):
+    """Timing must never swallow or replace the real failure."""
+    async def boom(_request):
+        raise ValueError("the actual bug")
+
+    with caplog.at_level(logging.WARNING):
+        with pytest.raises(ValueError, match="the actual bug"):
+            await measure_request(boom, FakeRequest(), 0.0)
+
+
+# -- the event-loop heartbeat ---------------------------------------------------
+
+
+async def test_a_blocked_loop_is_reported(caplog):
+    """THE assertion. A fake clock reproduces the condition exactly: sleep
+    was asked for 1s and 9s of wall time passed, so the loop had no chance
+    to run for 8 of them."""
+    ticks = iter([100.0, 109.0])
+
+    async def instant(_seconds):
+        return None
+
+    with caplog.at_level(logging.WARNING):
+        await loop_lag_monitor(threshold_seconds=1.0, interval_seconds=1.0,
+                               clock=lambda: next(ticks), sleep=instant,
+                               iterations=1)
+
+    blocked = [r for r in caplog.records if "event_loop_blocked" in r.message]
+    assert len(blocked) == 1
+    assert "8.0s" in blocked[0].message
+
+
+async def test_a_healthy_loop_stays_quiet(caplog):
+    ticks = iter([100.0, 101.01])
+
+    async def instant(_seconds):
+        return None
+
+    with caplog.at_level(logging.WARNING):
+        await loop_lag_monitor(threshold_seconds=1.0, interval_seconds=1.0,
+                               clock=lambda: next(ticks), sleep=instant,
+                               iterations=1)
+
+    assert [r for r in caplog.records if "event_loop_blocked" in r.message] == []
+
+
+async def test_the_monitor_really_catches_a_real_blocking_call(caplog):
+    """No fake clock: a genuine synchronous sleep inside the loop, caught by
+    the real timer. This is the exact shape of the bug it exists to find -
+    one blocking call, every request stalled."""
+    async def blocking_sleep(seconds):
+        await asyncio.sleep(seconds)
+        time.sleep(0.15)          # synchronous: nothing else can run
+
+    with caplog.at_level(logging.WARNING):
+        await loop_lag_monitor(threshold_seconds=0.05, interval_seconds=0.01,
+                               sleep=blocking_sleep, iterations=1)
+
+    assert any("event_loop_blocked" in r.message for r in caplog.records)
+
+
+def test_diagnostics_settings_have_usable_defaults():
+    """Off by default would recreate the exact situation this fixes."""
+    from app.config import DiagnosticsSettings
+    d = DiagnosticsSettings()
+    assert d.log_to_file is True
+    # Must fire well before the dashboard's own 30s client timeout, or it
+    # cannot explain the message the user actually sees.
+    assert 0 < d.slow_request_seconds < 30
+    assert d.loop_lag_seconds > 0

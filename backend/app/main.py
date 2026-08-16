@@ -776,7 +776,18 @@ def create_app(
             logger.info("marked %d orphaned autopilot run(s) failed", orphaned)
         dispatcher.start()
         term_sessions.start()
+        # A heartbeat that measures its own oversleep. If a synchronous call
+        # ever blocks the event loop, every request stalls at once and each
+        # handler still looks innocent on its own; this is the only line
+        # that names the real condition. One timer per second.
+        lag_task = None
+        if settings.diagnostics.loop_lag_seconds > 0:
+            from .diagnostics import loop_lag_monitor
+            lag_task = asyncio.create_task(loop_lag_monitor(
+                threshold_seconds=settings.diagnostics.loop_lag_seconds))
         yield
+        if lag_task is not None:
+            lag_task.cancel()
         await autopilot.stop()
         await dispatcher.stop()
         await term_sessions.stop()
@@ -857,6 +868,20 @@ def create_app(
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    # Times every request and logs the ones that crossed the threshold, so
+    # "No answer after 30s (/instances)" stops being unanswerable after the
+    # fact: either the log names the slow endpoint, or it says nothing and
+    # the backend was fine while the browser stalled. Registered before the
+    # network guard so the guard stays outermost.
+    if settings.diagnostics.slow_request_seconds > 0:
+        from .diagnostics import measure_request
+
+        @app.middleware("http")
+        async def _time_requests(request, call_next):
+            return await measure_request(
+                call_next, request,
+                settings.diagnostics.slow_request_seconds)
 
     # Phase 81: added LAST = OUTERMOST, and unconditionally. The network
     # policy is judged before any credential conversation: an unauthorized
@@ -3930,6 +3955,16 @@ def create_default_app() -> FastAPI:
         policy = load_policy(DATA_ROOT / "policy.yaml")
     except PolicyError as exc:
         raise SystemExit(f"manifold: refusing to start: {exc}") from exc
+
+    # Logs to a FILE, not just the terminal uvicorn was launched in. An
+    # intermittent freeze was reported three times and investigated with
+    # nothing to go on, because the only record died with the window. Like
+    # the breadcrumb below: only the real entry point does this, so tests
+    # that build apps in a loop never touch the user's log.
+    from .diagnostics import setup_file_logging
+    log_path = setup_file_logging(DATA_ROOT)
+    if log_path is not None:
+        logger.info("logging to %s", log_path)
 
     # Phase 88: leave the discovery breadcrumb (~/.config/manifold) so an
     # agent probing the filesystem finds the running product in seconds

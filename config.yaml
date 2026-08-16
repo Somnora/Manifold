@@ -234,6 +234,27 @@ watches:
   # If false, a watch marked auto_launch only notifies; it never launches.
   auto_launch_enabled: false
 
+diagnostics:
+  # What the backend writes down about its own health. This section exists
+  # because a freeze was reported three times and could not be investigated
+  # even once: uvicorn logs to the terminal it was launched in, so every
+  # occurrence erased its own evidence.
+  #
+  # Mirror logs into <data dir>/logs/manifold.log, rotating, 5 MB x 3.
+  log_to_file: true
+  # Log any request at or over this many seconds, with method and path. The
+  # dashboard gives up at 30s and says "No answer after 30s (/instances)",
+  # so this has to be well under that to catch the call it gave up on.
+  # Afterwards the log answers the only question that matters first: is
+  # there a slow_request line (the backend was slow) or none at all (the
+  # backend answered fine and the browser stalled)?
+  slow_request_seconds: 5.0
+  # Log when the event loop oversleeps by this much. `await sleep(1)`
+  # returning after 9 seconds means something synchronous held the loop for
+  # 8 - the one condition that makes EVERY endpoint slow at once while each
+  # handler still looks innocent. 0 disables the heartbeat.
+  loop_lag_seconds: 1.0
+
 telemetry:
   # How often the dispatcher records one GPU telemetry sample per connected
   # instance (peak VRAM, avg util). Backs the post-run utilization verdict

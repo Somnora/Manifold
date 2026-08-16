@@ -123,6 +123,28 @@ if not hits:
 '
 echo
 
+# The backend now keeps its own record (diagnostics.py), so a freeze that
+# happened BEFORE this script was run is still visible here.
+echo "--- backend log: freezes and slow calls it caught itself ---"
+found=""
+for d in "$HOME/Library/Application Support/Manifold/logs" \
+         "$REPO/logs" "$HOME/.local/share/manifold/logs"; do
+  [ -f "$d/manifold.log" ] || continue
+  found=1
+  echo "  ($d/manifold.log)"
+  grep -E "event_loop_blocked|slow_request" "$d/manifold.log" 2>/dev/null \
+    | tail -12 | sed 's/^/    /'
+  grep -qE "event_loop_blocked|slow_request" "$d/manifold.log" 2>/dev/null \
+    || echo "    (none recorded - the backend never saw itself stall)"
+done
+# An empty section would read as "nothing was wrong". It is not the same
+# fact, and confusing the two is how the last three freezes went
+# uninvestigated.
+[ -n "$found" ] || echo "  NO LOG FILE FOUND. The running backend predates" \
+  "diagnostics.py, or was started with log_to_file off - restart it to get" \
+  "a record of the next freeze."
+echo
+
 echo "--- disk pressure on the repo volume ---"
 df -h "$REPO" 2>/dev/null | tail -1 | awk '{print "  "$0}'
 echo
