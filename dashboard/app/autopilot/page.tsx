@@ -11,7 +11,7 @@ import {
 } from "@/lib/api";
 import { ApprovalsPanel } from "@/components/ApprovalsPanel";
 import { usePolling } from "@/lib/usePolling";
-import { StatusBadge } from "@/components/Badge";
+import { Badge, StatusBadge } from "@/components/Badge";
 import { formatDate } from "@/lib/format";
 
 const GATE_LABEL: Record<GateableAction, string> = {
@@ -390,7 +390,28 @@ function RunCard({ run, onChanged }: { run: AgentRun; onChanged: () => void }) {
     <div className="rounded-lg border border-zinc-200 bg-white p-4">
       <div className="flex items-center justify-between gap-3">
         <div className="flex min-w-0 items-center gap-2">
-          <StatusBadge status={run.status} />
+          {/* A run that only ever READ things did not accomplish anything,
+              whatever its closing summary claims. Showing it as plain
+              "succeeded" is how a fabricated answer came to wear the same
+              green as a run that launched a GPU and cleaned up after
+              itself. The status is still shown - it is true that the loop
+              ended cleanly - but it no longer stands alone. */}
+          {run.status === "succeeded" && run.effect === "no_effect" ? (
+            <>
+              <Badge label="no action taken" tone="zinc" />
+              <span className="shrink-0 text-xs text-zinc-400">
+                (ended cleanly)
+              </span>
+            </>
+          ) : (
+            <StatusBadge status={run.status} />
+          )}
+          {/* The expensive shape: it started a box and never stopped one.
+              An idle sweep may have reaped it since - this states what the
+              RUN did, which is the part nothing else recorded. */}
+          {run.launched && !run.terminated && run.status !== "running" && (
+            <Badge label="left an instance running" tone="amber" />
+          )}
           <span className="truncate text-sm font-medium">{run.goal}</span>
         </div>
         <div className="flex shrink-0 items-center gap-3 text-xs text-zinc-500">

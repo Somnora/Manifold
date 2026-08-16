@@ -559,6 +559,12 @@ export type AgentRun = {
   finished_at: string | null;
   // Which actions this run pauses on (frozen when the run started).
   approval_policy: GateableAction[];
+  // What the run actually DID, derived by the backend from its own steps
+  // (agent.run_effect). "no_effect" means every action it completed was a
+  // read: a summary from such a run is the model talking, not a result.
+  effect?: "acted" | "no_effect";
+  launched?: boolean;
+  terminated?: boolean;
 };
 
 export type GateableAction = "launch_gpu" | "run_job" | "terminate_instance";
