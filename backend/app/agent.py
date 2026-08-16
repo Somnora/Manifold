@@ -46,6 +46,68 @@ logger = logging.getLogger("manifold.autopilot")
 MAX_CONSECUTIVE_FAILURES = 3
 MAX_HISTORY_MESSAGES = 40      # system prompt + trailing window
 
+# Actions that CHANGE something: they spend money, queue work, write a
+# template, move files, or stop billing. Everything else the loop can call
+# (list_*, get_*, wait) only reads. The split is what lets a finished run
+# be judged by what it DID rather than by whether it managed to say "done".
+EFFECTFUL_ACTIONS = frozenset({
+    "launch_gpu", "run_job", "save_template", "sync_outputs",
+    "terminate_instance",
+})
+
+
+def _succeeded(step: dict) -> bool:
+    """An action that came back with an "error" key changed nothing - the
+    guards refused it, or the arguments were wrong. Only results without
+    one count as having happened."""
+    result = step.get("result")
+    if isinstance(result, str):
+        try:
+            result = json.loads(result)
+        except (TypeError, ValueError):
+            return False
+    return isinstance(result, dict) and "error" not in result
+
+
+def run_effect(steps: list[dict]) -> dict:
+    """What a run actually DID, derived from its own recorded steps.
+
+    Pure, and computed at READ time on purpose: it costs nothing, it needs
+    no migration, and it reclassifies runs that finished before this
+    existed - which is the point, because the runs that motivated it are
+    already in the database.
+
+    Why it exists: `done` was the only thing separating "succeeded" from
+    everything else, so a brain that opened with a fabricated summary and
+    called `done` scored the same green badge as a run that launched a
+    GPU, ran a job, and cleaned up. Two real runs on the owner's machine
+    ended `succeeded` having done nothing at all, while the one that did
+    the whole job was labelled `exhausted` for running out of turns. The
+    labels were exactly backwards, and the fix is to stop inferring
+    accomplishment from the last word the model said.
+
+    Returns:
+      effect     "acted" if any effectful action actually went through,
+                 else "no_effect"
+      launched   this run started an instance
+      terminated this run stopped one
+    """
+    launched = terminated = acted = False
+    for step in steps or []:
+        action = step.get("action")
+        if action not in EFFECTFUL_ACTIONS or not _succeeded(step):
+            continue
+        acted = True
+        if action == "launch_gpu":
+            launched = True
+        elif action == "terminate_instance":
+            terminated = True
+    return {
+        "effect": "acted" if acted else "no_effect",
+        "launched": launched,
+        "terminated": terminated,
+    }
+
 
 def find_serving_task(queue: TaskQueue, templates: dict[str, JobTemplate],
                       instance_id: str) -> dict | None:

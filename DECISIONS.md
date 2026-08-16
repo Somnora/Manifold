@@ -4924,3 +4924,54 @@ is unreachable, because `entries` is null rather than empty. That is
 correct - "no agent has ever connected" is a claim about data you have,
 and an unreachable backend gives you none. Silence there, a chip only on
 a confirmed empty log.
+
+## 2026-08-16 — Autopilot's labels were exactly backwards
+
+Reported as "Autopilot won't rent GPUs". It rents them fine: given a
+compute-shaped goal it ran the whole lifecycle unattended in mock mode -
+launch, recover from its own bad filesystem argument, poll to active, run
+gpu-smoke, read logs, terminate with rescue. The complaint was real, but
+it was three separate things wearing one symptom.
+
+**1. Two of the goals were not compute tasks.** "Scan for tech news
+highlights and synthesize a 1-sheet" has no action in the allowlist that
+could serve it - Manifold cannot fetch a web page, and no GPU changes
+that. The claude-brained run said so, at length, correctly. That refusal
+was the product working.
+
+**2. The local brain fabricated a result and scored green.** The only
+model in the owner's Ollama is `shot-tagger:latest`, a fine-tune for
+video shot tagging. As an Autopilot brain it called `list_instance_types`
+with invented arguments (`region: "North America"`, `instance_type:
+"Mid-Range"` - neither exists), then emitted `done` with a summary about
+AI/cybersecurity/IoT news it had no way to know. Status: succeeded. That
+hallucinated sentence then became the GOAL of the next run.
+
+**3. The run that did the work was labelled a failure.** A serve goal
+capped at 20 steps spent 11 of them on `wait` + poll cycles (a10 boot is
+~4.5 min, then a 7B download and vLLM init) and 3 more on recoverable
+errors. It ran out of turns at step 20 with vLLM just answering
+`/v1/models` - one or two steps short of the test prompt and the
+terminate. It was recorded `exhausted`, and it left an a10 billing.
+
+**The fix: judge a run by what it DID.** `agent.run_effect` is pure and
+computed at READ time - no migration, and it reclassifies the runs that
+motivated it. An action counts only if it is in EFFECTFUL_ACTIONS
+(launch_gpu, run_job, save_template, sync_outputs, terminate_instance)
+AND its result carried no "error" key, because a guard rejection changes
+nothing. Applied to the four real runs: all three `succeeded` rows are
+`no_effect`, and the `exhausted` one is the only `acted`. The dashboard
+now shows "no action taken" instead of a green badge for the first shape,
+and "left an instance running" for the second.
+
+**Deliberately not done: inferring whether the GOAL was achieved.** That
+needs a judge and would be wrong sometimes in both directions. "Did this
+run change anything" is decidable from data already recorded, and it is
+enough to stop a fabricated summary from looking like a result.
+
+**Also observed, not fixed here.** The idle sweep requires no running
+task of any kind, and a `vllm-serve` task never exits - so an abandoned
+served model is never idle, and with no max-lifetime ceiling set it bills
+until someone notices. The ceiling is the guard that fires through a
+server; nothing currently encourages setting one on a serve launch. Named
+here as the known hole rather than left to be rediscovered on a bill.

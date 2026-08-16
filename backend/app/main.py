@@ -3302,14 +3302,22 @@ def create_app(
 
     @app.get("/autopilot/runs")
     async def list_autopilot_runs():
-        return {"runs": db.list_agent_runs()}
+        # Each row carries what the run DID (see agent.run_effect), so the
+        # list can stop calling a run that accomplished nothing a success.
+        # Derived from the stored steps rather than a column: no migration,
+        # and runs recorded before this existed are judged too.
+        from .agent import run_effect
+        return {"runs": [{**r, **run_effect(db.get_agent_steps(r["id"]))}
+                         for r in db.list_agent_runs()]}
 
     @app.get("/autopilot/runs/{run_id}")
     async def get_autopilot_run(run_id: str):
+        from .agent import run_effect
         run = db.get_agent_run(run_id)
         if run is None:
             raise HTTPException(404, f"run {run_id} not found")
-        return {**run, "steps": db.get_agent_steps(run_id)}
+        steps = db.get_agent_steps(run_id)
+        return {**run, **run_effect(steps), "steps": steps}
 
     @app.post("/autopilot/runs/{run_id}/cancel")
     async def cancel_autopilot_run(run_id: str):
