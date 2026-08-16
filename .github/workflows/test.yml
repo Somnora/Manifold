@@ -162,6 +162,18 @@ jobs:
       - name: Check the dashboard says when no agent has ever connected
         run: |
           cd backend
+          # The previous step's `pkill` does not WAIT for the process to go,
+          # so :8000 can still be held when we arrive. Our uvicorn then dies
+          # on bind, while the health check below passes against the OLD
+          # backend on its way out - and node reaches a port with nothing
+          # behind it. That is exactly how this step failed its first time on
+          # main: 0.6 seconds from start to ECONNREFUSED, no wait, no error.
+          # Reap it and wait for the port to actually go quiet.
+          pkill -f "uvicorn app.main" || true
+          for i in $(seq 1 30); do
+            curl -sf -o /dev/null http://127.0.0.1:8000/health || break
+            sleep 1
+          done
           # A scratch data dir, not the checkout: the previous step's
           # backend wrote tasks and audit rows into the repo root, and this
           # check's whole precondition is an audit log with nothing in it.
@@ -171,13 +183,18 @@ jobs:
           MANIFOLD_MOCK=1 MANIFOLD_NO_BREADCRUMB=1 \
             uv run uvicorn app.main:create_default_app --factory --port 8000 \
             > /tmp/manifold-agent-check.log 2>&1 &
+          backend=$!
           up=""
           for i in $(seq 1 60); do
+            # OURS must be alive, not merely something answering on the port.
+            # Without this the health check can be satisfied by a backend we
+            # did not start and are about to lose.
+            kill -0 "$backend" 2>/dev/null || break
             curl -sf -o /dev/null http://127.0.0.1:8000/health && { up=1; break; }
             sleep 1
           done
           if [ -z "$up" ]; then
-            echo "backend never came up; its log:" >&2
+            echo "our backend never came up; its log:" >&2
             tail -30 /tmp/manifold-agent-check.log >&2
             exit 1
           fi
