@@ -215,3 +215,102 @@ jobs:
           API=http://127.0.0.1:8000 SITE=http://127.0.0.1:3000 \
             node e2e/agent-connection.mjs
           pkill -f "uvicorn app.main" || true
+
+      # The freeze, as an assertion. usePolling had no in-flight guard and
+      # lib/api.ts waits 30s before giving up, so a slow backend made every
+      # hook queue a fetch per interval while none finished - arrivals
+      # outran completions and the queue grew past the browser's ~6
+      # connections per origin, where a click's fetch starts waiting behind
+      # polls. Three reports of "it freezes after I step away, I have to
+      # restart it" and nothing in the type system can see any of it.
+      #
+      # This is the only check in the repo that measures BEHAVIOR OVER TIME
+      # rather than a rendered state, so it is also the only one that costs
+      # a minute of wall clock. It stays because the bug it catches is the
+      # one users actually hit.
+      - name: Check a stalled backend does not pile up polls
+        run: |
+          cd backend
+          pkill -f "uvicorn app.main" || true
+          for i in $(seq 1 30); do
+            curl -sf -o /dev/null http://127.0.0.1:8000/health || break
+            sleep 1
+          done
+          export MANIFOLD_DATA_DIR="$(mktemp -d)"
+          MANIFOLD_MOCK=1 MANIFOLD_NO_BREADCRUMB=1 \
+            uv run uvicorn app.main:create_default_app --factory --port 8000 \
+            > /tmp/manifold-pileup.log 2>&1 &
+          backend=$!
+          up=""
+          for i in $(seq 1 60); do
+            kill -0 "$backend" 2>/dev/null || break
+            curl -sf -o /dev/null http://127.0.0.1:8000/health && { up=1; break; }
+            sleep 1
+          done
+          if [ -z "$up" ]; then
+            echo "our backend never came up; its log:" >&2
+            tail -30 /tmp/manifold-pileup.log >&2
+            exit 1
+          fi
+          # The Jobs page renders its empty state without tasks, which mounts
+          # fewer hooks - and this check's preconditions assert that several
+          # are live, so it would fail on a missing fixture rather than a bug.
+          for i in 1 2 3 4 5 6; do
+            curl -sf -X POST http://127.0.0.1:8000/tasks \
+              -H 'content-type: application/json' \
+              -d '{"template":"gpu-smoke","parameters":{}}' -o /dev/null
+          done
+          cd ../dashboard
+          if ! curl -sf -o /dev/null http://127.0.0.1:3000/; then
+            python3 -m http.server 3000 --bind 127.0.0.1 --directory out \
+              >/dev/null 2>&1 &
+          fi
+          for i in $(seq 1 30); do
+            curl -sf -o /dev/null http://127.0.0.1:3000/ && break
+            sleep 1
+          done
+          API=http://127.0.0.1:8000 SITE=http://127.0.0.1:3000 \
+            node e2e/poll-pileup.mjs
+          pkill -f "uvicorn app.main" || true
+
+      # The other half of the same freeze. Phase 91 parked a dropped shell
+      # for 8 hours; nothing went back for it, so the grace bought nothing a
+      # user could see and a dead rectangle was still the whole experience.
+      # This drives a REAL pty through a real drop and a real `exit`, which
+      # is the only way to tell "reattached to the same shell" from "started
+      # a new one that looks the same".
+      - name: Check a dropped terminal reattaches to its shell
+        run: |
+          cd backend
+          pkill -f "uvicorn app.main" || true
+          for i in $(seq 1 30); do
+            curl -sf -o /dev/null http://127.0.0.1:8000/health || break
+            sleep 1
+          done
+          export MANIFOLD_DATA_DIR="$(mktemp -d)"
+          MANIFOLD_MOCK=1 MANIFOLD_NO_BREADCRUMB=1 \
+            uv run uvicorn app.main:create_default_app --factory --port 8000 \
+            > /tmp/manifold-terminal.log 2>&1 &
+          backend=$!
+          up=""
+          for i in $(seq 1 60); do
+            kill -0 "$backend" 2>/dev/null || break
+            curl -sf -o /dev/null http://127.0.0.1:8000/health && { up=1; break; }
+            sleep 1
+          done
+          if [ -z "$up" ]; then
+            echo "our backend never came up; its log:" >&2
+            tail -30 /tmp/manifold-terminal.log >&2
+            exit 1
+          fi
+          cd ../dashboard
+          if ! curl -sf -o /dev/null http://127.0.0.1:3000/; then
+            python3 -m http.server 3000 --bind 127.0.0.1 --directory out \
+              >/dev/null 2>&1 &
+          fi
+          for i in $(seq 1 30); do
+            curl -sf -o /dev/null http://127.0.0.1:3000/ && break
+            sleep 1
+          done
+          SITE=http://127.0.0.1:3000 node e2e/terminal-reconnect.mjs
+          pkill -f "uvicorn app.main" || true

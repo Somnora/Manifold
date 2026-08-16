@@ -5192,3 +5192,118 @@ now says so, and names the reason (a backend older than this change).
 
 Not claimed: a diagnosis. The freeze is still unexplained. What changed is
 that the next one leaves a record whether or not anyone is at the keyboard.
+
+## 2026-08-16 — Phase 93: the freeze had a mechanism, and it was ours
+
+Three reports of the same thing: step away from the app, come back, the UI
+is wedged. Tabs will not change, the terminal is a dead rectangle, a restart
+is the only way out, and the Claude session that was running in that
+terminal is gone. Phase 92 shipped the instruments to catch it in the act.
+This is the cause, found by reading instead of waiting.
+
+**It is two independent defects that produce one symptom.**
+
+### One: polling had no in-flight guard
+
+`usePolling` ran `setInterval(tick, intervalMs)` and `lib/api.ts` waits 30
+SECONDS before it gives up on a request. Those two numbers are the whole
+bug. While the backend is slow, every hook queues a fresh fetch every
+interval and none of them finish, so arrivals outrun completions and the
+queue grows without bound. It is an unstable queue in the textbook sense: it
+does not recover on its own, which is exactly why a restart was the only
+exit anyone found.
+
+A browser opens about six connections per origin over HTTP/1.1, and uvicorn
+speaks HTTP/1.1. Past six, the overflow waits in the browser's own network
+queue - and the fetch behind a click on a tab waits there too, behind the
+polls. "I cannot even change any of the tabs" is not a UI freeze at all. It
+is a network queue, and the pile-up is what makes the next request slow
+enough to deepen it.
+
+Measured on the Jobs page against a backend stalled by 8s, over 24s:
+
+|                              | before | after |
+|------------------------------|--------|-------|
+| requests issued              | 27     | 13    |
+| peak in flight               | 12     | 5     |
+| worst single endpoint        | 5      | 2     |
+| backlog when it recovered    | 10     | 5     |
+| issued while hidden (12s)    | 13     | 0     |
+| reloads within 1.2s of reveal| 0      | 7     |
+
+Ten outstanding against a limit of six is the freeze, as a number.
+
+Two rules fix it. **One poll at a time per hook**: a tick that lands while
+the previous is still out is dropped, or deferred if someone actually asked
+for it - `refresh()` after a mutation still runs, at most one extra poll is
+ever owed, and the queue cannot grow. **A hidden document does not poll**:
+background timers are throttled and coalesced, then fire together on wake,
+which is the moment the backend is slowest. Stepping away was building the
+pile-up that greeted you on return. Coming back now polls once, at once.
+
+Rejected: raising the interval (slower UI, same unbounded queue under a
+stall), and lowering the 30s timeout (it exists for calls that ride the SSH
+connection and are legitimately slow; cutting it would break file listings
+to make a symptom quieter).
+
+### Two: the terminal never went back for its shell
+
+Phase 91 parked a dropped shell on the backend for 8 hours so a frozen tab
+would stop costing an agent session. Nothing ever reattached. `ws.onclose`
+set status "closed" and that was the end of the panel's involvement, so the
+grace window was real and completely invisible: the user saw a dead
+rectangle, killed the tab, and lost the conversation the parked shell was
+still holding. The backend half shipped; the half a user could see did not.
+
+The panel reconnects now, with a capped backoff and an immediate retry when
+the window becomes visible again - which is the reported case exactly.
+
+**Reconnecting turns a close code into behavior, so the backend had to
+start sending one.** Three closes must NOT be returned from, and all three
+used to be indistinguishable from a dropped network:
+
+- `4410` the shell ended. Coming back would resurrect a shell the user just
+  ended with `exit`, handing them a fresh prompt as if nothing happened.
+- `4409` another view took this session. Coming back would steal it, kick
+  the other tab, and the two would trade the shell forever.
+- `4403` the origin was refused. Retrying cannot help.
+
+Everything else is a lost socket, and the shell is parked and waiting.
+
+Two details that only appear once a reconnect exists. `attach()` replays the
+entire scrollback, which is correct after a refresh (empty terminal) and
+paints a **second copy** of the session in place (full terminal), so a
+reattach resets the terminal first. And `lastCols/lastRows` mean "the size
+the PTY has been TOLD", which a new socket has not told it anything - left
+alone, the first refit is deduped away and the shell wraps at the width it
+had before the window changed.
+
+### Both are proven by measurement, not by typecheck
+
+`tsc` and `next build` pass on every version of this bug, and the only way
+to see either defect is to watch behavior over time in a real browser. So
+both get an e2e, and both were run against the code they replace:
+`poll-pileup.mjs` fails 6 of 9 checks on v0.2.3, `terminal-reconnect.mjs`
+fails 4 of 12.
+
+The first run of the pile-up check passed everything while measuring
+**nothing** - a static export served by a plain file server has no directory
+rewrite, so `/jobs` is a directory listing, and every assertion in that file
+is an upper bound satisfied by zero traffic. It asserts its own preconditions
+now. That is the second vacuous test caught in three phases (the Phase 90
+golden row was the first), and the pattern is the same both times: a check
+whose subject never ran.
+
+Two deliberate stubs, both stated in the files. The visibility half overrides
+`document.hidden`, because headless Chromium will not reliably background a
+tab. The terminal drop closes the socket from the page, because Playwright's
+offline switch does not reach loopback - measured: the socket stayed open and
+every assertion passed vacuously. Neither stub touches what is being tested;
+Chrome's own event dispatch and network detection are not this repo's code.
+The `exit` path stubs nothing at all.
+
+**Not claimed: that this was the freeze.** It is a mechanism that predicts
+every reported symptom - wedged after stepping away, tabs unresponsive,
+terminal dead, restart the only exit - from code that is now fixed. Phase
+92's logging stays exactly as valuable: if it happens again, the log says
+whether the backend was ever slow at all, and if it was not, this was not it.

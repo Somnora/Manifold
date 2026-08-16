@@ -88,7 +88,11 @@ from .storage import MockStorage, S3AdapterStorage, StorageClient
 from .task_queue import SQLiteTaskQueue
 from .templates import load_templates
 from .ide_attach import write_ssh_config_block, get_ide_urls
-from .terminal_sessions import TerminalSession, TerminalSessionManager
+from .terminal_sessions import (
+    WS_SHELL_GONE,
+    TerminalSession,
+    TerminalSessionManager,
+)
 from .providers import ProviderRegistry, LambdaProvider, GCPProvider, MockGCPProvider, RealGCPProvider
 from .providers.base import ProviderError, ProviderUnavailable
 from .subagent_engine import engine, NoHealthyEndpoint, SubagentDispatchError
@@ -1516,7 +1520,9 @@ def create_app(
                 elif kind == "close":
                     killed = True
                     term_sessions.kill(session.id)
-                    await ws.close()
+                    # GONE, not a bare close: the panel reconnects on an
+                    # unexplained one, and this shell is not coming back.
+                    await ws.close(code=WS_SHELL_GONE)
                     return
         except (WebSocketDisconnect, KeyError, ValueError, OSError):
             pass
@@ -1619,7 +1625,8 @@ def create_app(
             await ws.accept()
             await ws.send_text("\r\n[manifold] the local terminal is not "
                                "supported on Windows yet\r\n")
-            await ws.close()
+            # GONE: retrying cannot help, so the panel must stop trying.
+            await ws.close(code=WS_SHELL_GONE)
             return
 
         await ws.accept()
