@@ -4887,3 +4887,40 @@ docs even said "in this project" — technically true, pragmatically a trap.
 Writeup item not shipped here: the stale hand-copied IP lived in the
 owner's own rh3d skill files, outside this repo; Manifold already offers
 the fix twice (live `list_instances`, and tailscale MagicDNS names).
+
+## 2026-08-16 — The one state a real backend can never show you
+
+Phase 88's "no agent connected" chip and its Settings card shipped in the
+v0.2.2 installers verified by `npm run build` and nothing else. That is
+exactly the failure mode this project distrusts: a typecheck proves the
+component compiles, not that the state it exists for ever renders.
+
+The state is unobservable in normal use. This machine's audit log has 251
+`mcp` rows going back a month, and the chip's empty branch fires only at
+ZERO rows all-time, so no amount of looking at the running product would
+ever have shown it. It needed a backend with a virgin audit log.
+
+`dashboard/e2e/agent-connection.mjs`: mock backend on a scratch
+MANIFOLD_DATA_DIR, dashboard exported with `NEXT_PUBLIC_API_URL` pointing
+at it, driven in real Chromium. 14 assertions, all passing - the chip
+renders, links to Settings, the card states the fact in words, carries
+`--scope user` and `--doctor`, the commands have Copy buttons, and then
+the state FLIPS when a single mcp audit row is posted (the chip vanishes
+and the live "MCP now" chip replaces it). The flip is the assertion that
+matters: it proves the UI reports live audit truth, not a hardcoded
+empty state.
+
+**Two harness traps, both recorded in the file's header because both
+looked like product bugs.** The export must be served on port 3000
+exactly - the backend's CORS allowlist is localhost:3000 / 127.0.0.1:3000
+and nothing else, so on any other port every call dies at the preflight,
+`entries` stays null, and the chip renders nothing, which is
+indistinguishable from the bug being hunted. And `npx playwright node
+file.mjs` does not work: playwright's CLI has no `node` subcommand, so
+the module must be resolvable by node itself.
+
+**Not a bug, worth stating:** the chip renders nothing when the backend
+is unreachable, because `entries` is null rather than empty. That is
+correct - "no agent has ever connected" is a claim about data you have,
+and an unreachable backend gives you none. Silence there, a chip only on
+a confirmed empty log.
