@@ -54,6 +54,12 @@ type Session = {
   // Local shells only: shell env pre-wired to this served model (the
   // "Open in terminal" button on a running serve job).
   model?: string;
+  // This tab came back from sessionStorage, so a shell for it SHOULD
+  // already exist on the backend. Only the browser knows that: to the
+  // backend a restored id and a brand-new one look identical. It rides
+  // the socket as ?resume=1 and decides whether "the previous shell for
+  // this session had ended" is a true statement or a false alarm.
+  resumed?: boolean;
 };
 
 type Position = "bottom" | "right";
@@ -132,7 +138,11 @@ export function TerminalDockProvider({
       if (raw) {
         const saved = JSON.parse(raw);
         if (Array.isArray(saved.sessions) && saved.sessions.length > 0) {
-          setSessions(saved.sessions);
+          // Every restored tab is resuming, whatever the stored object says:
+          // a tab opened during the LAST page load was saved without the
+          // flag, and it is just as much a reattach as any other.
+          setSessions(saved.sessions.map(
+            (s: Session) => ({ ...s, resumed: true })));
           setActive(saved.active ?? saved.sessions[0].id);
           setOpen(!!saved.open);
         }
@@ -531,6 +541,7 @@ function SessionBody({ session: s }: { session: Session }) {
         // The dock tab id doubles as the backend session id, so a refresh
         // reattaches this panel to the same still-running shell.
         sessionId={s.id}
+        resumed={s.resumed}
         label={
           s.model
             ? `Shell wired to ${s.model} (via the local proxy)`

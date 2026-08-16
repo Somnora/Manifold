@@ -5307,3 +5307,48 @@ every reported symptom - wedged after stepping away, tabs unresponsive,
 terminal dead, restart the only exit - from code that is now fixed. Phase
 92's logging stays exactly as valuable: if it happens again, the log says
 whether the backend was ever slow at all, and if it was not, this was not it.
+
+## 2026-08-16 — The notice that reported lost work that was never lost
+
+Found by watching a browser during Phase 93's terminal work: every
+brand-new dock tab opened to
+
+    [manifold] The previous shell for this session had ended, so this is a
+    new one.
+    [manifold] Anything that was running in it (an agent, a job) stopped
+    when it ended; see Activity for when and why.
+
+when there had never been a previous shell. Phase 91 fed that notice on
+every new session id, and a new tab always has one. So the one screen whose
+entire job is being honest about lost work opened by reporting some.
+
+Worse than a stray line: it is recorded through `feed()`, so it lands in
+the scrollback and is replayed on every later reattach. The false report
+became permanent for the life of the shell.
+
+**Only the browser knows.** The backend cannot tell a fresh session id from
+one whose shell it reaped - and after a restart it remembers neither, which
+is precisely the case where the notice IS correct. So the client says which
+it is, with `?resume=1`, and it means "I expected a shell to already be
+here". Two things set it: a dock tab restored from sessionStorage, and any
+reconnect after the first socket (new in Phase 93). The notice now fires
+only when the client expected a shell AND the backend had to build a new
+one, which is exactly when the statement is true.
+
+Rejected: having the backend remember ids it has seen. It fails at the one
+moment that matters - a backend restart kills every shell and forgets every
+id, so the notice would go silent exactly when the user most needs it.
+
+Rejected: dropping the notice. The report it answers ("I lose my entire
+chat history") was real; the fix is to say it when true, not to stop saying
+it.
+
+`resumed` is read through a ref rather than passed into the effect's
+dependency array. Re-running that effect tears the panel down, and its
+cleanup sends `{"type": "close"}`, which really ends the shell - a prop
+that only decides the wording of a banner must not be able to kill a
+running agent session.
+
+Proven both ways: four backend tests (three fail on the old behavior, the
+fourth is the guard that resuming a genuinely dead session still says so),
+and a browser assertion that fails against a backend reverted to Phase 91.

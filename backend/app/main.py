@@ -116,6 +116,12 @@ _REAP_TASKS: set = set()
 def _replaced_shell_notice(local_cwd=None) -> str:
     """What to print when a session id was asked for and its shell is gone.
 
+    Only printed when the CLIENT said it expected one (?resume=1). Printed
+    on every new session id, this told a brand-new tab that "the previous
+    shell for this session had ended" when there had never been a previous
+    shell - a false report of lost work, on the one screen whose whole job
+    is being honest about lost work.
+
     Reattaching used to hand back a fresh prompt with no explanation, which
     reads as "my work vanished" - the shell had been reaped or had exited,
     and nothing said so. Manifold restores the TERMINAL; it cannot restore a
@@ -1548,6 +1554,13 @@ def create_app(
         """
         await ws.accept()
         sid = ws.query_params.get("session", "")
+        # Did the client believe a shell was already here? A restored dock
+        # tab and any reconnect say yes; a freshly opened tab says nothing.
+        # Only the browser knows this - the backend cannot tell a new id
+        # from one whose shell it reaped (and after a restart it remembers
+        # neither), which is exactly how the notice came to fire on tabs
+        # that never had a previous shell.
+        resuming = ws.query_params.get("resume", "") == "1"
         key = f"inst:{instance_id}:{sid}" if sid else ""
         touch = lambda: dispatcher.touch_activity(instance_id)  # noqa: E731
 
@@ -1594,10 +1607,15 @@ def create_app(
 
         session.pump_task = asyncio.create_task(pump_output())
         term_sessions.register(session)
-        if sid:
-            # A session id was asked for and we are building a NEW shell:
-            # whatever was there is gone. Recorded into scrollback so it
+        if sid and resuming:
+            # The client expected a shell here and we are building a NEW one,
+            # so whatever was there is gone. Recorded into scrollback so it
             # survives the attach and any later reattach.
+            #
+            # `resuming` is the whole difference between a true report and a
+            # false one: a first connect on a fresh tab id lands here too,
+            # and telling it that its previous shell ended is a lie about the
+            # one thing this message exists to tell the truth about.
             await session.feed(_replaced_shell_notice())
         await _drive_terminal(ws, session, persistent=bool(sid),
                               on_input=touch)
@@ -1631,6 +1649,7 @@ def create_app(
 
         await ws.accept()
         sid = ws.query_params.get("session", "")
+        resuming = ws.query_params.get("resume", "") == "1"   # see above
         key = f"local:{sid}" if sid else ""
         existing = term_sessions.get(key) if key else None
         if existing is not None:
@@ -1787,7 +1806,7 @@ def create_app(
 
         session.pump_task = asyncio.create_task(pump_output())
         term_sessions.register(session)
-        if sid:
+        if sid and resuming:
             # Asked for a session we no longer have: say so, and point at
             # the conversations that DID survive. The shell inherits this
             # process's cwd (no chdir above), so that is where any Claude

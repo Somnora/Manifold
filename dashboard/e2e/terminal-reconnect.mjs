@@ -88,6 +88,16 @@ await p.getByRole("button", { name: /open local terminal/i }).click();
 ok(await waitForStatus("open", 20000), "the local shell connects");
 ok(await socketCount() === 1, "exactly one socket so far");
 
+// Phase 91 fed the replacement notice on every new session id, so a tab that
+// had never had a shell opened to "The previous shell for this session had
+// ended" - a false report of lost work on the screen whose job is honest
+// reporting of lost work. Sessions live in the backend's memory, so this
+// wants a freshly started one; CI always has that.
+ok(
+  !(await screen()).includes("previous shell"),
+  "a brand-new tab is not told it lost a shell it never had",
+);
+
 // A marker only this run could have produced, so its survival below cannot be
 // a coincidence, a cached frame, or another run's shell.
 const marker = `mfld-${process.pid}-${process.hrtime.bigint() % 100000n}`;

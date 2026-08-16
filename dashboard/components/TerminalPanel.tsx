@@ -23,6 +23,7 @@ export function TerminalPanel({
   fill,
   sessionId,
   model,
+  resumed,
 }: {
   instanceId?: string;
   wsPath?: string;
@@ -31,6 +32,11 @@ export function TerminalPanel({
   // by the terminal drawer, whose own top-edge handle does the resizing.
   fill?: boolean;
   sessionId?: string;
+  // This panel expects a shell to already exist for its session id (a dock
+  // tab restored from sessionStorage). The backend cannot tell that from a
+  // brand-new id, and it decides whether "your previous shell ended" is
+  // true or a false alarm - so it is told. Any reconnect counts too.
+  resumed?: boolean;
   // Local shells only: pre-wire the shell's environment to this served
   // model via the OpenAI proxy (OPENAI_BASE_URL etc., set backend-side).
   model?: string;
@@ -47,6 +53,12 @@ export function TerminalPanel({
   // header because a silent fallback is indistinguishable from a bug — if
   // the terminal is sluggish, this says whether the GPU path is even live.
   const [renderer, setRenderer] = useState<"webgl" | "dom">("dom");
+  // Read through a ref so it is NOT an effect dependency. Re-running the
+  // effect tears the panel down, and this panel's cleanup sends {"type":
+  // "close"} - which really ends the shell. A prop that only decides the
+  // wording of a banner must never be able to do that.
+  const resumedRef = useRef(resumed);
+  resumedRef.current = resumed;
 
   useEffect(() => {
     const el = containerRef.current;
@@ -281,6 +293,12 @@ export function TerminalPanel({
       const socketUrl = () => {
         const params = new URLSearchParams();
         if (sessionId) params.set("session", sessionId);
+        // A restored tab, or any socket after the first: both mean a shell
+        // was supposed to be here. If the backend has to build a new one it
+        // will say so, which is only honest when we actually expected one.
+        if (sessionId && (resumedRef.current || reattaching)) {
+          params.set("resume", "1");
+        }
         if (model) params.set("model", model);
         // Browser WebSockets cannot set headers, so the API token rides as
         // ?token= (the backend accepts either spelling on WS routes).
