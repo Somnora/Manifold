@@ -577,7 +577,9 @@ export type NotificationKind =
   | "data_transferred"
   | "capacity_available"
   | "instance_idle"
-  | "instance_ceiling";
+  | "instance_ceiling"
+  | "budget_threshold"
+  | "terminal_reaped";
 
 export type Preferences = {
   approvals: Record<GateableAction, boolean>;

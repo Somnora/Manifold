@@ -18,6 +18,10 @@ const TONE: Record<NotificationKind, string> = {
   capacity_available: "text-emerald-400",
   instance_idle: "text-amber-400",
   instance_ceiling: "text-orange-400",
+  budget_threshold: "text-amber-400",
+  // A shell was ended with whatever was inside it. Amber, not red: it is
+  // the grace period doing its job, but it is never good news.
+  terminal_reaped: "text-amber-400",
 };
 
 const LABEL: Record<NotificationKind, string> = {
@@ -29,6 +33,8 @@ const LABEL: Record<NotificationKind, string> = {
   capacity_available: "capacity",
   instance_idle: "idle spend",
   instance_ceiling: "max lifetime",
+  budget_threshold: "budget",
+  terminal_reaped: "terminal",
 };
 
 export function NotificationBell() {

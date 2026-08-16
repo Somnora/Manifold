@@ -42,13 +42,27 @@ def test_default_policy_gates_launches_only():
 
 
 def test_every_notification_kind_has_a_toggle():
-    """A kind listed in NOTIFICATION_KINDS but missing from NotificationPrefs
-    fails wants() and is dropped silently, with no error anywhere - the
-    feature ships dead and nothing says so. This is the test that catches
-    the next kind somebody adds to only one of the two lists."""
+    """The two lists must match BOTH ways.
+
+    A kind in NOTIFICATION_KINDS but missing from NotificationPrefs fails
+    wants() and is dropped silently: the feature ships dead. A field on
+    NotificationPrefs but missing from NOTIFICATION_KINDS fires fine but is
+    absent from /preferences/meta, so no UI can offer its switch: the user
+    gets a notification they cannot turn off.
+
+    This test claimed to catch "the next kind somebody adds to only one of
+    the two lists" while checking one direction only - and the next kind
+    (terminal_reaped, Phase 91) went in the other one and sailed past. Both
+    directions now.
+    """
     prefs = NotificationPrefs()
-    missing = [k for k in NOTIFICATION_KINDS if not hasattr(prefs, k)]
-    assert missing == []
+    missing_toggle = [k for k in NOTIFICATION_KINDS if not hasattr(prefs, k)]
+    assert missing_toggle == [], "listed as a kind, but has no toggle"
+    # `desktop` is the OS-ping switch, not a kind: it gates how a
+    # notification is delivered, not whether this event notifies at all.
+    unlisted = [f for f in vars(prefs)
+                if f != "desktop" and f not in NOTIFICATION_KINDS]
+    assert unlisted == [], "has a toggle, but is not offered as a kind"
     assert all(prefs.wants(kind) for kind in NOTIFICATION_KINDS)
     assert prefs.wants("no_such_kind") is False
 

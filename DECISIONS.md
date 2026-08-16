@@ -5107,3 +5107,38 @@ a backslash in its expression (a syntax error before Python 3.12) printed
 "(could not read)" over real data twice; `pgrep -f "uvicorn app.main"`
 matched the `uv run` WRAPPER and reported its 15 fds as the backend's; and
 a loose WebKit pattern reported Brave's renderers as Manifold's.
+
+## 2026-08-16 — The notification kind that fired but could not be switched off
+
+Phase 91 added `terminal_reaped` to `NotificationPrefs` and stopped there.
+The kind fired, recorded, and pinged - and no user could turn it off,
+because `NOTIFICATION_KINDS` is what `/preferences` advertises and the tuple
+never learned about it. A notification you cannot silence is a worse
+default than one that does not exist.
+
+The fence that should have caught it had the right docstring and half the
+assertion. `test_every_notification_kind_has_a_toggle` said it "catches the
+next kind somebody adds to only one of the two lists" while checking one
+direction only: every KIND has a toggle, never every TOGGLE is a kind. The
+next kind went in the other list and sailed past. It checks both ways now
+(`desktop` excluded by name - it gates delivery, not whether an event
+notifies at all).
+
+**Then TypeScript found the third place, and a bug that predates this.**
+Completing the frontend `NotificationKind` union broke the build on
+`NotificationBell`'s two `Record<NotificationKind, string>` maps - so
+`budget_threshold`, shipped earlier, had been rendering its tone and label
+as `undefined` in the bell the whole time. The incomplete union was hiding
+it: an exhaustive Record cannot check exhaustiveness against a union that
+is itself missing members. Both kinds now have a tone and a label, and both
+have a Settings toggle with a hint.
+
+Four places have to agree for one notification kind: the prefs dataclass,
+NOTIFICATION_KINDS, the TS union (which drags in the bell's maps), and the
+Settings list. The bidirectional test covers the first two; the type system
+covers the third; the fourth is still prose in a component, which is a real
+gap and named here rather than pretended away.
+
+Verified against a live backend rather than by reading: the API advertises
+10 kinds, `terminal_reaped` defaults on, PUT switches it off, and its
+neighbours are unaffected.

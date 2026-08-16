@@ -39,6 +39,7 @@ NOTIFICATION_KINDS = (
     "instance_idle",        # a running instance is billing while barely used
     "instance_ceiling",     # an instance is near, or past, its max lifetime
     "budget_threshold",     # month-to-date spend crossed a share of the budget
+    "terminal_reaped",      # a detached shell was killed after its grace period
 )
 
 
