@@ -125,7 +125,11 @@ await p.goto(`${SITE}${PAGE}`, { waitUntil: "domcontentloaded" });
 await sleep(3000);                     // let the page mount its hooks
 
 API = process.env.API || [...foreign][0] || null;
-console.log(`  the page calls: ${API ?? "(nothing off-site)"}`);
+// Every origin, not just the chosen one: when this picks wrong, the next
+// line is the whole diagnosis instead of another round trip through CI.
+console.log(`  off-site origins seen: ${[...foreign].join(", ") || "(none)"}`);
+console.log(`  measuring: ${API ?? "(nothing off-site)"}`
+  + (process.env.API ? "  [API= override in effect]" : ""));
 if (!API) {
   ok(false, "the page never called a backend - nothing to measure");
   await b.close();

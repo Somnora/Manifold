@@ -269,8 +269,12 @@ jobs:
             curl -sf -o /dev/null http://127.0.0.1:3000/ && break
             sleep 1
           done
-          API=http://127.0.0.1:8000 SITE=http://127.0.0.1:3000 \
-            node e2e/poll-pileup.mjs
+          # No API=: the export is built with no NEXT_PUBLIC_API_URL, so it
+          # calls the `http://localhost:8000` default baked in by
+          # lib/backend.ts - NOT the 127.0.0.1 spelling this job serves on.
+          # Passing the wrong one is how this check first measured zero
+          # traffic, twice. It finds the backend in the page's own requests.
+          SITE=http://127.0.0.1:3000 node e2e/poll-pileup.mjs
           pkill -f "uvicorn app.main" || true
 
       # The other half of the same freeze. Phase 91 parked a dropped shell
