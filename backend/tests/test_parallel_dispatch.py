@@ -145,7 +145,21 @@ def test_running_task_pins_only_its_own_instance(tmp_path):
             "parameters": {"model_id": "m/pin"},
             "target_instance_id": a,
         }).json()["task"]
-        wait_task(client, serve["id"], ("running",))
+        # Keep A in use from the moment it exists, not merely once its task
+        # is running. With a 0.2s idle window, a loaded runner can reap A
+        # during the QUEUED gap before dispatch - the task then never runs
+        # and the test fails as "stuck at queued", pointing nowhere near the
+        # behaviour under test. Seen on CI, never locally (8/8 green there),
+        # which is exactly the kind of timing gap a busy shared runner finds
+        # and a fast laptop hides.
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline:
+            client.post(f"/instances/{a}/run", json={"command": "true"})
+            if client.get(f"/tasks/{serve['id']}").json()["status"] == "running":
+                break
+            time.sleep(0.02)
+        assert client.get(f"/tasks/{serve['id']}").json()["status"] == "running", \
+            "the server task never dispatched"
 
         # Idle box B gets reaped; box A, in use, survives. The timeout here
         # is 0.2s, so A must be touched faster than that - a real 30-minute
