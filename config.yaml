@@ -212,8 +212,21 @@ hub:
   local_terminal: true
   # A refresh (or frozen tab) no longer kills dock shells: the shell stays
   # alive waiting for the page to reattach. This is how long a DETACHED
-  # shell waits before being reaped (a closed tab never comes back).
-  terminal_grace_seconds: 900
+  # shell waits before being reaped.
+  #
+  # It was 900 (15 minutes), on the reasoning that "a closed tab never comes
+  # back". A frozen app is indistinguishable from a closed tab, and 15
+  # minutes is shorter than a coffee break - so stepping away from a wedged
+  # window killed whatever was running in the shell, agent sessions
+  # included. 8 hours instead: a detached shell holds a pty and, for an
+  # instance terminal, an SSH channel, and NOTHING else. It cannot keep a
+  # GPU billing, because the idle sweep counts terminal INPUT as activity
+  # and a detached shell produces none. The bound exists only so a machine
+  # left running for weeks does not accumulate dead shells forever.
+  #
+  # Reaping is now recorded in the audit log and raises a notification, so
+  # the one destructive thing this timer does is never silent again.
+  terminal_grace_seconds: 28800
 
 watches:
   # Capacity watches: poll the instance-types catalog on this interval.

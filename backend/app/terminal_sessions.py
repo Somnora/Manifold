@@ -235,12 +235,27 @@ class TerminalSession:
 
 class TerminalSessionManager:
     """Registry + reaper. `grace_seconds` bounds how long a DETACHED session
-    waits for a reattach (refresh takes seconds; a closed tab never comes
-    back). An attached session lives until it is closed or its shell exits."""
+    waits for a reattach. An attached session lives until it is closed or
+    its shell exits.
 
-    def __init__(self, grace_seconds: float = 900.0):
+    The reaper KILLS A SHELL, and a shell can have hours of an agent's work
+    inside it. It used to do that on a 15-minute timer with nothing but a
+    log line - no audit row, no notification - in a product that refuses to
+    terminate an instance without first rescuing its files. The asymmetry
+    was reported by the owner the honest way: "I lose my entire chat history
+    with claude". The grace period is now long enough to survive stepping
+    away (see config hub.terminal_grace_seconds), and `on_reap` exists so
+    the one destructive thing this class does leaves a trace like every
+    other destructive thing in Manifold.
+    """
+
+    def __init__(self, grace_seconds: float = 28800.0, on_reap=None):
         self.sessions: dict[str, TerminalSession] = {}
         self.grace_seconds = grace_seconds
+        # on_reap(session, detached_seconds) -> None. Injected by main.py,
+        # which owns the db and the notifier; this module stays free of
+        # backend imports, like the rest of its dependencies.
+        self._on_reap = on_reap
         self._reap_task: asyncio.Task | None = None
 
     def get(self, session_id: str) -> TerminalSession | None:
@@ -279,8 +294,20 @@ class TerminalSessionManager:
                     self.sessions.pop(session_id, None)
                 elif (session.detached_at is not None
                       and now - session.detached_at > self.grace_seconds):
+                    detached = now - session.detached_at
                     logger.info(
                         "reaping terminal session %s (detached %.0fs)",
-                        session_id, now - session.detached_at,
+                        session_id, detached,
                     )
+                    # Report BEFORE killing: the callback reads the tail of
+                    # what was on screen, and after kill() there is nothing
+                    # left to say what died. A failing callback must never
+                    # leave the shell running forever, so it cannot skip the
+                    # kill below.
+                    if self._on_reap is not None:
+                        try:
+                            self._on_reap(session, detached)
+                        except Exception:
+                            logger.exception(
+                                "on_reap callback failed for %s", session_id)
                     self.kill(session_id)
