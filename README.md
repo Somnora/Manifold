@@ -90,18 +90,39 @@ new filebases in any region from the Storage page.
 
 ## Built for AI agents
 
-Any MCP client (Claude Code, Claude Desktop, Codex, Gemini CLI) gets 20
+Any MCP client (Claude Code, Claude Desktop, Codex, Gemini CLI) gets 37
 tools that flow through the same guarded backend, so an agent hits the same
 budget walls you do. With the desktop app installed, registration is one
 line, no dev checkout:
 
 ```bash
-claude mcp add manifold -- "/Applications/Manifold.app/Contents/MacOS/manifold-backend" --mcp
+claude mcp add manifold --scope user -- "/Applications/Manifold.app/Contents/MacOS/manifold-backend" --mcp
 ```
+
+`--scope user` is the part people miss: without it Claude Code registers
+Manifold for sessions started in ONE directory, and from every other repo
+that is indistinguishable from "not installed". An agent told "Manifold is
+open for you to use" then cannot find it, and the GPU bills while everyone
+looks in the wrong place.
 
 The agent's first call, `get_skill`, returns a playbook of recipes (launch,
 serve, batch, fine-tune, teardown) and the rules that keep GPU work safe.
 Full setup for every client: `docs/mcp-setup.md`.
+
+To check the wiring instead of guessing, ask the app:
+
+```bash
+/Applications/Manifold.app/Contents/MacOS/manifold-backend --doctor
+```
+
+It reports whether a backend is answering (real or mock), whether an API
+token exists and is accepted (status only, never the value), which agent
+configs register Manifold and at what scope, and what is running. It exits
+nonzero when an agent would be blocked, and every failure line carries the
+command that fixes it. The backend also writes `~/.config/manifold/manifold.json`
+on every boot, so an agent that has never heard of Manifold can find it by
+looking where it already looks. The dashboard says "no agent connected"
+until the first MCP call ever arrives.
 
 There is also Autopilot, an agent loop that runs *inside* Manifold, driven
 by any brain: a model served on your own instance, a local Ollama or

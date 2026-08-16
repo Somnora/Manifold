@@ -25,9 +25,25 @@ were lost. Every one of those failures is impossible through Manifold.
 ## How to connect
 
 MCP (preferred): the `manifold` MCP server exposes every tool named below.
-If it is not configured yet, ask the user to run:
+If it is not configured yet, ask the user to run ONE of these, then start a
+new session:
 
-    claude mcp add manifold -- uv run --directory <repo>/backend manifold-mcp
+    # installed desktop app
+    claude mcp add manifold --scope user -- "/Applications/Manifold.app/Contents/MacOS/manifold-backend" --mcp
+
+    # dev checkout
+    claude mcp add manifold --scope user -- uv run --directory <repo>/backend manifold-mcp
+
+`--scope user` matters: the default scope registers Manifold for sessions
+started in one directory only, so from anywhere else it looks like it was
+never installed. That exact gap once cost a session, with a GPU billing
+throughout.
+
+If you cannot tell whether Manifold is installed at all, look for
+`~/.config/manifold/manifold.json` before concluding it is missing: the
+backend writes it on every boot with the API URL and the registration
+command for this machine. `manifold-backend --doctor` (or `uv run
+manifold-doctor` in a dev checkout) reports what is wired and what is not.
 
 Plain HTTP: the same operations exist on http://localhost:8000 (the
 desktop app or a dev backend must be running). GET /health confirms it.
