@@ -2,9 +2,12 @@
 //
 //   MANIFOLD_MOCK=1 MANIFOLD_DATA_DIR=$(mktemp -d) \
 //     uv run uvicorn app.main:create_default_app --factory --port 8033
-//   NEXT_PUBLIC_API_URL=http://127.0.0.1:8033 npm run build
+//   NEXT_PUBLIC_API_URL=http://localhost:8033 npm run build
 //   python3 -m http.server 3000 --directory out
-//   API=http://127.0.0.1:8033 SITE=http://127.0.0.1:3000 node e2e/poll-pileup.mjs
+//   SITE=http://127.0.0.1:3000 node e2e/poll-pileup.mjs
+//
+// No API variable: the backend's address is discovered from the page's own
+// traffic (see below). Set API= only to override that.
 //
 // Port 3000 exactly: the backend's CORS allowlist is localhost:3000 and
 // nothing else, and every api call is blocked at the preflight anywhere else.
@@ -31,7 +34,6 @@
 // a real browser with real timers; it does not re-test Chrome's own event.
 import { chromium } from "playwright";
 
-const API = process.env.API || "http://127.0.0.1:8033";
 const SITE = process.env.SITE || "http://127.0.0.1:3000";
 const STALL = Number(process.env.STALL || 8000);   // every API call takes this
 const WINDOW = Number(process.env.WINDOW || 24000);
@@ -62,6 +64,16 @@ await p.addInitScript(() => {
   };
 });
 
+// WHERE the backend is, discovered rather than declared. lib/backend.ts
+// bakes the base in at build time and defaults to `http://localhost:8000`,
+// which is NOT `http://127.0.0.1:8000` to a URL prefix. Being handed the
+// wrong spelling matched zero requests, stalled nothing, and passed every
+// upper bound in this file - CI caught it on the preconditions, which is
+// exactly what they are for. So the page is watched instead of trusted: the
+// first origin it calls that is not the site IS the backend.
+let API = null;
+const siteOrigin = new URL(SITE).origin;
+
 // Accounting. `request` fires when the page initiates a fetch, and finished/
 // failed when it is done, so inflight is what the browser is actually holding
 // open - the number the connection limit applies to.
@@ -69,7 +81,7 @@ let inflight = 0, peak = 0, started = 0;
 const perUrl = new Map();
 const inflightPerUrl = new Map();
 let counting = false;
-const isApi = (u) => u.startsWith(API);
+const isApi = (u) => API !== null && u.startsWith(API);
 const key = (u) => u.slice(API.length).split("?")[0];
 
 p.on("request", (r) => {
@@ -91,16 +103,35 @@ const done = (r) => {
 p.on("requestfinished", done);
 p.on("requestfailed", done);
 
+// Every non-site origin the page calls, so the backend can be identified
+// from its own traffic. Registered before navigation so nothing is missed.
+const foreign = new Set();
+p.on("request", (r) => {
+  const o = new URL(r.url()).origin;
+  if (o !== siteOrigin) foreign.add(o);
+});
+
 // The slow backend. Held before continue(), so from the page's side the
 // fetch is simply pending - exactly a backend that has not answered yet.
+// The predicate reads API on every request, so routing simply does nothing
+// until the origin below is discovered.
 let stalling = false;
-await p.route((u) => u.href.startsWith(API), async (route) => {
+await p.route((u) => API !== null && u.href.startsWith(API), async (route) => {
   if (stalling) await sleep(STALL);
   await route.continue();
 });
 
 await p.goto(`${SITE}${PAGE}`, { waitUntil: "domcontentloaded" });
 await sleep(3000);                     // let the page mount its hooks
+
+API = process.env.API || [...foreign][0] || null;
+console.log(`  the page calls: ${API ?? "(nothing off-site)"}`);
+if (!API) {
+  ok(false, "the page never called a backend - nothing to measure");
+  await b.close();
+  process.exit(1);
+}
+await sleep(1500);                     // let routing settle onto the origin
 
 // -- 1. a stalled backend must not produce an unbounded queue ----------------
 console.log(`  stalling every API call by ${STALL}ms for ${WINDOW}ms...`);
