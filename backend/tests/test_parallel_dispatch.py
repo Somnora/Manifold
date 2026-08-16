@@ -122,8 +122,14 @@ def test_jobs_route_to_targeted_instances_in_parallel(tmp_path):
 
 
 def test_running_task_pins_only_its_own_instance(tmp_path):
-    """Idle: a server running on box A must NOT keep idle box B alive.
-    (Old behavior: any running task blocked ALL idle termination.)"""
+    """Idle: work on box A must NOT keep idle box B alive.
+
+    Phase 35's point, still the point. What changed in Phase 90 is WHY box
+    A survives: a served model is no longer immune just for existing, so A
+    is kept alive here the way a real one is - by being used. Every request
+    to a served model already calls touch_activity, and this drives that
+    same path through the app. Box B is touched by nothing and dies.
+    """
     settings = _fast(
         tmp_path,
         guardrails=Guardrails(max_concurrent_instances=2,
@@ -139,16 +145,66 @@ def test_running_task_pins_only_its_own_instance(tmp_path):
             "parameters": {"model_id": "m/pin"},
             "target_instance_id": a,
         }).json()["task"]
-        wait_task(client, serve["id"], ("running",))
-
-        # Idle box B gets reaped; pinned box A survives.
+        # Keep A in use from the moment it exists, not merely once its task
+        # is running. With a 0.2s idle window, a loaded runner can reap A
+        # during the QUEUED gap before dispatch - the task then never runs
+        # and the test fails as "stuck at queued", pointing nowhere near the
+        # behaviour under test. Seen on CI, never locally (8/8 green there),
+        # which is exactly the kind of timing gap a busy shared runner finds
+        # and a fast laptop hides.
         deadline = time.monotonic() + 8
         while time.monotonic() < deadline:
+            client.post(f"/instances/{a}/run", json={"command": "true"})
+            if client.get(f"/tasks/{serve['id']}").json()["status"] == "running":
+                break
+            time.sleep(0.02)
+        assert client.get(f"/tasks/{serve['id']}").json()["status"] == "running", \
+            "the server task never dispatched"
+
+        # Idle box B gets reaped; box A, in use, survives. The timeout here
+        # is 0.2s, so A must be touched faster than that - a real 30-minute
+        # window needs no such urgency.
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline:
+            client.post(f"/instances/{a}/run", json={"command": "true"})
             if not mock.instances[b].is_running:
                 break
             time.sleep(0.05)
         assert not mock.instances[b].is_running, "idle box B never terminated"
-        assert mock.instances[a].is_running, "pinned box A was wrongly reaped"
+        client.post(f"/instances/{a}/run", json={"command": "true"})
+        assert mock.instances[a].is_running, "box A in use was wrongly reaped"
+
+
+def test_a_served_model_nobody_uses_is_reaped(tmp_path):
+    """Phase 90, end to end through the app: a ready server that nobody
+    queries is idle, and the sweep takes it.
+
+    The mocked-harness matrix (test_idle_serves.py) pins the decision; this
+    pins the wiring - a real task row, a real readiness probe, the real
+    termination flow. It is the exact shape that billed for an hour: an
+    autopilot run left a vllm-serve task running and stopped asking it
+    anything.
+    """
+    settings = _fast(
+        tmp_path,
+        guardrails=Guardrails(max_concurrent_instances=2,
+                              max_hourly_spend_usd=4.00),
+        idle=IdleSettings(timeout_seconds=0.2, poll_seconds=0.03))
+    app, mock = _app(settings, sidecar=MockSidecarClient(unpersisted=[]))
+    with TestClient(app) as client:
+        a = launch_connected_on(client)
+        serve = client.post("/tasks", json={
+            "template": "vllm-serve",
+            "parameters": {"model_id": "m/abandoned"},
+            "target_instance_id": a,
+        }).json()["task"]
+        wait_task(client, serve["id"], ("running",))
+
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline and mock.instances[a].is_running:
+            time.sleep(0.05)
+        assert not mock.instances[a].is_running, (
+            "an abandoned served model kept billing")
 
 
 def test_mock_mode_auto_manage_works_with_real_key_in_config(tmp_path):

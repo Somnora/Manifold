@@ -4975,3 +4975,72 @@ served model is never idle, and with no max-lifetime ceiling set it bills
 until someone notices. The ceiling is the guard that fires through a
 server; nothing currently encourages setting one on a serve launch. Named
 here as the known hole rather than left to be rediscovered on a bill.
+
+## 2026-08-16 — Phase 90: an abandoned model server is idle
+
+The hole named the night before, closed. Any running task used to make its
+instance immune to the idle sweep, and a `vllm-serve` task never leaves
+`running` - so an abandoned model server was never idle, and with no
+ceiling set it billed until a human noticed. One did: an autopilot run ran
+out of steps one turn short of its terminate, left an a10 serving Qwen,
+and it ran for an hour ($1.29) with every guard working exactly as
+designed.
+
+**The idle verdict now pins on BATCH tasks only**, the same distinction
+the ceiling has always used. A server is judged by the question that
+actually defines idleness for one: is anyone using it?
+
+- **Loading** (serving, but `/v1/models` not answering yet) counts as
+  activity and RESTARTS the clock. Weights for a large model can outlast
+  the idle window, and reaping a box seconds before it becomes useful is
+  the worst possible moment. The window therefore runs from readiness, not
+  from dispatch.
+- **In use** needs no new machinery: `/v1/chat/completions`, the chat
+  panel, and `/instances/{id}/run` all call `touch_activity` already. That
+  is why this fix is small - the signal existed, nothing consulted it.
+- **Ready and silent** for the full window is what an abandoned server IS,
+  and it is now terminated through the standard flow, rescue included.
+
+**Everything ambiguous fails safe.** No endpoint, an unreachable box, a
+probe that errors or raises: all mean "leave it alone". This is the only
+unattended code in Manifold that destroys a paid instance, so the bar is
+not "probably idle", it is "answering and provably unused".
+
+**A batch job still pins absolutely.** A fine-tune at 90% is destroyed by
+no sweep, ready or not - the trade this project refuses to make. Server
+and batch on one box: batch wins. keep-alive and auto-managed ownership
+are checked before any of this and are unchanged.
+
+**Cost of the probe:** `model_ready` is already cached (30s once ready, 3s
+while loading), so a 15s idle poll adds at most one HTTP round trip over
+an SSH forward that is already open.
+
+**The golden matrix row changed, and that is stated in the file.**
+`test_running_server_job_pins_its_instance` still passes - the harness has
+no model client, so the probe says "not answering", and a server that is
+not answering is still protected. But it no longer pins what its docstring
+claimed. The real matrix (ready+silent terminates; loading, busy,
+unprobeable, keep-alive, batch-beside-server do not) is
+`tests/test_idle_serves.py`, where readiness is injected.
+
+**Worth stating plainly:** the golden matrix row passed throughout this
+change, for a different reason than it claimed - the harness has no model
+client, so the probe says "not answering". The behaviour was really pinned
+by an INTEGRATION test (test_parallel_dispatch), which failed immediately
+and correctly, because there the probe answers. The unit fence went green
+while the integration fence caught it: a reminder that a mocked harness
+can only test the decision, never the wiring.
+
+That integration row kept its Phase 35 intent (work on box A must not keep
+idle box B alive) and changed only WHY box A survives: it is now kept alive
+by being used, driving the same touch_activity path a real client does. A
+second row was added beside it for the shape that cost the money - a ready
+server nobody queries, reaped end to end through the app.
+
+Alternative considered: default a max-lifetime ceiling on every launch
+(`idle.default_max_lifetime_seconds`). Rejected as the primary fix - it is
+coarse (a 4h default still bills ~$5 on an abandoned a10) and it changes
+behaviour for every launch to work around a signal we already had. It
+remains a reasonable BACKSTOP for boxes the idle sweep cannot see (an
+unreachable instance is never idle-terminated by design), and is not
+foreclosed.
