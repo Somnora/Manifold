@@ -152,3 +152,49 @@ jobs:
           # The backend must not outlive the step: a uv-spawned process
           # alive at post-job time is what broke the action's cleanup.
           pkill -f "uvicorn app.main" || true
+
+      # "No agent connected" is the one state a developer machine cannot
+      # show you: the chip fires only at ZERO all-time `mcp` audit rows,
+      # and any backend that has ever been driven by an agent has some.
+      # It shipped in the v0.2.2 installers verified by a typecheck alone.
+      # CI is the natural home for it, because a fresh runner is the only
+      # place a virgin audit log happens for free.
+      - name: Check the dashboard says when no agent has ever connected
+        run: |
+          cd backend
+          # A scratch data dir, not the checkout: the previous step's
+          # backend wrote tasks and audit rows into the repo root, and this
+          # check's whole precondition is an audit log with nothing in it.
+          # (No mcp rows either way - tasks are posted as `api` - but a
+          # precondition worth asserting is worth guaranteeing.)
+          export MANIFOLD_DATA_DIR="$(mktemp -d)"
+          MANIFOLD_MOCK=1 MANIFOLD_NO_BREADCRUMB=1 \
+            uv run uvicorn app.main:create_default_app --factory --port 8000 \
+            > /tmp/manifold-agent-check.log 2>&1 &
+          up=""
+          for i in $(seq 1 60); do
+            curl -sf -o /dev/null http://127.0.0.1:8000/health && { up=1; break; }
+            sleep 1
+          done
+          if [ -z "$up" ]; then
+            echo "backend never came up; its log:" >&2
+            tail -30 /tmp/manifold-agent-check.log >&2
+            exit 1
+          fi
+          cd ../dashboard
+          # Port 3000 exactly. The export talks to :8000 only when served
+          # there; anywhere else it calls ITSELF, every request dies at the
+          # CORS preflight, and the chip renders nothing - which is
+          # indistinguishable from the bug this check exists to catch.
+          # The previous step left a server on 3000; start one only if not.
+          if ! curl -sf -o /dev/null http://127.0.0.1:3000/; then
+            python3 -m http.server 3000 --bind 127.0.0.1 --directory out \
+              >/dev/null 2>&1 &
+          fi
+          for i in $(seq 1 30); do
+            curl -sf -o /dev/null http://127.0.0.1:3000/ && break
+            sleep 1
+          done
+          API=http://127.0.0.1:8000 SITE=http://127.0.0.1:3000 \
+            node e2e/agent-connection.mjs
+          pkill -f "uvicorn app.main" || true
