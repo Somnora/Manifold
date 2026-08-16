@@ -1,126 +1,127 @@
-"""Sidecar reachability diagnosis.
+"""Make an intermittent freeze diagnose itself.
 
-The sidecar binds to 127.0.0.1:9411 on the instance and is reached only
-through an SSH local port forward. When it does not answer, the managed SSH
-connection itself is almost always fine, so we can ask the instance directly
-WHY: read-only shell probes over the known-good SSH channel, classified into
-an actionable cause instead of a dead-end "sidecar not reachable yet".
+The owner reports the app freezing after being left alone: tabs stop
+responding and the dashboard shows "No answer after 30s (/instances)".
+Investigating it produced nothing, for one boring reason - the backend
+logs to the terminal uvicorn was launched in, so by the time anyone looks,
+the window is gone and the freeze left NO RECORD ANYWHERE. Every question
+about it ("was the backend actually slow?", "which call hung?") was
+unanswerable after the fact.
 
-Pure and injectable: diagnose_sidecar takes a `run(cmd) -> (exit, out, err)`
-coroutine (ManagedConnection.run in production, a fake in tests).
+Three cheap things fix that, and together they answer the only question
+worth asking first:
+
+  THE FORK. The dashboard's own client timeout is 30s. So "no answer
+  after 30s" has two completely different causes, and they need opposite
+  fixes:
+    - the BACKEND was slow  -> slow_request log lines name the endpoint
+                               and the seconds it took
+    - the backend was FINE  -> no slow_request lines at all, which means
+                               the webview stalled and fired its own
+                               timeout against a backend that answered
+
+  THE MECHANISM. If everything is slow at once, the event loop is
+  blocked - one synchronous call in an async handler stops every request
+  in the process. A heartbeat that measures its own oversleep detects
+  exactly that, and costs one timer per second.
+
+Nothing here changes behaviour: it only writes things down. All of it is
+best-effort - a diagnostic that can break the app it watches is worse than
+no diagnostic.
 """
 
 from __future__ import annotations
 
-from .sidecar_client import SIDECAR_PORT
+import asyncio
+import logging
+import logging.handlers
+import time
+from pathlib import Path
 
-# (key, human label, read-only command). Ordered; all are best-effort and
-# must never fail the whole probe, hence the `|| true` / echo fallbacks.
-def _checks(port: int):
-    return [
-        ("cloud_init", "first-boot setup (cloud-init)",
-         "cloud-init status 2>/dev/null || echo 'status: unknown'"),
-        ("service", "sidecar service state",
-         "systemctl is-active manifold-sidecar 2>/dev/null || echo unknown"),
-        ("listening", f"listening on 127.0.0.1:{port}",
-         f"( ss -ltnH 2>/dev/null || netstat -ltn 2>/dev/null ) "
-         f"| grep -q ':{port} ' && echo yes || echo no"),
-        ("logs", "recent sidecar log",
-         "journalctl -u manifold-sidecar --no-pager -n 15 2>/dev/null "
-         "| tail -n 15 || echo '(no journal)'"),
-    ]
+logger = logging.getLogger("manifold.diagnostics")
+
+# Bounded on purpose: this runs on a laptop for weeks. 5 MB x 3 is days of
+# freezes at the volume below and can never eat a disk.
+LOG_MAX_BYTES = 5_000_000
+LOG_BACKUPS = 3
 
 
-async def diagnose_sidecar(run, *, port: int = SIDECAR_PORT) -> dict:
-    """Probe the instance over SSH and classify why the sidecar is silent.
+def setup_file_logging(data_root: Path) -> Path | None:
+    """Mirror the app's logs into DATA_ROOT/logs/manifold.log.
 
-    Returns {cause, summary, port, checks:[{label, command, output}]}.
+    Returns the path, or None if it could not be set up - a read-only home
+    directory must never stop the backend from starting. Idempotent: a
+    reload that re-runs this will not stack handlers, which would otherwise
+    write every line N times and quietly multiply the log's size.
     """
-    results: dict[str, dict] = {}
-    probe_lost = False
-    checks = _checks(port)
-    for i, (key, label, cmd) in enumerate(checks):
+    try:
+        log_dir = data_root / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        path = log_dir / "manifold.log"
+        root = logging.getLogger()
+        for existing in root.handlers:
+            if getattr(existing, "_manifold_file_handler", False):
+                return path
+        handler = logging.handlers.RotatingFileHandler(
+            path, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUPS)
+        handler.setFormatter(logging.Formatter(
+            "%(asctime)s %(levelname)-7s %(name)s: %(message)s"))
+        handler._manifold_file_handler = True     # type: ignore[attr-defined]
+        root.addHandler(handler)
+        # uvicorn's default config drops app-level INFO from the root
+        # logger; without this the file would hold almost nothing.
+        if root.level > logging.INFO or root.level == logging.NOTSET:
+            root.setLevel(logging.INFO)
+        return path
+    except OSError as exc:
+        logger.debug("file logging not set up: %s", exc)
+        return None
+
+
+async def measure_request(call_next, request, threshold_seconds: float):
+    """Time one request; log it if it crossed the threshold.
+
+    The response is returned unchanged whatever happens, and a failure in
+    the timing path can never turn a working request into an error.
+    """
+    started = time.monotonic()
+    try:
+        return await call_next(request)
+    finally:
         try:
-            _exit, out, err = await run(cmd)
-            output = (out or "").strip() or (err or "").strip()
-        except Exception as exc:   # a probe failing must not sink the report
-            # The SSH channel itself just failed. Don't keep probing over a
-            # dead channel (each attempt would burn its own timeout), and
-            # don't let the partial answers below masquerade as a diagnosis.
-            probe_lost = True
-            results[key] = {"label": label, "command": cmd,
-                            "output": f"probe failed: {exc}"}
-            for skipped_key, skipped_label, skipped_cmd in checks[i + 1:]:
-                results[skipped_key] = {
-                    "label": skipped_label, "command": skipped_cmd,
-                    "output": "probe skipped: connection lost mid-diagnosis",
-                }
-            break
-        results[key] = {"label": label, "command": cmd, "output": output}
+            elapsed = time.monotonic() - started
+            if elapsed >= threshold_seconds:
+                logger.warning(
+                    "slow_request %s %s took %.1fs (threshold %.1fs)",
+                    request.method, request.url.path, elapsed,
+                    threshold_seconds)
+        except Exception:   # noqa: BLE001 - never break a served request
+            pass
 
-    if probe_lost:
-        return {
-            "cause": "probe-error",
-            "summary": (
-                "The SSH connection failed while probing the instance, so "
-                "the sidecar state is unknown (not necessarily broken). "
-                "Wait for the connection to recover and retry."
-            ),
-            "port": port,
-            "checks": [results[k] for k in
-                       ("cloud_init", "service", "listening", "logs")],
-        }
 
-    cloud = results["cloud_init"]["output"].lower()
-    service = results["service"]["output"].strip()
-    listening = results["listening"]["output"].strip() == "yes"
+async def loop_lag_monitor(threshold_seconds: float = 1.0,
+                           interval_seconds: float = 1.0,
+                           *, clock=time.monotonic, sleep=asyncio.sleep,
+                           iterations: int | None = None) -> None:
+    """Log whenever the event loop oversleeps by more than the threshold.
 
-    if "status: running" in cloud:
-        cause = "cloud-init-running"
-        summary = (
-            "The instance is still running first-boot setup (cloud-init). "
-            "The sidecar starts only after Docker and the NVIDIA toolkit "
-            "finish installing, which can take a few minutes on first boot. "
-            "Recheck shortly."
-        )
-    elif "status: error" in cloud:
-        cause = "cloud-init-error"
-        summary = (
-            "First-boot setup (cloud-init) reported an error, so the sidecar "
-            "may never have been installed. See the recent log below."
-        )
-    elif service == "failed":
-        cause = "sidecar-crashed"
-        summary = (
-            "The sidecar service is installed but crashed. The recent log "
-            "below usually names the reason."
-        )
-    elif service in ("activating", "inactive") or (
-        service == "active" and not listening
-    ):
-        cause = "sidecar-starting"
-        summary = (
-            "The sidecar service is up but not yet listening on "
-            f"127.0.0.1:{port}. Give it a moment and recheck."
-        )
-    elif service == "active" and listening:
-        cause = "forward-transient"
-        summary = (
-            "The sidecar is healthy on the instance (running and listening). "
-            "The dashboard's SSH port-forward likely failed transiently; "
-            "retry the telemetry or files action."
-        )
-    else:
-        cause = "unknown"
-        summary = (
-            "Could not classify the sidecar state from the instance. See the "
-            "raw checks below."
-        )
+    `await sleep(1)` returning after 9 seconds means the loop had no chance
+    to run for 8 of them: something synchronous held it. That is the one
+    condition under which EVERY endpoint goes slow at once, and it is
+    otherwise invisible - each individual handler looks innocent.
 
-    return {
-        "cause": cause,
-        "summary": summary,
-        "port": port,
-        "checks": [results[k] for k in
-                   ("cloud_init", "service", "listening", "logs")],
-    }
+    `iterations` bounds the loop for tests; None runs forever.
+    """
+    count = 0
+    while iterations is None or count < iterations:
+        count += 1
+        before = clock()
+        await sleep(interval_seconds)
+        lag = clock() - before - interval_seconds
+        if lag >= threshold_seconds:
+            # WARNING, not INFO: this is never normal, and it is the line
+            # that says "the backend froze" rather than "a call was slow".
+            logger.warning(
+                "event_loop_blocked for %.1fs (slept %.1fs, expected %.1fs) - "
+                "every request was stalled during this window",
+                lag, lag + interval_seconds, interval_seconds)

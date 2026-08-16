@@ -5142,3 +5142,53 @@ gap and named here rather than pretended away.
 Verified against a live backend rather than by reading: the API advertises
 10 kinds, `terminal_reaped` defaults on, PUT switches it off, and its
 neighbours are unaffected.
+
+## 2026-08-16 — Phase 92: the freeze now records itself
+
+The freeze has been reported three times and investigated zero times, for
+one boring reason: uvicorn logs to the terminal it was launched in, so
+every occurrence erased its own evidence. Asked afterwards - "was the
+backend actually slow, or did the browser stall?" - the honest answer was
+always "no way to know now". That is not a hard bug, it is an
+unobservable one, and the fix is observability, not a guess.
+
+**The fork this answers.** The dashboard's client timeout is 30 seconds,
+so "No answer after 30s (/instances)" has two opposite causes: the backend
+was slow, or the backend was fine and the webview stalled and timed out
+against a healthy server. Those need opposite fixes and looked identical.
+Now: a `slow_request` line names the endpoint and its seconds, and the
+ABSENCE of one is equally informative.
+
+**The mechanism this catches.** If everything goes slow at once, the event
+loop is blocked - one synchronous call in an async handler stalls every
+request in the process, while each handler still looks innocent on its
+own. A heartbeat that measures its own oversleep detects precisely that:
+`await sleep(1)` returning after 9 seconds means the loop had no chance to
+run for 8. One timer per second.
+
+**Proved against a real freeze, not just unit tests.** A live mock backend
+was suspended with SIGSTOP for six seconds (the closest thing to a laptop
+sleep) and caught itself on resume:
+
+    event_loop_blocked for 5.2s (slept 6.2s, expected 1.0s) -
+    every request was stalled during this window
+
+That is the line that did not exist at 12:27 AM. Normal traffic produced
+zero warnings, so it is not a false-positive machine.
+
+**Everything is best-effort and additive.** A read-only home directory
+returns None rather than refusing to boot; the timing wrapper returns the
+response untouched and re-raises the handler's own exception unchanged;
+`setup_file_logging` is idempotent, because --reload re-runs the entry
+point and stacked handlers would write every line N times. File logging
+and the breadcrumb are both wired into `create_default_app` ONLY, so the
+hundreds of apps the test suite builds never touch the user's log.
+
+**And a bug in the capture script, found by running it.** With no log file
+anywhere the new section printed NOTHING, which reads as "no freezes
+recorded" when it actually means "I could not tell". Those are different
+facts, and conflating them is how three freezes went uninvestigated. It
+now says so, and names the reason (a backend older than this change).
+
+Not claimed: a diagnosis. The freeze is still unexplained. What changed is
+that the next one leaves a record whether or not anyone is at the keyboard.
