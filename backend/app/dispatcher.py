@@ -739,6 +739,30 @@ class Dispatcher:
         template = self.templates.get(template_name)
         return bool(template is not None and template.ports)
 
+    async def _server_answering(self, instance_id: str, task: dict) -> bool:
+        """Is this server task actually serving requests yet?
+
+        False means "do not judge this box idle": either the model is still
+        loading, or we could not ask. Both are reasons to leave it alone,
+        and both must fail SAFE (protect) rather than terminate on a probe
+        that errored - the wrong answer here destroys a running instance.
+
+        The probe is model_ready's, cached per task (30s once ready, 3s
+        while loading), so a 15s idle poll costs at most one extra HTTP
+        round trip over a forward that is already open.
+        """
+        endpoint = self._served_endpoint(task)
+        if endpoint is None:
+            return False
+        try:
+            verdict = await self.model_ready(instance_id, task["id"],
+                                             endpoint[1])
+        except Exception:   # noqa: BLE001 - a probe must never terminate a box
+            logger.debug("readiness probe failed for %s; treating as busy",
+                         instance_id, exc_info=True)
+            return False
+        return bool(verdict.get("ready"))
+
     def _served_endpoint(self, task: dict) -> tuple[str, int] | None:
         """The subagent-registry (model_id, remote_port) a server task exposes,
         or None for a batch task.
@@ -1240,14 +1264,32 @@ class Dispatcher:
         'running', so a ceiling that deferred to it would be permanently
         unreachable on the most expensive workload Manifold runs.
 
-        IDLE (on by default, unchanged). Connected, no running task of any
-        kind, no activity (job or terminal) for idle.timeout_seconds. The
-        clock starts when the connection comes up, so a freshly booted
-        instance gets a full quiet period before it is eligible.
+        IDLE (on by default). Connected, no running BATCH task, no activity
+        (job, terminal, or a request to a served model) for
+        idle.timeout_seconds. The clock starts when the connection comes up,
+        so a freshly booted instance gets a full quiet period before it is
+        eligible.
 
-        The two use DIFFERENT protection sets on purpose: the idle verdict
-        still protects every auto-managed and every pinned instance exactly
-        as it always has. Only the ceiling narrows them.
+        A SERVER task no longer makes its box immune (Phase 90). It used to,
+        and the consequence was a hole shaped exactly like the bill this
+        product exists to prevent: a vllm-serve task never leaves 'running',
+        so an abandoned model server was never idle, and with no ceiling set
+        it billed until a human noticed. One did, an hour and $1.29 later.
+
+        What protects a server instead is what "idle" actually means for one:
+        - STILL LOADING (serving but not answering /v1/models yet) counts as
+          activity. Weights for a large model take longer than the idle
+          window, and reaping a box seconds before it becomes useful is the
+          worst possible moment.
+        - IN USE resets the clock on its own: /v1/chat/completions, the chat
+          panel, and run all call touch_activity already.
+        - READY AND SILENT for the whole window is the real definition of an
+          abandoned server, and is now terminated like any other idle box.
+
+        A BATCH job still pins its instance absolutely. A fine-tune has a
+        90%, and destroying one to save a billing hour is the trade this
+        project refuses to make - the same reasoning the ceiling uses.
+        auto_owned and keep-alive are untouched escape hatches.
         """
         now = self._clock()
         # Instances an auto-managed job owns are governed by that job's
@@ -1258,8 +1300,11 @@ class Dispatcher:
         auto_owned = self.db.auto_managed_instance_ids()
         running = self.db.running_tasks()
         # A running task pins ITS OWN instance only (Phase 35): with several
-        # GPUs up, a job on box A must not keep an idle box B billing.
-        pinned = {t["instance_id"] for t in running if t.get("instance_id")}
+        # GPUs up, a job on box A must not keep an idle box B billing. Both
+        # verdicts now use the BATCH set below - Phase 90 removed the last
+        # reader of the all-tasks set rather than leave a name that reads
+        # like a live protection but guards nothing.
+        #
         # The ceiling defers to a BATCH job only. A batch job has a 90% — a
         # fine-tune destroyed at 90% is the failure this project refuses to
         # cause. A server daemon has no 90%: it streams until something stops
@@ -1268,6 +1313,12 @@ class Dispatcher:
         pinned_batch = {t["instance_id"] for t in running
                         if t.get("instance_id")
                         and not self._is_server(t["template"])}
+        # The server task per instance, so the idle verdict can ask the one
+        # question that separates "loading" from "abandoned": is it ANSWERING
+        # yet? Last writer wins - a box running two servers is protected
+        # while either is still coming up, which is the safe direction.
+        serving = {t["instance_id"]: t for t in running
+                   if t.get("instance_id") and self._is_server(t["template"])}
         for instance_id, conn in list(self.orchestrator.connections.items()):
             # One poison instance must not disable termination for every box
             # behind it in this iteration. Only TerminationBlocked used to be
@@ -1309,16 +1360,24 @@ class Dispatcher:
                 self._clear_ceiling_deferral(instance_id)
                 self._maybe_warn_ceiling(instance_id, launch)
 
-                # -- idle verdict: the ladder exactly as it has always run,
-                # against the FULL auto_owned and pinned sets. A served model
-                # is still protected from IDLE termination.
-                if instance_id in auto_owned or instance_id in pinned:
+                # -- idle verdict. Pinned by a BATCH task only (Phase 90); a
+                # server is judged by whether anyone is using it, below.
+                if instance_id in auto_owned or instance_id in pinned_batch:
                     continue
                 if not connected:
                     # Not reachable: don't count unreachable time as idle.
                     self.last_activity.pop(instance_id, None)
                     continue
                 if self.keep_alive_enabled(instance_id):
+                    continue
+                server = serving.get(instance_id)
+                if server is not None and not await self._server_answering(
+                        instance_id, server):
+                    # Coming up (or unprobeable): treat as activity so the
+                    # window restarts from readiness, not from dispatch. A
+                    # 70B that downloads for 40 minutes must never be reaped
+                    # at minute 30 for the crime of not being loaded yet.
+                    self.touch_activity(instance_id)
                     continue
                 timeout = self._effective_timeout(instance_id)
                 last = self.last_activity.setdefault(instance_id, now)

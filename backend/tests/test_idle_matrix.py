@@ -152,7 +152,22 @@ async def test_auto_managed_instance_in_terminating_is_left_alone(harness):
 
 
 async def test_running_server_job_pins_its_instance(harness):
-    """vllm-serve streams for its lifetime; killing it kills a served model."""
+    """A server that is not ANSWERING pins its instance.
+
+    CHANGED IN PHASE 90, deliberately, and noted here because this file's
+    rule is that a row needing a change is a behaviour change nobody asked
+    for - this one was asked for. Until then a running vllm-serve task made
+    its box immune to this sweep unconditionally, and since such a task
+    never leaves 'running', an ABANDONED model server could never be idle.
+    It billed until a human noticed; one did, an hour later.
+
+    The row still passes and still guards something real: no model client
+    exists in this harness, so the readiness probe says "not answering",
+    and a server that is not answering is protected (it may be loading).
+    What is no longer true is that a server is protected REGARDLESS of use.
+    That distinction - ready and silent gets terminated, loading or busy
+    does not - lives in test_idle_serves.py, where readiness is controlled.
+    """
     harness.add_instance("i-serving")
     harness.pin_task("i-serving", "vllm-serve")
     await harness.dispatcher._check_idle()
