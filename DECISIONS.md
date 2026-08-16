@@ -4975,3 +4975,67 @@ served model is never idle, and with no max-lifetime ceiling set it bills
 until someone notices. The ceiling is the guard that fires through a
 server; nothing currently encourages setting one on a serve launch. Named
 here as the known hole rather than left to be rediscovered on a bill.
+
+## 2026-08-16 — Phase 91: a shell that dies says so, and says what survived
+
+Reported as: "when I step away the app freezes, I have to kill the
+terminal tab, and I lose my entire chat history with claude because my
+chat isn't saved in Manifold. When I hot resume, it doesn't pick up right
+where I left off."
+
+Three separate things, and the first two were fixable immediately.
+
+**The history was never lost.** Claude Code writes every conversation to
+`~/.claude/projects/<cwd-with-slashes-as-dashes>/<session>.jsonl` on the
+machine it ran on, and killing a shell does not touch those files. The
+local terminal does `pty.fork()` + `execvp` with NO chdir, so its shells
+inherit the backend's cwd - which is where the transcripts were, intact,
+the whole time. Confirmed on the owner's machine: three conversations in
+the repo directory, the newest 18.9 MB from that night.
+
+**What actually killed the shell: `terminal_grace_seconds: 900`.** A
+detached session waited 15 minutes for a reattach, then the reaper killed
+its process group. The reasoning in the code was "a closed tab never comes
+back" - but a FROZEN app is indistinguishable from a closed tab, and 15
+minutes is shorter than a coffee break. Now 28800 (8 hours). A detached
+shell holds a pty and, for an instance terminal, an SSH channel, and
+nothing else; it cannot keep a GPU billing, because the idle sweep counts
+terminal INPUT as activity and a detached shell produces none. The bound
+exists only so a long-running machine does not accumulate dead shells.
+
+**And the kill was silent.** No audit row, no notification - one log line
+to a stdout nobody reads. In a product that will not terminate an instance
+without first rescuing its files, the one destructive act that left no
+trace was the one that destroyed an agent session. `on_reap` is injected
+by main.py (terminal_sessions.py keeps its zero backend imports) and
+writes both an audit row and a `terminal_reaped` notification, carrying
+the tail of what was on screen so the record answers "what did I lose".
+It reports BEFORE killing - after `kill()` there is nothing left to read -
+and a callback that raises can never skip the kill.
+
+**Reattach now explains itself.** Asking for a session id whose shell is
+gone used to hand back a bare prompt: indistinguishable from "my work
+vanished". Both terminals now print, into scrollback so it survives later
+reattaches, that the previous shell had ended and that anything running in
+it stopped. For the LOCAL terminal it also counts the Claude transcripts
+recorded in that cwd and names the command: `claude --resume`. Only the
+directory listing is read; a test asserts no transcript content can reach
+the notice.
+
+**The freeze itself is NOT diagnosed, and is not claimed to be.** Measured
+after 23.5 hours of uptime: backend 70 MB RSS, 49 fds, 19 threads, /health
+in 40 ms, /instances in 1.7 s; the WKWebView 57 MB. That rules out a slow
+resource leak, and rules out nothing else - the backend's logs go to the
+terminal uvicorn was launched in, so the 12:27 AM window left no record.
+`scripts/capture-freeze.sh` exists to end that: one read-only command, run
+DURING a freeze, that answers the only question worth asking first - are
+the endpoints slow too (backend wedged), or fast while the UI is stuck
+(the webview is, and the app's own 30s client timeout is firing against a
+backend that answers instantly)?
+
+Four bugs in that script's own first run, all fixed and noted in it,
+because a diagnostic that lies at 1am is worse than none: an f-string with
+a backslash in its expression (a syntax error before Python 3.12) printed
+"(could not read)" over real data twice; `pgrep -f "uvicorn app.main"`
+matched the `uv run` WRAPPER and reported its 15 fds as the backend's; and
+a loose WebKit pattern reported Brave's renderers as Manifold's.

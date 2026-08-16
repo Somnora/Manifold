@@ -109,6 +109,44 @@ TERMINAL_TEARDOWNS = {"sighup": 0, "sigkill": 0}
 _REAP_TASKS: set = set()
 
 
+def _replaced_shell_notice(local_cwd=None) -> str:
+    """What to print when a session id was asked for and its shell is gone.
+
+    Reattaching used to hand back a fresh prompt with no explanation, which
+    reads as "my work vanished" - the shell had been reaped or had exited,
+    and nothing said so. Manifold restores the TERMINAL; it cannot restore a
+    process it killed. What it can do is say what happened and point at the
+    thing that CAN be resumed.
+
+    Claude Code writes every conversation to
+    ~/.claude/projects/<cwd-with-slashes-as-dashes>/<session>.jsonl on the
+    machine it ran on, and killing a shell does not touch those files. So a
+    lost session is nearly always recoverable, and the user's own report -
+    "I lose my entire chat history" - was about not being told where it
+    went. Only the directory LISTING is read here; no transcript is opened.
+    """
+    lines = [
+        "\r\n[manifold] The previous shell for this session had ended, so "
+        "this is a new one.",
+        "[manifold] Anything that was running in it (an agent, a job) "
+        "stopped when it ended; see Activity for when and why.",
+    ]
+    if local_cwd is not None:
+        try:
+            from pathlib import Path
+            encoded = str(Path(local_cwd).resolve()).replace("/", "-")
+            transcripts = sorted(
+                (Path.home() / ".claude" / "projects" / encoded).glob("*.jsonl"))
+        except OSError:
+            transcripts = []
+        if transcripts:
+            lines.append(
+                f"[manifold] Claude Code recorded {len(transcripts)} "
+                f"conversation(s) in this directory and they survived: "
+                f"run  claude --resume  to pick one up.")
+    return "\r\n".join(lines) + "\r\n\r\n"
+
+
 def _end_shell_group(pid: int, *, grace_seconds: float = 5.0,
                      label: str = "", on_escalation=None):
     """End a local terminal shell and everything it spawned, then reap it.
@@ -689,8 +727,32 @@ def create_app(
     brains = BrainRegistry(settings, orchestrator, queue, templates)
     # Shells outlive their WebSocket (a refresh reattaches instead of
     # re-setting up whatever was running); see terminal_sessions.py.
+    def _report_reaped_shell(session, detached_seconds: float) -> None:
+        """A reaped shell is a destroyed workspace: say so, twice.
+
+        The audit log is the record that survives; the notification is what
+        reaches a user who was away - which, by definition of this reaper,
+        every one of them was. The tail of the screen goes in the body so
+        the row answers "what did I lose" rather than only "something died".
+        """
+        tail = " ".join(session.tail_text(160).split())[-160:]
+        minutes = detached_seconds / 60
+        db.record_audit(
+            "backend", "terminal_reaped",
+            f"{session.id}: shell killed after {minutes:.0f}m detached"
+            + (f"; last output: {tail}" if tail else ""))
+        notifier.notify(
+            "terminal_reaped",
+            "A terminal shell was closed",
+            f"Session {session.id[:8]} had no viewer for {minutes:.0f} "
+            f"minutes, so its shell was ended. Anything running in it "
+            f"(including an agent) has stopped."
+            + (f" Last output: {tail}" if tail else ""),
+            ref=session.id)
+
     term_sessions = TerminalSessionManager(
-        grace_seconds=settings.hub.terminal_grace_seconds)
+        grace_seconds=settings.hub.terminal_grace_seconds,
+        on_reap=_report_reaped_shell)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -1501,6 +1563,11 @@ def create_app(
 
         session.pump_task = asyncio.create_task(pump_output())
         term_sessions.register(session)
+        if sid:
+            # A session id was asked for and we are building a NEW shell:
+            # whatever was there is gone. Recorded into scrollback so it
+            # survives the attach and any later reattach.
+            await session.feed(_replaced_shell_notice())
         await _drive_terminal(ws, session, persistent=bool(sid),
                               on_input=touch)
 
@@ -1688,6 +1755,12 @@ def create_app(
 
         session.pump_task = asyncio.create_task(pump_output())
         term_sessions.register(session)
+        if sid:
+            # Asked for a session we no longer have: say so, and point at
+            # the conversations that DID survive. The shell inherits this
+            # process's cwd (no chdir above), so that is where any Claude
+            # Code transcripts for it were written.
+            await session.feed(_replaced_shell_notice(local_cwd=os.getcwd()))
         if model:
             # Through feed(), so the banner lands in scrollback and a
             # reattach after refresh replays it too.

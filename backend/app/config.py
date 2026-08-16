@@ -198,7 +198,7 @@ class HubSettings:
     # freeze, crash) keeps its shell alive waiting for a reattach. A refresh
     # reattaches in seconds; a tab closed for good never does, and its shell
     # is reaped after this window instead of leaking.
-    terminal_grace_seconds: float = 900.0
+    terminal_grace_seconds: float = 28800.0
 
 
 @dataclass(frozen=True)
@@ -483,7 +483,7 @@ def load_settings(
             ) or ("claude", "codex", "gemini"),
             local_terminal=bool(hub.get("local_terminal", True)),
             terminal_grace_seconds=float(
-                hub.get("terminal_grace_seconds", 900)),
+                hub.get("terminal_grace_seconds", 28800)),
         ),
         telemetry=TelemetrySettings(
             sample_seconds=float(telemetry.get("sample_seconds", 30)),

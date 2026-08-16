@@ -93,6 +93,12 @@ class NotificationPrefs:
     # notification IS the feature - a cap you are not told about is a cap
     # that does nothing.
     budget_threshold: bool = True
+    # A detached terminal shell reaped after its grace period. The shell may
+    # have had an agent session running in it, and killing it is the only
+    # destructive act in Manifold that used to happen with no record at all.
+    # On by default: a silent kill is how "my chat history disappeared"
+    # becomes a mystery instead of a fact with a timestamp.
+    terminal_reaped: bool = True
     # Also raise an OS notification (macOS Notification Center, libnotify on
     # Linux). In-app notifications are always recorded regardless; this only
     # controls the ping outside the window.
