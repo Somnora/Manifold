@@ -110,7 +110,7 @@ async def test_over_timeout_and_connected_is_terminated(harness):
     await harness.dispatcher._check_idle()
     assert [i for i, _ in harness.terminated] == ["i-idle"]
     # Never unattended-force: the rescue runs first, always.
-    assert harness.terminated[0][1] == {"force": False}
+    assert harness.terminated[0][1]["force"] is False   # never unattended force
     assert "i-idle" not in harness.dispatcher.last_activity
 
 

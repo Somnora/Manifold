@@ -19,15 +19,20 @@ export default function SettingsPage() {
   );
 
   return (
-    <div className="max-w-2xl space-y-6">
+    /* The full centered container, in two columns at lg. This page lived in
+       a 672px column with no mx-auto - left-hugging inside the 1104px
+       layout, with the dead space growing as the window did. items-start,
+       not the default stretch: unequal cards must not inherit each other's
+       height (the same grid lesson as the home page's fleet panel). */
+    <div className="grid grid-cols-1 items-start gap-6 lg:grid-cols-2">
       {error && (
-        <p className="rounded border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-800">
+        <p className="rounded border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-800 lg:col-span-2">
           {error}
         </p>
       )}
 
       {status && (
-        <section className="rounded-lg border border-zinc-200 bg-white p-4">
+        <section className="rounded-lg border border-zinc-200 bg-white p-4 lg:col-span-2">
           <h2 className="text-sm font-semibold uppercase tracking-wide text-zinc-500">
             Status
           </h2>
@@ -87,19 +92,16 @@ export default function SettingsPage() {
         </section>
       )}
 
-      <LambdaKeyForm onSaved={refresh} />
-      <GcpConfigForm onSaved={refresh} />
-      <S3KeysForm onSaved={refresh} />
-
-      <ConnectAgentPanel envPath={status?.env_path} />
-
-      <PrincipalsPanel />
-
-      <PolicyCard />
-
-      <PolicySettings />
-
-      <section className="rounded-lg border border-zinc-200 bg-white p-4 text-sm text-zinc-600">
+      {/* Two PACKED column stacks, not grid auto-placement: placement
+          pairs cards by row, so a short card beside a tall one left a hole
+          beneath it. Each stack flows tightly; reading order is the left
+          column then the right, which suits settings. */}
+      <div className="space-y-6">
+        <LambdaKeyForm onSaved={refresh} />
+        <S3KeysForm onSaved={refresh} />
+        <PrincipalsPanel />
+        <PolicySettings />
+        <section className="rounded-lg border border-zinc-200 bg-white p-4 text-sm text-zinc-600">
         <h2 className="text-sm font-semibold uppercase tracking-wide text-zinc-500">
           Credits and billing
         </h2>
@@ -119,8 +121,13 @@ export default function SettingsPage() {
           .
         </p>
       </section>
+      </div>
 
-      <section className="rounded-lg border border-zinc-200 bg-white p-4 text-sm text-zinc-600">
+      <div className="space-y-6">
+        <GcpConfigForm onSaved={refresh} />
+        <ConnectAgentPanel envPath={status?.env_path} />
+        <PolicyCard />
+        <section className="rounded-lg border border-zinc-200 bg-white p-4 text-sm text-zinc-600">
         <h2 className="text-sm font-semibold uppercase tracking-wide text-zinc-500">
           Where do these come from?
         </h2>
@@ -140,6 +147,7 @@ export default function SettingsPage() {
           </li>
         </ol>
       </section>
+      </div>
     </div>
   );
 }

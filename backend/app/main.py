@@ -743,6 +743,9 @@ def create_app(
     from pathlib import Path as _P
     from .worklog import Worklog
     worklog = Worklog(_P(settings.db_path).with_name("worklog.md"), prefs)
+    # Instance lifetimes are work too (Phase 97): the orchestrator writes
+    # one entry per launch when it settles.
+    orchestrator.worklog = worklog
     dispatcher = Dispatcher(
         settings, orchestrator, queue, templates, db, lambda_client,
         image_checker=image_checker, notifier=notifier, worklog=worklog,

@@ -5973,3 +5973,35 @@ path warns on whichever ceiling lands sooner, named.
 Launch-time only for now: the per-instance edit route still edits only the
 absolute ceiling. Deliberate scope cut, noted here so it is a decision rather
 than an oversight.
+
+## 2026-08-17 — Phase 97, parts 2-3: lifetimes reach the log, and Settings uses its page
+
+**Instance-lifetime worklog entries.** get_work_log answered "what happened on
+this account" with jobs and autopilot runs only, so days of raw GPU sessions —
+launches, notes, durations, costs, terminations — left no trace, and "what are
+these A100s?" became a whodunit. Every launch that settles now writes one entry
+from data already held: purpose (or "(none stated)"), launcher (or
+"unattributed"), active and total time, a cost upper bound carrying spend.py's
+own disclaimer, and the REASON it ended — threaded from the sweep, so an idle
+reap logs "idle: idle 1811s (limit 1800s)" and the reconcile path logs
+"terminated outside Manifold". Best-effort by construction: a log entry must
+never be able to break a termination, and unknowable durations are omitted,
+never zeroed. Fixing the reason plumbing surfaced five tests asserting
+terminate()'s kwargs EXACTLY (`== {"force": False}`); they now assert the claim
+they guard — force is False, never unattended — instead of an incidental dict
+shape.
+
+**The Settings page.** Every card lived in a 672px column with no mx-auto —
+left-hugging inside the centered 1104px layout, dead space growing with the
+window. Now: the Status card spans the full container; everything below flows
+in two PACKED column stacks. Not grid auto-placement — the first attempt showed
+placement pairing a short card with a tall one and leaving a hole beneath it
+(screenshotted, rejected) — two space-y flows pack each column tightly, credentials
+entry down the left, the big reference panels down the right, single column
+again on narrow windows. Verified by screenshot against the mock rig, not by
+assumption.
+
+**Process note, earned twice tonight:** two concurrent `uv run` invocations
+against the same project can deadlock on the environment lock — a 4-minute
+suite sat wedged for 1h40m while the visual rig's mock backend held uv's
+attention. Run the rig or the suite, not both.

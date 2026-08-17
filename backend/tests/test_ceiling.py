@@ -158,7 +158,7 @@ async def test_ceiling_fires_from_launched_at_not_from_activity(harness):
                 max_lifetime=CEILING, idle_for=1.0)
     await harness.dispatcher._check_idle()
     assert harness.terminated() == ["i-busy"]
-    assert harness.calls[0][1] == {"force": False}
+    assert harness.calls[0][1]["force"] is False   # never unattended force
     detail = harness.db._execute(
         "SELECT detail FROM audit_log WHERE action = 'ceiling_termination'"
     ).fetchone()["detail"]
@@ -177,7 +177,7 @@ async def test_ceiling_survives_a_restart(tmp_path, db):
 
     await reborn.dispatcher._check_idle()
     assert reborn.terminated() == ["i-restart"]
-    assert reborn.calls[0][1] == {"force": False}
+    assert reborn.calls[0][1]["force"] is False   # never unattended force
 
 
 # -- what the ceiling does and does not defer to --------------------------------
@@ -203,7 +203,7 @@ async def test_ceiling_fires_through_a_served_model(harness):
     await harness.dispatcher._check_idle()
 
     assert harness.terminated() == ["i-serving"]
-    assert harness.calls[0][1] == {"force": False}
+    assert harness.calls[0][1]["force"] is False   # never unattended force
     assert "ceiling_termination" in harness.audit()
     assert "idle_termination" not in harness.audit()
 
@@ -287,7 +287,7 @@ async def test_ceiling_overrides_keep_alive(harness):
                 max_lifetime=CEILING, keep_alive=True)
     await harness.dispatcher._check_idle()
     assert harness.terminated() == ["i-kept"]
-    assert harness.calls[0][1] == {"force": False}
+    assert harness.calls[0][1]["force"] is False   # never unattended force
 
 
 def test_keep_alive_audit_admits_the_ceiling_still_applies(harness):
@@ -323,7 +323,7 @@ async def test_ceiling_honours_a_blocked_termination(harness):
 
     await harness.dispatcher._check_idle()
 
-    assert harness.calls[0][1] == {"force": False}
+    assert harness.calls[0][1]["force"] is False   # never unattended force
     assert "i-blocked" in harness.orch.connections   # still up
     assert "ceiling_termination_blocked" in harness.audit()
 
@@ -414,7 +414,7 @@ async def test_orphan_repaired_row_fires_within_one_poll(harness):
 
     await harness.dispatcher._check_idle()
     assert harness.terminated() == ["i-orphan"]
-    assert harness.calls[0][1] == {"force": False}
+    assert harness.calls[0][1]["force"] is False   # never unattended force
 
 
 # -- one bad instance must not disable the loop ----------------------------------
@@ -433,7 +433,7 @@ async def test_a_provider_error_on_one_box_does_not_abandon_the_others(harness):
     await harness.dispatcher._check_idle()
 
     assert harness.terminated() == ["i-poison", "i-second"]
-    assert all(kwargs == {"force": False} for _, kwargs in harness.calls)
+    assert all(kwargs["force"] is False for _, kwargs in harness.calls)
 
 
 async def test_every_branch_terminates_with_force_false(tmp_path, db):
@@ -454,7 +454,8 @@ async def test_every_branch_terminates_with_force_false(tmp_path, db):
 
     assert sorted(harness.terminated()) == [
         "i-ceiling", "i-ceiling-keepalive", "i-ceiling-serving", "i-idle"]
-    assert [kwargs for _, kwargs in harness.calls] == [{"force": False}] * 4
+    assert all(kwargs["force"] is False for _, kwargs in harness.calls)
+    assert len(harness.calls) == 4
 
 
 # -- the warning ------------------------------------------------------------------

@@ -182,3 +182,73 @@ def test_a_too_short_active_ceiling_is_rejected_not_clamped(client):
     })
     assert resp.status_code == 400
     assert "max_active_seconds" in resp.json()["detail"]
+
+
+# -- Phase 97, part 2: instance lifetimes reach the worklog -------------------
+#
+# get_work_log answered "what happened on this account" with jobs and
+# autopilot runs only, so days of raw GPU sessions left no trace and "what
+# are these A100s?" became a whodunit. The data was already held.
+
+
+class _Log:
+    def __init__(self):
+        self.entries = []
+
+    def record(self, title, lines):
+        self.entries.append((title, lines))
+
+
+def test_a_terminated_instance_leaves_a_worklog_entry(client):
+    from tests.test_terminal import launch_connected
+    iid = launch_connected(client)
+    orch = client.app.state.orchestrator
+    log = _Log()
+    orch.worklog = log
+    orch.connections.pop(iid, None)     # test-harness loop artifact dodge
+
+    resp = client.delete(f"/instances/{iid}")
+    assert resp.status_code == 200
+
+    assert len(log.entries) == 1
+    title, lines = log.entries[0]
+    assert title == "instance session ended"
+    joined = "\n".join(lines)
+    assert iid[:12] in joined
+    assert "purpose: (none stated)" in joined
+    assert "ended: requested" in joined
+    assert "cost upper bound" in joined and "wall clock" in joined, (
+        "the cost line must carry spend.py's own disclaimer")
+
+
+def test_the_sweep_names_its_verdict_in_the_entry(tmp_path, db):
+    import asyncio
+
+    from tests.test_idle_matrix import Harness
+
+    async def run():
+        harness = Harness(tmp_path, db)
+        log = _Log()
+        # The harness stubs orchestrator.terminate, so drive the REAL
+        # terminate's worklog write indirectly: check the reason plumbing
+        # by calling _terminate_for and asserting the stub received it.
+        seen = {}
+
+        async def fake_terminate(instance_id, **kwargs):
+            seen.update(kwargs)
+            return {"instance_id": instance_id, "terminated": True}
+
+        harness.orch.terminate = fake_terminate
+        harness.add_instance("i-idle")
+        await harness.dispatcher._check_idle()
+        assert seen.get("reason", "").startswith("idle:"), seen
+
+    asyncio.run(run())
+
+
+def test_an_unknowable_duration_is_omitted_not_zeroed():
+    from app.orchestrator import _interval_seconds
+    assert _interval_seconds(None, "2026-08-17T00:00:00+00:00") is None
+    assert _interval_seconds("garbage", "2026-08-17T00:00:00+00:00") is None
+    assert _interval_seconds("2026-08-17T00:00:00+00:00",
+                             "2026-08-17T01:00:00+00:00") == 3600.0

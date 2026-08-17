@@ -2000,7 +2000,8 @@ class Dispatcher:
         self.db.record_audit("backend", f"{kind}_termination",
                              f"{instance_id} {detail}")
         try:
-            await self.orchestrator.terminate(instance_id, force=False)
+            await self.orchestrator.terminate(
+                instance_id, force=False, reason=f"{kind}: {detail}")
             self._blocked_retry.pop(instance_id, None)
         except TerminationBlocked as exc:
             # The rescue could not save everything. Leave the box up with the
