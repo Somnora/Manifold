@@ -11,7 +11,8 @@ import {
   type Template,
 } from "@/lib/api";
 import { usePolling } from "@/lib/usePolling";
-import { StatusBadge } from "@/components/Badge";
+import { Badge, StatusBadge } from "@/components/Badge";
+import { PollErrorBanner } from "@/components/PollErrorBanner";
 import { ParameterForm } from "@/components/ParameterForm";
 import { EstimateWidget } from "@/components/EstimateWidget";
 import { TemplateEditor } from "@/components/TemplateEditor";
@@ -68,7 +69,17 @@ export default function JobsPage() {
     filesystem: "",
   });
 
-  const { data: tasks, refresh } = usePolling(() => api.tasks(), 2000);
+  // error/stale are taken, not discarded: `(tasks ?? [])` renders "No active
+  // jobs." out of a request that never returned, which is a manufactured
+  // claim during exactly the outage where a wrong "nothing is running"
+  // costs money. See PollErrorBanner.
+  const {
+    data: tasks,
+    error: tasksError,
+    stale: tasksStale,
+    lastSuccess: tasksLastSuccess,
+    refresh,
+  } = usePolling(() => api.tasks(), 2000);
   // Connected instances, for the "Run on" picker (manual jobs, multi-GPU).
   const { data: instances } = usePolling(() => api.instances(), 5000);
   const connected = (instances ?? []).filter(
@@ -182,6 +193,19 @@ export default function JobsPage() {
   }
 
   async function clearHistory() {
+    // Confirmation is load-bearing, not politeness. This deletes task_logs
+    // AND the succeeded-task rows that db.task_durations() reads, so one
+    // click silently flips the EstimateWidget on this same page from
+    // "measured · N runs" back to "rough · no history yet". "Up to":
+    // finished jobs a queued job still depends on are spared.
+    if (
+      !window.confirm(
+        `Clear up to ${history.length} finished job(s)?\n\n` +
+          `This permanently deletes their logs, and the run history that ` +
+          `makes cost estimates "measured" rather than "rough".`,
+      )
+    )
+      return;
     setClearing(true);
     setError("");
     try {
@@ -196,6 +220,13 @@ export default function JobsPage() {
   }
 
   async function removeTask(id: string) {
+    if (
+      !window.confirm(
+        `Remove job ${id}?\n\nIts logs are permanently deleted, and if it ` +
+          `succeeded it no longer feeds the cost estimate for its template.`,
+      )
+    )
+      return;
     setError("");
     try {
       await api.deleteTask(id);
@@ -287,7 +318,11 @@ export default function JobsPage() {
                   </select>
                 </label>
               )}
-              {!auto.enabled && connected.length === 0 && (
+              {/* Gated on instances != null: before /instances has answered
+                  (or if it never does), "no instance is connected" is a
+                  guess - and one that steers toward renting a SECOND GPU
+                  while the first may be running fine. */}
+              {!auto.enabled && instances != null && connected.length === 0 && (
                 <p className="rounded border border-zinc-200 bg-zinc-100 px-3 py-2 text-xs text-zinc-500">
                   No instance is connected: this job will wait in the queue
                   until one is running (launch one on Instances), or turn on
@@ -417,7 +452,19 @@ export default function JobsPage() {
         </div>
       </section>
 
-      <section className="space-y-6">
+      <section className="min-w-0 space-y-6">
+        <PollErrorBanner
+          error={tasksError}
+          stale={tasksStale}
+          lastSuccess={tasksLastSuccess}
+          what="job list"
+        />
+        {/* Stale = the poll is failing but old data exists: grey it and block
+            interaction, same as the home page's instance cards, so a
+            snapshot cannot be cancelled/removed as if it were live. */}
+        <div
+          className={`space-y-6 ${tasksStale ? "pointer-events-none opacity-40" : ""}`}
+        >
         <div>
           <h2 className="mb-3 text-sm font-semibold uppercase tracking-wide text-zinc-500">
             Active {active.length > 0 && `(${active.length})`}
@@ -431,7 +478,9 @@ export default function JobsPage() {
                 onCancel={cancelTask}
               />
             ))}
-            {active.length === 0 && (
+            {/* "No active jobs." only once the list has actually loaded:
+                before that it is not a fact, it is a hope. */}
+            {active.length === 0 && tasks != null && (
               <p className="rounded-lg border border-dashed border-zinc-300 p-6 text-center text-sm text-zinc-500">
                 No active jobs.
               </p>
@@ -463,12 +512,13 @@ export default function JobsPage() {
                 onCancel={cancelTask}
               />
             ))}
-            {history.length === 0 && (
+            {history.length === 0 && tasks != null && (
               <p className="rounded-lg border border-dashed border-zinc-300 p-6 text-center text-sm text-zinc-500">
                 No finished jobs yet.
               </p>
             )}
           </div>
+        </div>
         </div>
       </section>
     </div>
@@ -487,63 +537,26 @@ function TaskCard({
   onCancel: (id: string) => void;
 }) {
   const [showLogs, setShowLogs] = useState(false);
-  const [lines, setLines] = useState<string[]>([]);
   const [failTail, setFailTail] = useState<string[] | null>(null);
-  // null until the first readiness probe returns; only meaningful for a
-  // running serve job (see the effect below).
-  const [readiness, setReadiness] = useState<{
-    ready: boolean;
-    detail: string;
-  } | null>(null);
-  const { openModelShell } = useTerminalDock();
 
-  // A running serve job is reachable at the local OpenAI proxy; this
-  // opens a local shell whose env is already pointed at it, so any
-  // OpenAI-compatible CLI (aider, opencode, ...) talks to the served
-  // model with zero setup.
+  // A running serve job is reachable at the local OpenAI proxy; ServeStatus
+  // (below) probes readiness and renders the chip + terminal button.
   const servedModel =
     task.status === "running" &&
     (task.template === "vllm-serve" || task.template === "sglang-serve") &&
     typeof task.parameters?.model_id === "string"
       ? (task.parameters.model_id as string)
       : "";
-
-  // "running" only means the container is up; the model API answers a few
-  // minutes later, once the weights finish downloading and loading. Probe
-  // /v1/models (backend-cached) so the chip and the terminal button reflect
-  // when the CLI will actually connect instead of erroring.
   const instanceId = task.instance_id;
-  useEffect(() => {
-    if (!servedModel || !instanceId) {
-      setReadiness(null);
-      return;
-    }
-    let cancelled = false;
-    const probe = () =>
-      api
-        .modelStatus(instanceId)
-        .then((s) => {
-          if (cancelled) return;
-          // The endpoint reports the ONE serving task on the instance; only
-          // trust its verdict when it is reporting on THIS task's card.
-          const mine = s.serving && s.task_id === task.id;
-          setReadiness({
-            ready: mine && s.ready,
-            detail: mine ? s.status_detail ?? "" : "",
-          });
-        })
-        .catch(() => {
-          if (!cancelled) setReadiness((r) => r ?? { ready: false, detail: "" });
-        });
-    probe();
-    const id = setInterval(probe, 5000);
-    return () => {
-      cancelled = true;
-      clearInterval(id);
-    };
-  }, [servedModel, instanceId, task.id]);
 
-  const modelReady = !!readiness?.ready;
+  // Stopping a job on purpose is not a failure. The backend deliberately
+  // writes error="cancelled by user" so the card would NOT show "a baffling
+  // container exited 137" (dispatcher.py) - but its completion funnel still
+  // settles the row as status="failed" with the container's real exit code,
+  // so without this gate a click on Stop produced a red failed badge, a red
+  // error line, an auto-opened post-mortem, and "exit 137".
+  const wasCancelled =
+    task.status === "failed" && task.error === "cancelled by user";
 
   const auto = task.auto_manage;
   const lc = task.lifecycle;
@@ -558,10 +571,10 @@ function TaskCard({
     : task.status === "queued" || task.status === "running";
 
   // A failed job must show WHY inline, not just "exit -1": pull the last 10
-  // lines of its retained log automatically. The full "Logs" button still
-  // shows everything.
+  // lines of its retained log automatically. Not for a cancel - the user
+  // stopped it; there is no mystery to post-mortem.
   useEffect(() => {
-    if (task.status !== "failed") return;
+    if (task.status !== "failed" || task.error === "cancelled by user") return;
     let cancelled = false;
     api
       .taskLogs(task.id, 10)
@@ -574,38 +587,23 @@ function TaskCard({
     return () => {
       cancelled = true;
     };
-  }, [task.id, task.status]);
-
-  useEffect(() => {
-    if (!showLogs) return;
-    let cancelled = false;
-    // Tail the last 400 lines: a served-model job emits tens of thousands,
-    // and this refetches every 1.5s while running.
-    const load = () =>
-      api
-        .taskLogs(task.id, 400)
-        .then((l) => {
-          if (!cancelled) setLines(l.map((x) => x.line));
-        })
-        .catch(() => {});
-    load();
-    const id =
-      task.status === "running" || task.status === "queued"
-        ? setInterval(load, 1500)
-        : undefined;
-    return () => {
-      cancelled = true;
-      if (id) clearInterval(id);
-    };
-  }, [showLogs, task.id, task.status]);
+  }, [task.id, task.status, task.error]);
 
   const finished = task.status !== "running" && task.status !== "queued";
 
   return (
     <div className="rounded-lg border border-zinc-200 bg-white p-4">
-      <div className="flex items-center justify-between gap-3">
-        <div className="flex items-center gap-2">
-          <StatusBadge status={task.status} />
+      {/* flex-wrap + min-w-0/shrink-0: this row packs badges, id, cost,
+          buttons - wider than the column at every real window size. Without
+          wrap the labels broke mid-word (the pattern to copy is the run
+          card header on the Autopilot page). */}
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="flex min-w-0 flex-wrap items-center gap-2">
+          {wasCancelled ? (
+            <Badge label="cancelled" tone="zinc" />
+          ) : (
+            <StatusBadge status={task.status} />
+          )}
           {auto && (
             <span
               className="rounded bg-sky-100 px-1.5 py-0.5 text-[11px] font-medium text-sky-800"
@@ -625,7 +623,7 @@ function TaskCard({
             </span>
           )}
         </div>
-        <div className="flex items-center gap-3 text-xs text-zinc-500">
+        <div className="flex shrink-0 flex-wrap items-center gap-3 text-xs text-zinc-500">
           {finished && task.runtime_seconds !== null && (
             <span
               className="font-mono text-zinc-400"
@@ -640,7 +638,10 @@ function TaskCard({
                 ` · $${(task.actual_cost_cents / 100).toFixed(2)}`}
             </span>
           )}
-          {task.exit_code !== null && finished && (
+          {/* No exit code on a cancel: 137 is just what SIGKILL looks like,
+              and rendering it red re-frames the user's own click as a
+              crash. The code is still in Logs for anyone who wants it. */}
+          {task.exit_code !== null && finished && !wasCancelled && (
             <span
               className={`font-mono ${
                 task.exit_code === 0 ? "text-zinc-400" : "text-red-600"
@@ -651,48 +652,12 @@ function TaskCard({
             </span>
           )}
           <span>{formatDate(task.created_at)}</span>
-          {servedModel && (
-            <span
-              className={`flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] font-medium ${
-                modelReady
-                  ? "bg-emerald-100 text-emerald-800"
-                  : "bg-amber-100 text-amber-800"
-              }`}
-              title={
-                modelReady
-                  ? `${servedModel} is answering. The terminal button and in-instance chat are wired to it.`
-                  : `${servedModel} is still starting on the GPU (downloading and loading the weights). The terminal button unlocks once it answers.${
-                      readiness?.detail ? ` Last probe: ${readiness.detail}.` : ""
-                    }`
-              }
-            >
-              <span
-                className={`h-1.5 w-1.5 rounded-full ${
-                  modelReady
-                    ? "bg-emerald-500"
-                    : "bg-amber-500 motion-safe:animate-pulse"
-                }`}
-              />
-              {modelReady ? "model ready" : "model loading"}
-            </span>
-          )}
-          {servedModel && (
-            <button
-              onClick={() => modelReady && openModelShell(servedModel)}
-              disabled={!modelReady}
-              title={
-                modelReady
-                  ? `Open a local shell wired to ${servedModel}: OPENAI_BASE_URL points at the proxy, so any OpenAI-compatible CLI talks to this model`
-                  : `${servedModel} is still loading. This unlocks once the model answers, so the CLI will not error the moment it connects.`
-              }
-              className={`rounded border px-2 py-0.5 ${
-                modelReady
-                  ? "border-teal-300 text-teal-700 hover:bg-teal-50"
-                  : "cursor-not-allowed border-zinc-200 text-zinc-400"
-              }`}
-            >
-              Open in terminal
-            </button>
+          {servedModel && instanceId && (
+            <ServeStatus
+              model={servedModel}
+              instanceId={instanceId}
+              taskId={task.id}
+            />
           )}
           <button
             onClick={() => setShowLogs((s) => !s)}
@@ -753,7 +718,8 @@ function TaskCard({
       )}
 
       {Object.keys(task.parameters).length > 0 && (
-        <p className="mt-1 font-mono text-xs text-zinc-500">
+        /* break-all: model ids and paths have no spaces to wrap at. */
+        <p className="mt-1 break-all font-mono text-xs text-zinc-500">
           {Object.entries(task.parameters)
             .map(([k, v]) => `${k}=${v}`)
             .join("  ")}
@@ -761,16 +727,19 @@ function TaskCard({
       )}
       {task.error && (
         /* A skipped job's "error" is an explanation, not a failure of this
-           job: render it calm, not red. The red belongs on the parent. */
+           job: render it calm, not red. The red belongs on the parent.
+           Same for a cancel: the user did it; red would call it a fault. */
         <p
           className={`mt-2 text-xs ${
-            task.status === "skipped" ? "text-zinc-500" : "text-red-700"
+            task.status === "skipped" || wasCancelled
+              ? "text-zinc-500"
+              : "text-red-700"
           }`}
         >
           {task.error}
         </p>
       )}
-      {task.status === "failed" && failTail !== null && (
+      {task.status === "failed" && !wasCancelled && failTail !== null && (
         <div className="mt-2">
           <p className="mb-1 text-[11px] font-medium uppercase tracking-wide text-zinc-400">
             Last log lines
@@ -794,12 +763,107 @@ function TaskCard({
       )}
 
       {showLogs && (
-        /* pre-wrap + break-words: long docker/pip lines wrap instead of
-           forcing the whole card into horizontal scroll; height stays capped. */
-        <pre className="mt-3 max-h-72 overflow-y-auto whitespace-pre-wrap break-words rounded bg-zinc-950 p-3 font-mono text-xs leading-relaxed text-zinc-800">
-          {lines.length > 0 ? lines.join("\n") : "(no output yet)"}
-        </pre>
+        <TaskLogs
+          taskId={task.id}
+          live={task.status === "running" || task.status === "queued"}
+        />
       )}
     </div>
+  );
+}
+
+// The log tail, as its own component so it only exists while the panel is
+// open. This replaces a raw setInterval(load, 1500) with no in-flight guard
+// and no document.hidden check - the exact pattern usePolling was written
+// to end (a 400-line payload every 1.5s piling up behind a 30s timeout is
+// the freeze recipe). Mounting on expand also gives us usePolling's
+// immediate first tick, so logs appear at once rather than an interval
+// later. A finished job still gets that first fetch; the absurd interval
+// just never fires meaningfully again.
+function TaskLogs({ taskId, live }: { taskId: string; live: boolean }) {
+  const { data, error } = usePolling(
+    () => api.taskLogs(taskId, 400),
+    live ? 1500 : 3_600_000,
+  );
+  const lines = data === null ? null : data.map((x) => x.line);
+  return (
+    /* pre-wrap + break-words: long docker/pip lines wrap instead of
+       forcing the whole card into horizontal scroll; height stays capped. */
+    <pre className="mt-3 max-h-72 overflow-y-auto whitespace-pre-wrap break-words rounded bg-zinc-950 p-3 font-mono text-xs leading-relaxed text-zinc-800">
+      {lines === null
+        ? // Not "(no output yet)": that is a claim the job produced nothing,
+          // and before the first fetch lands (or if it fails) we do not know.
+          error
+          ? `(logs unavailable: ${error})`
+          : "(loading logs...)"
+        : lines.length > 0
+          ? lines.join("\n")
+          : "(no output yet)"}
+    </pre>
+  );
+}
+
+// Readiness chip + "Open in terminal" for a running serve job. Its own
+// component for the same reason as TaskLogs: it polls, so it goes through
+// usePolling, and it only exists while there is a served model to probe.
+// "running" only means the container is up; the model API answers minutes
+// later, once the weights finish downloading and loading.
+function ServeStatus({
+  model,
+  instanceId,
+  taskId,
+}: {
+  model: string;
+  instanceId: string;
+  taskId: string;
+}) {
+  const { openModelShell } = useTerminalDock();
+  const { data } = usePolling(() => api.modelStatus(instanceId), 5000);
+  // The endpoint reports the ONE serving task on the instance; only trust
+  // its verdict when it is reporting on THIS task's card. A failed probe
+  // (data null) reads as "loading", never as "ready".
+  const mine = data != null && data.serving && data.task_id === taskId;
+  const ready = mine && data.ready;
+  const detail = (mine && data.status_detail) || "";
+  return (
+    <>
+      <span
+        className={`flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] font-medium ${
+          ready
+            ? "bg-emerald-100 text-emerald-800"
+            : "bg-amber-100 text-amber-800"
+        }`}
+        title={
+          ready
+            ? `${model} is answering. The terminal button and in-instance chat are wired to it.`
+            : `${model} is still starting on the GPU (downloading and loading the weights). The terminal button unlocks once it answers.${
+                detail ? ` Last probe: ${detail}.` : ""
+              }`
+        }
+      >
+        <span
+          className={`h-1.5 w-1.5 rounded-full ${
+            ready ? "bg-emerald-500" : "bg-amber-500 motion-safe:animate-pulse"
+          }`}
+        />
+        {ready ? "model ready" : "model loading"}
+      </span>
+      <button
+        onClick={() => ready && openModelShell(model)}
+        disabled={!ready}
+        title={
+          ready
+            ? `Open a local shell wired to ${model}: OPENAI_BASE_URL points at the proxy, so any OpenAI-compatible CLI talks to this model`
+            : `${model} is still loading. This unlocks once the model answers, so the CLI will not error the moment it connects.`
+        }
+        className={`rounded border px-2 py-0.5 ${
+          ready
+            ? "border-teal-300 text-teal-700 hover:bg-teal-50"
+            : "cursor-not-allowed border-zinc-200 text-zinc-400"
+        }`}
+      >
+        Open in terminal
+      </button>
+    </>
   );
 }

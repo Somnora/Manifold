@@ -10,6 +10,7 @@ import {
   type GateableAction,
 } from "@/lib/api";
 import { ApprovalsPanel } from "@/components/ApprovalsPanel";
+import { PollErrorBanner } from "@/components/PollErrorBanner";
 import { usePolling } from "@/lib/usePolling";
 import { Badge, StatusBadge } from "@/components/Badge";
 import { formatDate } from "@/lib/format";
@@ -70,10 +71,21 @@ export default function AutopilotPage() {
     }
   }
 
-  const { data: runs, refresh } = usePolling(() => api.autopilotRuns(), 2000);
+  // error/stale taken, not discarded: `(runs ?? [])` renders "No runs yet."
+  // out of a request that never returned. See PollErrorBanner.
+  const {
+    data: runs,
+    error: runsError,
+    stale: runsStale,
+    lastSuccess: runsLastSuccess,
+    refresh,
+  } = usePolling(() => api.autopilotRuns(), 2000);
   // Every model that can drive Manifold: served on a GPU instance, running
   // locally (Ollama/LM Studio), or a frontier API with a key in Settings.
-  const { data: brainList } = usePolling(() => api.brains(), 5000);
+  const { data: brainList, error: brainsError } = usePolling(
+    () => api.brains(),
+    5000,
+  );
   const brains: Brain[] = brainList ?? [];
 
   useEffect(() => {
@@ -126,7 +138,17 @@ export default function AutopilotPage() {
         <h2 className="text-sm font-semibold uppercase tracking-wide text-zinc-500">
           Start a run
         </h2>
-        {brains.length === 0 ? (
+        {brainList == null ? (
+          /* Before /brains has answered - or when it cannot - "No brain
+             available" plus the setup tutorial is a manufactured claim.
+             During an outage it told the user to go configure things that
+             may be configured perfectly. */
+          <p className="mt-3 text-sm text-zinc-500">
+            {brainsError
+              ? `Brain list unavailable (${brainsError}). Runs cannot start until the backend answers.`
+              : "Checking for available brains..."}
+          </p>
+        ) : brains.length === 0 ? (
           <p className="mt-3 text-sm text-zinc-500">
             No brain available. A brain can be: a model served on a running
             instance (queue{" "}
@@ -283,11 +305,24 @@ export default function AutopilotPage() {
         <h2 className="mb-3 text-sm font-semibold uppercase tracking-wide text-zinc-500">
           Runs
         </h2>
-        <div className="space-y-3">
+        {runsError && (
+          <div className="mb-3">
+            <PollErrorBanner
+              error={runsError}
+              stale={runsStale}
+              lastSuccess={runsLastSuccess}
+              what="run list"
+            />
+          </div>
+        )}
+        <div
+          className={`space-y-3 ${runsStale ? "pointer-events-none opacity-40" : ""}`}
+        >
           {(runs ?? []).map((run) => (
             <RunCard key={run.id} run={run} onChanged={refresh} />
           ))}
-          {(runs ?? []).length === 0 && (
+          {/* Only a fact once the list has loaded. */}
+          {runs != null && runs.length === 0 && (
             <p className="rounded-lg border border-dashed border-zinc-300 p-6 text-center text-sm text-zinc-500">
               No runs yet.
             </p>
@@ -357,25 +392,6 @@ export default function AutopilotPage() {
 
 function RunCard({ run, onChanged }: { run: AgentRun; onChanged: () => void }) {
   const [open, setOpen] = useState(false);
-  const [steps, setSteps] = useState<AgentStep[]>([]);
-
-  useEffect(() => {
-    if (!open) return;
-    let cancelled = false;
-    const load = () =>
-      api
-        .autopilotRun(run.id)
-        .then((r) => {
-          if (!cancelled) setSteps(r.steps);
-        })
-        .catch(() => {});
-    load();
-    const id = run.status === "running" ? setInterval(load, 1500) : undefined;
-    return () => {
-      cancelled = true;
-      if (id) clearInterval(id);
-    };
-  }, [open, run.id, run.status]);
 
   async function cancel() {
     try {
@@ -443,52 +459,87 @@ function RunCard({ run, onChanged }: { run: AgentRun; onChanged: () => void }) {
         <span className="font-mono">{run.brain_instance_id}</span>
       </p>
       {run.summary && (
-        <p className="mt-2 rounded bg-emerald-50 px-3 py-2 text-sm text-emerald-900">
+        /* The success tint only for a success that DID something. A refusal
+           ("No GPU launched; no spend incurred. Reason: ...") used to render
+           in the same green as a run that launched a GPU and cleaned up -
+           the closing summary wearing a verdict the run did not earn. And
+           pre-wrap: summaries arrive with real newlines, which collapsed
+           into a single wall of text. */
+        <p
+          className={`mt-2 whitespace-pre-wrap rounded px-3 py-2 text-sm ${
+            run.status === "succeeded" && run.effect !== "no_effect"
+              ? "bg-emerald-50 text-emerald-900"
+              : "bg-zinc-100 text-zinc-700"
+          }`}
+        >
           {run.summary}
         </p>
       )}
       {run.error && (
-        <p className="mt-2 rounded bg-red-50 px-3 py-2 text-xs text-red-800">
+        <p className="mt-2 whitespace-pre-wrap rounded bg-red-50 px-3 py-2 text-xs text-red-800">
           {run.error}
         </p>
       )}
 
-      {open && (
-        <ol className="mt-3 space-y-2">
-          {steps.map((s) => (
-            <li
-              key={s.seq}
-              className="rounded border border-zinc-100 bg-zinc-50 p-2 text-xs"
-            >
-              <div className="flex items-center gap-2">
-                <span className="font-mono text-zinc-400">#{s.seq}</span>
-                <span className="font-mono font-medium text-zinc-800">
-                  {s.action}
-                </span>
-                {"error" in s.result && (
-                  <span className="rounded bg-red-100 px-1.5 text-red-800">
-                    refused
-                  </span>
-                )}
-              </div>
-              {s.thought && (
-                <p className="mt-1 italic text-zinc-500">{s.thought}</p>
-              )}
-              {Object.keys(s.args).length > 0 && (
-                <p className="mt-1 break-all font-mono text-zinc-600">
-                  {JSON.stringify(s.args)}
-                </p>
-              )}
-              <p className="mt-1 max-h-24 overflow-y-auto break-all font-mono text-zinc-500">
-                → {JSON.stringify(s.result).slice(0, 600)}
-              </p>
-            </li>
-          ))}
-          {steps.length === 0 && (
-            <p className="text-xs text-zinc-400">No steps yet.</p>
-          )}
-        </ol>
-      )}
+      {open && <RunSteps runId={run.id} live={run.status === "running"} />}
     </div>
+  );
+}
+
+// The step list, mounted only while expanded. Replaces a raw
+// setInterval(load, 1500) with no in-flight guard and no document.hidden
+// check - and /autopilot/runs/{id} returns the ENTIRE untruncated step
+// history each time, growing monotonically, which made it the heaviest
+// unguarded poll in the app. Mounting on expand gives usePolling's
+// immediate first tick, so a finished run's steps appear at once instead
+// of "No steps yet." for a full interval.
+function RunSteps({ runId, live }: { runId: string; live: boolean }) {
+  const { data, error } = usePolling(
+    () => api.autopilotRun(runId),
+    live ? 1500 : 3_600_000,
+  );
+  const steps: AgentStep[] | null = data?.steps ?? null;
+  if (steps === null) {
+    return (
+      <p className="mt-3 text-xs text-zinc-400">
+        {error ? `Steps unavailable (${error}).` : "Loading steps..."}
+      </p>
+    );
+  }
+  return (
+    <ol className="mt-3 space-y-2">
+      {steps.map((s) => (
+        <li
+          key={s.seq}
+          className="rounded border border-zinc-100 bg-zinc-50 p-2 text-xs"
+        >
+          <div className="flex items-center gap-2">
+            <span className="font-mono text-zinc-400">#{s.seq}</span>
+            <span className="font-mono font-medium text-zinc-800">
+              {s.action}
+            </span>
+            {"error" in s.result && (
+              <span className="rounded bg-red-100 px-1.5 text-red-800">
+                refused
+              </span>
+            )}
+          </div>
+          {s.thought && (
+            <p className="mt-1 italic text-zinc-500">{s.thought}</p>
+          )}
+          {Object.keys(s.args).length > 0 && (
+            <p className="mt-1 break-all font-mono text-zinc-600">
+              {JSON.stringify(s.args)}
+            </p>
+          )}
+          <p className="mt-1 max-h-24 overflow-y-auto break-all font-mono text-zinc-500">
+            → {JSON.stringify(s.result).slice(0, 600)}
+          </p>
+        </li>
+      ))}
+      {steps.length === 0 && (
+        <p className="text-xs text-zinc-400">No steps yet.</p>
+      )}
+    </ol>
   );
 }

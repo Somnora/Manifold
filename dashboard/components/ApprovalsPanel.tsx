@@ -1,6 +1,7 @@
 "use client";
 
-import { api, type Approval } from "@/lib/api";
+import { useState } from "react";
+import { api, ApiError, type Approval } from "@/lib/api";
 import { usePolling } from "@/lib/usePolling";
 
 // Actions an approval-gated autopilot run is waiting on. Each card is one
@@ -13,15 +14,29 @@ import { usePolling } from "@/lib/usePolling";
 // billing. (That is why Settings does not gate shutdowns by default.)
 export function ApprovalsPanel() {
   const { data, refresh } = usePolling(() => api.approvals(), 2000);
+  const [decideError, setDecideError] = useState("");
   const pending = data?.approvals ?? [];
   const timeout = data?.timeout_seconds ?? 600;
   if (pending.length === 0) return null;
 
   async function decide(id: string, approve: boolean) {
+    setDecideError("");
     try {
       await api.decideApproval(id, approve);
-    } catch {
-      /* already decided or expired - the refresh clears it */
+    } catch (e) {
+      // Only a 4xx means "already decided or expired" - benign, the refresh
+      // clears the card. A network failure or a 500 used to be swallowed by
+      // the same catch, so the click looked accepted while the action was
+      // STILL PENDING and its countdown ran toward auto-deny.
+      if (e instanceof ApiError && e.status >= 400 && e.status < 500) {
+        /* the refresh below clears it */
+      } else {
+        setDecideError(
+          `${approve ? "Approve" : "Deny"} did not reach the backend (${
+            e instanceof Error ? e.message : String(e)
+          }). The action is STILL PENDING - retry before the countdown expires.`,
+        );
+      }
     }
     refresh();
   }
@@ -31,6 +46,11 @@ export function ApprovalsPanel() {
       <h2 className="text-sm font-semibold uppercase tracking-wide text-amber-800">
         Waiting for your approval ({pending.length})
       </h2>
+      {decideError && (
+        <p className="mt-2 rounded border border-red-200 bg-red-50 px-2 py-1 text-xs font-medium text-red-800">
+          {decideError}
+        </p>
+      )}
       <div className="mt-3 space-y-2">
         {pending.map((a: Approval) => (
           <div

@@ -90,7 +90,13 @@ export function ParameterForm({
     "w-full rounded border border-zinc-300 bg-white px-2.5 py-1.5 text-sm transition-colors focus:border-teal-500 focus:ring-1 focus:ring-teal-500";
 
   return (
-    <div className="grid gap-6 lg:grid-cols-2">
+    /* Single column on purpose. This form lives in the Jobs page's 460px
+       left track; lg:grid-cols-2 split that into two ~197px halves, leaving
+       the rendered-config <pre> about 171px wide - ~23 monospace characters,
+       with pre's no-wrap and no scroll affordance. "image:
+       vllm/vllm-openai:v0.6.3" is 33. The preview exists to be read before
+       money is spent, and it was unreadable at every real window size. */
+    <div className="grid gap-6">
       <form onSubmit={handleSubmit} className="space-y-4">
         {template.parameters.map((p) => (
           <label key={p.name} className="block text-xs font-medium text-zinc-600">

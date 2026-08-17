@@ -30,6 +30,12 @@ export default function StoragePage() {
   // Unreachable is UNKNOWN, not empty: only trust the file list (and the
   // "no files" / count copy) after a read that actually succeeded.
   const [readOk, setReadOk] = useState(false);
+  // Whether the FILESYSTEM list itself ever loaded. Without this, `readOk`
+  // starting false made the page open on "the backend or storage is
+  // unreachable" - a claim of an outage - on every load, and forever on a
+  // healthy account that simply has no filesystems yet (the file effect
+  // early-returns when nothing is selected, so readOk never flips).
+  const [fsLoaded, setFsLoaded] = useState<"ok" | "error" | null>(null);
   const [confirmKey, setConfirmKey] = useState<string | null>(null);
   // Filesystem deletion: destroys the whole volume, so the user proves
   // intent by typing the name back (the backend refuses without it).
@@ -42,9 +48,13 @@ export default function StoragePage() {
       .filesystems()
       .then((fs) => {
         setFilesystems(fs);
+        setFsLoaded("ok");
         if (fs.length > 0) setSelected((v) => v || fs[0].name);
       })
-      .catch((e) => setError(e.message));
+      .catch((e) => {
+        setFsLoaded("error");
+        setError(e.message);
+      });
     api
       .regions()
       .then((rs) => {
@@ -277,9 +287,14 @@ export default function StoragePage() {
         </p>
       )}
 
+      {/* overflow-x-auto, not overflow-hidden: a 120-character HF cache key
+          used to push the delete confirm's buttons clean off-screen - a
+          confirm that could not be cancelled. Greyed only when a read of a
+          SELECTED filesystem genuinely failed; it used to grey on first
+          paint and on an empty account, dressing normal states as broken. */}
       <div
-        className={`overflow-hidden rounded-lg border border-zinc-200 bg-white ${
-          !readOk && !loading ? "opacity-40" : ""
+        className={`overflow-x-auto rounded-lg border border-zinc-200 bg-white ${
+          selected && !readOk && !loading ? "opacity-40" : ""
         }`}
       >
         <table className="w-full text-sm">
@@ -294,7 +309,11 @@ export default function StoragePage() {
           <tbody className="divide-y divide-zinc-100">
             {files.map((f) => (
               <tr key={f.key}>
-                <td className="px-4 py-2 font-mono text-xs">{f.key}</td>
+                {/* break-all: S3 keys have no spaces; without it a long key
+                    is what shoved the row past the viewport. */}
+                <td className="break-all px-4 py-2 font-mono text-xs">
+                  {f.key}
+                </td>
                 <td className="px-4 py-2 whitespace-nowrap text-zinc-600">
                   {formatBytes(f.size_bytes)}
                 </td>
@@ -303,8 +322,15 @@ export default function StoragePage() {
                 </td>
                 <td className="px-4 py-2 text-right">
                   {confirmKey === f.key ? (
-                    <span className="inline-flex items-center gap-2">
-                      <span className="text-xs text-zinc-500">Delete?</span>
+                    /* Names what is destroyed. "Delete?" was the entire
+                       confirmation for a possibly-16GB checkpoint on a
+                       bucket with no versioning, while the whole-filesystem
+                       delete above demands the name typed back. */
+                    <span className="inline-flex flex-wrap items-center justify-end gap-2">
+                      <span className="break-all text-left text-xs text-zinc-600">
+                        Delete <span className="font-mono">{f.key}</span> (
+                        {formatBytes(f.size_bytes)})? Permanent, no undo.
+                      </span>
                       <button
                         onClick={() => deleteFile(f.key)}
                         className="rounded bg-red-600 px-2 py-0.5 text-xs font-medium text-zinc-900 hover:bg-red-500"
@@ -335,11 +361,20 @@ export default function StoragePage() {
                   colSpan={4}
                   className="px-4 py-8 text-center text-sm text-zinc-500"
                 >
-                  {!readOk
-                    ? "Can't read files right now: the backend or storage is unreachable, so this list is unknown (not necessarily empty)."
-                    : selected
-                      ? "No files match."
-                      : "No filesystems available."}
+                  {/* Four different situations that used to share one
+                      sentence - and the one they shared was "unreachable",
+                      shown on every first paint and on a healthy empty
+                      account. Loading, empty, and broken are different
+                      facts and only one is bad news. */}
+                  {fsLoaded === null
+                    ? "Loading filesystems..."
+                    : fsLoaded === "error"
+                      ? "Can't reach the backend: the filesystem list is unknown (not necessarily empty)."
+                      : filesystems.length === 0
+                        ? "No filesystems yet. Create one above — creation is free."
+                        : !readOk
+                          ? "Can't read files right now: the backend or storage is unreachable, so this list is unknown (not necessarily empty)."
+                          : "No files match."}
                 </td>
               </tr>
             )}
@@ -347,15 +382,19 @@ export default function StoragePage() {
         </table>
       </div>
 
-      {/* Count is a claim of fact: only make it after a successful read. */}
-      {readOk ? (
-        <p className="text-xs text-zinc-500">
-          {files.length} file{files.length === 1 ? "" : "s"},{" "}
-          {formatBytes(totalBytes)} total
-        </p>
-      ) : (
-        <p className="text-xs text-zinc-400">File count unavailable.</p>
-      )}
+      {/* Count is a claim of fact: only make it after a successful read,
+          and only when there is a filesystem to be counting. "File count
+          unavailable" on a fresh page implied a fault where there was
+          only an empty account. */}
+      {selected &&
+        (readOk ? (
+          <p className="text-xs text-zinc-500">
+            {files.length} file{files.length === 1 ? "" : "s"},{" "}
+            {formatBytes(totalBytes)} total
+          </p>
+        ) : (
+          <p className="text-xs text-zinc-400">File count unavailable.</p>
+        ))}
     </div>
   );
 }

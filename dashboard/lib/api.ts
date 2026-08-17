@@ -47,7 +47,14 @@ async function request<T>(
           "slow or unreachable.",
       );
     }
-    throw new ApiError(0, "Backend unreachable. Is it running on :8000?");
+    // Name the address it actually tried, not a hardcoded ":8000": with
+    // NEXT_PUBLIC_API_URL set, or served same-origin by the desktop app,
+    // this message pointed at a port nothing was using.
+    throw new ApiError(
+      0,
+      `Backend unreachable at ${API_BASE || window.location.origin}. ` +
+        "Is the Manifold app running?",
+    );
   } finally {
     clearTimeout(timer);
   }
@@ -1221,7 +1228,14 @@ export const api = {
             "connection is likely stalled.",
         );
       }
-      throw new ApiError(0, "Backend unreachable. Is it running on :8000?");
+      // Name the address it actually tried, not a hardcoded ":8000": with
+    // NEXT_PUBLIC_API_URL set, or served same-origin by the desktop app,
+    // this message pointed at a port nothing was using.
+    throw new ApiError(
+      0,
+      `Backend unreachable at ${API_BASE || window.location.origin}. ` +
+        "Is the Manifold app running?",
+    );
     } finally {
       clearTimeout(timer);
     }

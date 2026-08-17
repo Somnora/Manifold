@@ -5737,3 +5737,73 @@ Both were found by standing the thing up against a mock backend and looking at
 it, not by the tests — which is the same way the `busy: false` defect was found
 two hours earlier, and is becoming the pattern worth naming: these tests are good
 at proving the path they model and blind to the one the user takes.
+
+## 2026-08-17 — The pages stop asserting what they do not know
+
+**Decided:** Five fixes from an adversarially-verified audit of Jobs, Storage and
+Autopilot, chosen because each one removed a FALSE CLAIM rather than adding
+polish. Items that merely added information (instance names on job cards, unshown
+backend fields, the server-template detection) were deliberately held.
+
+**1. Outage honesty.** Jobs and Autopilot destructured only `data` from
+`usePolling`, discarding `error`/`stale` — so `(tasks ?? [])` rendered "No active
+jobs." and "No runs yet." out of a request that never returned, and Autopilot
+showed the full "No brain available" setup tutorial for a backend that was simply
+down. During the exact freeze this codebase spent Phase 93 fixing, the three
+pages the owner would check all said *nothing is happening* while instances
+billed. A shared `PollErrorBanner` now renders the same treatment the home page
+already had (banner + snapshot timestamp + greyed, non-interactive content), and
+every empty state is gated on `data != null`: "No active jobs." is only ever a
+loaded fact, never a default. Storage had the INVERSE bug — `readOk` starts false
+and only flips inside an effect that early-returns when nothing is selected, so a
+healthy account with zero filesystems claimed "the backend or storage is
+unreachable" forever, and every page load flashed it. A `fsLoaded` tri-state
+splits loading / unreachable / genuinely-empty / no-match into four sentences,
+because only one of them is bad news.
+
+**2. Ceremony proportional to damage.** "Clear history" fired with no
+confirmation and permanently deletes `task_logs` plus the succeeded-task rows
+that `db.task_durations()` reads — one click silently flipped the EstimateWidget
+on the same screen from "measured · N runs" to "rough · no history yet". The
+per-file Storage delete confirm was the single word "Delete?" for a
+possibly-16 GB checkpoint, while the whole-filesystem delete above it demands the
+name typed back. Both now name what is destroyed; neither is a ritual.
+
+**3. The last three raw `setInterval` loops.** The log tail (400 lines / 1.5s),
+the readiness probe (5s), and the autopilot step poll (1.5s, the whole
+untruncated step history each tick) — none with an in-flight guard or hidden-tab
+check, the exact class Phase 93 eliminated everywhere else. Each is now a child
+component that mounts only while relevant (logs open, run expanded, serve job
+running), so `usePolling`'s mount-time tick doubles as the immediate first fetch.
+That dodges both traps the naive conversions hit: wrapping the loader in a
+conditional wipes loaded lines every tick, and swapping the hook in place shows
+"No steps yet." for a full interval on expand.
+
+**4. Outcomes the product reported that did not happen.** `dispatcher.py` writes
+`error="cancelled by user"` precisely so a stop would not read as "a baffling
+container exited 137" — and `task_queue.mark_finished` then maps any non-empty
+error to `status="failed"`, keeping the container's real exit code. The author's
+stated intent, defeated one function later; the frontend now honours it (zinc
+`cancelled` badge, calm text, no exit code, no auto-opened post-mortem — the code
+stays in Logs). Autopilot rendered every closing summary in the success tint,
+including refusals ("No GPU launched; no spend incurred. Reason: …") — green now
+requires `succeeded` AND `effect !== "no_effect"`. And a failed log fetch left
+"(no output yet)" on screen, a confident claim the job produced nothing; unknown
+now reads as unknown. Fixing the messages also un-hardcoded the ":8000" in
+"Backend unreachable. Is it running on :8000?" — which this session watched name
+the wrong port while the real backend listened on :8099, in the middle of the
+new banner built to be trusted during outages.
+
+**5. Text that existed to be read and could not be.** The rendered-config
+preview — the thing you check before spending money — was 171px wide (~23
+monospace characters, `white-space: pre`, no scroll): the Jobs page's 460px left
+track, split again by the form's own `lg:grid-cols-2`. One deleted class; the
+preview now gets the full 418px. Long S3 keys pushed Storage's delete-confirm
+buttons off a viewport with `overflow-hidden` — a confirm that could not be
+cancelled. Job-card headers packed ~718px into 586 with no wrap.
+
+**Verified in a real browser, both directions:** with the mock backend up, the
+seeded job renders; killed mid-view, the banner + greyed snapshot appear and "No
+active jobs." does not; cold-loaded during the outage — the manufactured-claims
+case — Jobs, Autopilot and Storage all decline to invent an empty state. 15
+assertions, all of which fail against the previous code.
