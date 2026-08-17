@@ -326,6 +326,11 @@ class Dispatcher:
         # every few seconds. Each entry carries the sweep tick that wrote
         # it so a stale verdict can be recognised rather than trusted.
         self._activity: dict[str, dict] = {}
+        # Last "spared because the GPU was working" reason audited per
+        # instance, so a long job writes ONE row instead of one per poll,
+        # and writes a fresh one when the reason changes. Cleared when the
+        # box goes quiet, so a second busy spell is reported again.
+        self._gpu_busy_noted: dict[str, str] = {}
         # Instances whose idle auto-termination the user switched off; also
         # persisted on the launch row (see keep_alive_enabled).
         self._keep_alive_mem: set[str] = set()
@@ -406,6 +411,67 @@ class Dispatcher:
     def touch_activity(self, instance_id: str) -> None:
         """Record activity (job start/end, terminal traffic) on an instance."""
         self.last_activity[instance_id] = self._clock()
+
+    def _telemetry_says_busy(self, instance_id: str,
+                             window_seconds: float) -> str | None:
+        """Did this GPU do real work during the window we are calling idle?
+
+        Returns the reason to spare it, or None to let the sweep proceed.
+
+        WHY A WINDOW AND NOT THE LATEST SAMPLE. Utilization is instantaneous
+        and spiky: the box that provoked this read 100, 100, 0, 100, 100, 0
+        across six consecutive samples while serving. A single reading is
+        unreliable in BOTH directions, so the question is "did any sample in
+        this window show work", over exactly the period the sweep is about
+        to call idle.
+
+        WHY PEAK AND NOT MEAN. One busy card out of eight is a working box.
+        A mean would let seven idle cards vote a real job to death.
+
+        WHY VRAM IS NOT CONSULTED. A loaded model sitting at 0% is precisely
+        the abandoned server Phase 90 was written to reap - it holds 30GB
+        forever and answers nobody. Protecting on VRAM would undo that and
+        recreate the hour-long bill. Utilization is work; VRAM is only
+        residency.
+
+        WHAT THIS DOES NOT COVER, stated so nobody trusts it further than it
+        goes: a CPU-bound phase - CUDA extension builds, weights streaming
+        off NFS - shows little or no GPU utilization, so a long setup is NOT
+        protected by this. Neither is a box whose telemetry is broken or
+        whose sidecar never came up, where there are no samples at all. In
+        both cases the sweep behaves exactly as it did before. This only
+        ever ADDS protection on positive evidence of work; it never removes
+        any, and it is not a substitute for keep-alive or an idle timeout
+        that matches the job.
+        """
+        threshold = getattr(self.settings.idle, "busy_util_pct", 0)
+        if not threshold:
+            return None                      # switched off in config
+        since = self._iso_seconds_ago(window_seconds)
+        seen = self.db.peak_util_since(instance_id, since)
+        if not seen["samples"]:
+            # No evidence either way. Deliberately NOT treated as "idle":
+            # it is treated as unchanged, which is what the old behaviour
+            # already was. Saying so here so the silence is a decision.
+            return None
+        peak = seen["peak"] or 0
+        if peak < threshold:
+            return None
+        return (f"GPU reached {peak}% utilization in the last "
+                f"{window_seconds:.0f}s ({seen['samples']} sample(s)), so "
+                f"work is running here that Manifold cannot see the traffic "
+                f"for")
+
+    def _iso_seconds_ago(self, seconds: float) -> str:
+        """The wall-clock ISO timestamp `seconds` before now.
+
+        Uses real time, not self._clock: _clock is a monotonic test seam,
+        while telemetry rows are stamped with utcnow(). Comparing the two
+        would silently select nothing.
+        """
+        from datetime import datetime, timedelta, timezone
+        return (datetime.now(timezone.utc)
+                - timedelta(seconds=seconds)).isoformat()
 
     def _note_activity(self, instance_id: str, state: str, busy: bool | None,
                        reason: str) -> None:
@@ -1481,6 +1547,27 @@ class Dispatcher:
                             f"no jobs or terminal traffic for {quiet:.0f}s "
                             f"of a {timeout:.0f}s window")
                     continue
+                # LAST GATE. Manifold has seen no traffic for a full window,
+                # which is not the same as the box having done nothing - it
+                # only ever counted the traffic that came through Manifold.
+                # A model served over the user's own SSH tunnel, or a
+                # detached training run, drives a GPU flat out and touches
+                # nothing here. Ask the telemetry we are already collecting.
+                busy = self._telemetry_says_busy(instance_id, timeout)
+                if busy is not None:
+                    self._note_activity(
+                        instance_id, "gpu_busy", True, busy)
+                    # Restart the window from now: the box is working, and
+                    # the next pass should judge the NEXT quiet period, not
+                    # re-run this arithmetic on the same stale timestamp.
+                    self.touch_activity(instance_id)
+                    if self._gpu_busy_noted.get(instance_id) != busy:
+                        self._gpu_busy_noted[instance_id] = busy
+                        self.db.record_audit(
+                            "backend", "idle_deferred_gpu_busy",
+                            f"{instance_id}: {busy}")
+                    continue
+                self._gpu_busy_noted.pop(instance_id, None)
                 await self._terminate_for(
                     instance_id, "idle",
                     f"idle {now - last:.0f}s (limit {timeout:.0f}s)")
@@ -1716,6 +1803,7 @@ class Dispatcher:
         # answers "serving" would be a lie, and a blocked one is about to be
         # re-judged on the next pass anyway.
         self._activity.pop(instance_id, None)
+        self._gpu_busy_noted.pop(instance_id, None)
 
     # -- auto-manage lifecycle loop -----------------------------------------------------
 

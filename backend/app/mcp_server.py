@@ -365,6 +365,33 @@ async def terminate_instance(
 
 
 @mcp.tool()
+async def set_keep_alive(
+    instance_id: str, enabled: bool, note: str = ""
+) -> dict:
+    """Switch idle auto-termination OFF (enabled=true) or back on for one
+    running instance.
+
+    Use this before a long stretch where Manifold will see no traffic from
+    you — a detached training run, a model you serve over your own SSH
+    tunnel, anything you fire and then stop polling. Manifold counts only
+    the traffic that goes THROUGH it as activity, so a box working hard on
+    a channel it cannot see looks abandoned and is reaped at the idle
+    timeout. That has already destroyed a serving box and the run using it.
+
+    THIS COSTS MONEY IF YOU FORGET IT. A box with keep-alive on bills until
+    something else stops it, and the idle sweep is the thing that usually
+    would. Switch it back on (enabled=false) the moment the long stretch
+    ends, and prefer a max_lifetime_seconds ceiling at launch as the backstop
+    — the ceiling still applies with keep-alive on, and is the only guard
+    that does."""
+    return await _call(
+        "set_keep_alive", "POST", f"/instances/{instance_id}/keep-alive",
+        note=note, args={"instance_id": instance_id, "enabled": enabled},
+        body={"enabled": enabled},
+    )
+
+
+@mcp.tool()
 async def sync_outputs(instance_id: str, note: str = "") -> dict:
     """rsync the instance's ephemeral scratch to the persistent filesystem
     (ephemeral-backup/), over the managed SSH connection."""

@@ -131,6 +131,12 @@ class IdleSettings:
     # percentage: 90% of 30 days is three days of nagging, and 90% of 70
     # minutes is seven minutes of notice.
     ceiling_warning_seconds: float = 600.0
+    # Phase 94b: GPU utilization that counts as "this box is working",
+    # whatever Manifold can see of the traffic driving it. An idle card
+    # reports 0-2%, so 10 clears noise without needing the box to be
+    # saturated. Set to 0 to switch the telemetry check off entirely and
+    # go back to judging solely by Manifold-visible activity.
+    busy_util_pct: int = 10
 
 
 @dataclass(frozen=True)

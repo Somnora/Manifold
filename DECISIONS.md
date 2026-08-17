@@ -5453,3 +5453,92 @@ Proven both ways: 22 tests, 18 of which fail against the code they replace.
 The 4 that pass on both sides are the regression guards — own-box
 termination, the unattributed box, and the sweep never being ownership-checked
 — and they are the ones that would catch this guard being over-applied.
+
+## 2026-08-17 — A GPU at 100% is not idle, whatever Manifold saw of the traffic
+
+**Decided:** Before the idle sweep terminates a box, it consults the GPU
+telemetry Manifold is already collecting. Any sample above
+`idle.busy_util_pct` (default 10) within the idle window defers the reap,
+restarts the window, and writes one audit row. `set_keep_alive` joins the MCP
+tool surface as the manual override.
+
+**The evidence, from two of Manifold's own tables.**
+
+```
+audit_log          2026-08-16T07:36:56  backend  idle_termination
+                   4718a91f... idle 1811s (limit 1800s)
+
+telemetry_samples  07:36:57   36653/40960 MiB   util_pct 100
+                   07:36:23   36653/40960 MiB   util_pct 100
+                   07:35:51   36653/40960 MiB   util_pct 100
+```
+
+Manifold sampled a GPU pinned at 100% with 36GB held, wrote it down, and
+terminated the instance for inactivity in the same second. A 126-workflow
+extraction run failed at 07:42 with retry exhaustion, six minutes after its
+endpoint vanished.
+
+`touch_activity` is called by jobs, the terminal, the chat panel and the
+OpenAI proxy — everything that goes THROUGH Manifold. That box served a model
+over the user's own SSH tunnel, so nothing ever reached it. "No traffic we
+can see" became "no work happening": the same inference an agent made about a
+loading box the same night, one layer down, with better evidence available
+and unread.
+
+**Why this narrows the reaper rather than loosening it.** The distinction
+matters because "make the reaper more reluctant" and "stop the reaper killing
+boxes at 100% util" sound like one request and are not. A genuinely abandoned
+box reads near-zero utilization and is still terminated on schedule — the
+Phase 90 case, the one that pays for this product, pinned by four tests here.
+What this removes is only the case where the box is provably working and the
+sweep cannot see why.
+
+**Why a window, not the latest sample.** Utilization is instantaneous and
+spiky: the instance above read 100, 100, 0, 100, 100, 0 across six
+consecutive samples *while serving*. A rule reading the newest sample would
+have reaped it on roughly half of all passes — a coin flip on someone's job.
+The question asked is "did any sample show work during the period we are
+calling idle", over exactly that period.
+
+**Why peak and not mean.** One busy card out of eight is a working box. The
+mean is the idle-SPEND figure, where under-reporting busyness is the safe
+direction; here it is the reverse, and a mean would let seven idle cards vote
+a real job to death.
+
+**Why VRAM is not consulted.** A loaded model sitting at 0% is precisely the
+abandoned server Phase 90 was written to reap: it holds 30GB forever and
+answers nobody. Protecting on memory would undo that and rebuild the
+hour-long bill. Utilization is work; VRAM is only residency.
+
+**What this deliberately does not cover,** recorded so nobody trusts it
+further than it goes. A CPU-bound phase — CUDA extension builds, weights
+streaming off NFS — shows little GPU utilization, so a long *setup* is not
+protected; a second project's 15-25 minute detached bootstrap has exactly
+that shape. Neither is a box whose telemetry never arrives, where there are
+no samples at all. In both cases the sweep behaves as it did before. This
+only ever ADDS protection on positive evidence of work.
+
+That is also why `peak_util_since` returns the sample COUNT alongside the
+peak. "No samples" and "samples, all zero" are opposite findings — no
+evidence versus evidence of no work — and collapsing them into a bare peak of
+0 would have rebuilt, inside the fix, the exact inference the fix exists to
+remove.
+
+**The money backstop is untouched.** Nothing here bounds a job that stays
+busy forever; the max-lifetime ceiling is checked before the idle verdict,
+never defers to a server, and remains the only guard that applies to a box
+doing real work. A test pins that a ceiling still kills a box at 100%.
+
+**`set_keep_alive` on the MCP surface.** The escape hatch was recommended to
+two agent sessions three times before anyone checked whether they could call
+it: the route and the dashboard switch had existed since Phase 5, and the MCP
+server never got a setter. An override an agent cannot call is not an
+override. Its docstring states the billing consequence and names the ceiling
+as the backstop, because a tool that only says "this keeps your box alive"
+is a tool that leaves boxes alive.
+
+Proven both ways: 12 tests, 6 of which fail against the code they replace.
+The other 6 are the regression guards — abandoned reaped, loaded-but-idle
+reaped, below-threshold reaped, stale samples reaped, no-telemetry unchanged,
+ceiling still fatal — and they are the ones that would catch this being
+turned into a licence to bill.

@@ -715,6 +715,28 @@ class Database:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    def peak_util_since(self, instance_id: str, since_iso: str) -> dict:
+        """Busiest GPU sample in a window, and HOW MANY samples there were.
+
+        The count is not decoration. "No samples" and "samples, all zero"
+        are opposite findings — one is no evidence, the other is evidence of
+        no work — and the idle sweep must act on them differently. Collapsing
+        them into a bare peak of 0 would recreate, inside the fix, the exact
+        inference the fix exists to remove.
+
+        MAX and not the mean: one busy card out of eight is a box doing work.
+        (util_pct is already the per-sample max across cards; util_pct_mean
+        is the idle-SPEND figure, where under-reporting busyness would be the
+        unsafe direction. Here it is the reverse.)
+        """
+        row = self._execute(
+            """SELECT COUNT(util_pct) AS samples, MAX(util_pct) AS peak
+                 FROM telemetry_samples
+                WHERE instance_id = ? AND at >= ? AND util_pct IS NOT NULL""",
+            (instance_id, since_iso),
+        ).fetchone()
+        return {"samples": row["samples"] or 0, "peak": row["peak"]}
+
     def find_launch_by_instance(self, lambda_instance_id: str) -> dict | None:
         row = self._execute(
             """SELECT * FROM launches WHERE lambda_instance_id = ?
