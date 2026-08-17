@@ -919,10 +919,26 @@ class Dispatcher:
         if launch is None:
             launch = self.db.find_launch_by_instance(instance_id)
         limit = launch.get("max_lifetime_seconds") if launch else None
+        active_limit = launch.get("max_active_seconds") if launch else None
+        # The ACTIVE ceiling (Phase 97): anchored at health-check pass, so
+        # its countdown is None until the box is active - "no clock yet" is
+        # a different fact from "0 seconds left" on a destructive control.
+        active_age = (self._anchor_age_seconds(launch, "active_at")
+                      if active_limit is not None else None)
+        active_fields = {
+            "max_active_seconds": (None if active_limit is None
+                                   else float(active_limit)),
+            "active_seconds_remaining": (
+                None if active_limit is None or active_age is None
+                else round(float(active_limit) - active_age)),
+        }
         if limit is None:
             return {"max_lifetime_seconds": None,
                     "ceiling_seconds_remaining": None,
-                    "ceiling_deferred_by": None}
+                    "ceiling_deferred_by": (
+                        self._ceiling_deferred.get(instance_id)
+                        if active_limit is not None else None),
+                    **active_fields}
         age = self._launch_age_seconds(launch)
         return {
             "max_lifetime_seconds": float(limit),
@@ -932,6 +948,7 @@ class Dispatcher:
             "ceiling_seconds_remaining": (
                 None if age is None else round(float(limit) - age)),
             "ceiling_deferred_by": self._ceiling_deferred.get(instance_id),
+            **active_fields,
         }
 
     # -- model readiness ---------------------------------------------------------------
@@ -1594,6 +1611,11 @@ class Dispatcher:
                 connected = conn.state == ConnectionState.CONNECTED
                 launch = self.db.find_launch_by_instance(instance_id)
                 over = self._ceiling_breach(launch)
+                over_kind = "max_lifetime"
+                if over is None:
+                    active_over = self._active_breach(launch)
+                    if active_over is not None:
+                        over, over_kind = active_over, "max_active"
 
                 if over is not None:
                     # -- ceiling verdict. At most ONE terminate per instance
@@ -1619,7 +1641,7 @@ class Dispatcher:
                         self._clear_ceiling_deferral(instance_id)
                         await self._terminate_for(
                             instance_id, "ceiling",
-                            f"{over:.0f}s past max_lifetime")
+                            f"{over:.0f}s past {over_kind}")
                     continue
 
                 self._clear_ceiling_deferral(instance_id)
@@ -1742,14 +1764,14 @@ class Dispatcher:
     # -- the ceiling ---------------------------------------------------------------
 
     @staticmethod
-    def _launch_age_seconds(launch: dict | None) -> float | None:
-        """Wall-clock seconds since the provider ACCEPTED this launch.
+    def _anchor_age_seconds(launch: dict | None, field: str) -> float | None:
+        """Wall-clock seconds since the given timestamp column, or None.
 
-        None (never an exception) when there is no row, no launched_at, or an
-        unparsable one: an unreadable anchor must be a no-op, not a crash and
-        certainly not a termination.
+        None (never an exception) when there is no row, no stamp, or an
+        unparsable one: an unreadable anchor must be a no-op, not a crash
+        and certainly not a termination.
         """
-        stamp = (launch or {}).get("launched_at")
+        stamp = (launch or {}).get(field)
         if not stamp:
             return None
         try:
@@ -1759,6 +1781,11 @@ class Dispatcher:
         if started.tzinfo is None:
             started = started.replace(tzinfo=timezone.utc)
         return (datetime.now(timezone.utc) - started).total_seconds()
+
+    @classmethod
+    def _launch_age_seconds(cls, launch: dict | None) -> float | None:
+        """Wall-clock seconds since the provider ACCEPTED this launch."""
+        return cls._anchor_age_seconds(launch, "launched_at")
 
     def _ceiling_breach(self, launch: dict | None) -> float | None:
         """Seconds this launch is PAST its max lifetime, or None.
@@ -1778,6 +1805,26 @@ class Dispatcher:
         age = self._launch_age_seconds(launch)
         if age is None:
             return None
+        over = age - float(limit)
+        return over if over >= 0 else None
+
+    def _active_breach(self, launch: dict | None) -> float | None:
+        """Seconds this launch is PAST its max ACTIVE time, or None.
+
+        Anchored at active_at - the moment the instance passed health checks
+        - so boot, driver reboots and retries never come out of this budget.
+        The bound on the part the user actually controls (Phase 97); the
+        absolute max_lifetime ceiling remains the outer bound. A box that
+        has not reached active yet has no active clock: None, never 0.
+        """
+        if not launch:
+            return None
+        limit = launch.get("max_active_seconds")
+        if limit is None:
+            return None
+        age = self._anchor_age_seconds(launch, "active_at")
+        if age is None:
+            return None                       # not active yet: no clock
         over = age - float(limit)
         return over if over >= 0 else None
 
@@ -1875,21 +1922,33 @@ class Dispatcher:
         ceiling shorter than twice the lead gets no warning at all, because
         that warning would land at (or before) launch and mean nothing.
         """
+        # Whichever ceiling lands sooner gets the warning (Phase 97 added
+        # the active-anchored one). Same fixed lead, same "too short to
+        # warn" rule, per bound.
+        candidates = []
         limit = (launch or {}).get("max_lifetime_seconds")
-        if limit is None:
-            return
+        if limit is not None:
+            age = self._launch_age_seconds(launch)
+            if age is not None:
+                candidates.append((float(limit), age, "max lifetime"))
+        active_limit = (launch or {}).get("max_active_seconds")
+        if active_limit is not None:
+            active_age = self._anchor_age_seconds(launch, "active_at")
+            if active_age is not None:
+                candidates.append(
+                    (float(active_limit), active_age, "max active time"))
         lead = self.settings.idle.ceiling_warning_seconds
-        if lead <= 0 or float(limit) < 2 * lead:
+        candidates = [(lim, a, label) for lim, a, label in candidates
+                      if lead > 0 and lim >= 2 * lead]
+        if not candidates:
             return
-        age = self._launch_age_seconds(launch)
-        if age is None:
-            return
+        limit, age, label = min(candidates, key=lambda c: c[0] - c[1])
         remaining = float(limit) - age
         if remaining > lead:
             return
         self._notify_ceiling_once(
             instance_id, "warning",
-            f"Instance {instance_id[:12]} hits its max lifetime in "
+            f"Instance {instance_id[:12]} hits its {label} in "
             f"{remaining / 60:.0f} min",
             (f"It has been running for {age / 3600:.1f}h against a "
              f"{float(limit) / 3600:.1f}h limit. Manifold will terminate it "

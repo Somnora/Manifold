@@ -291,6 +291,7 @@ async def launch_gpu(
     connection_mode: str | None = None,
     idle_timeout_seconds: float | None = None,
     max_lifetime_seconds: float | None = None,
+    max_active_seconds: float | None = None,
     note: str = "",
 ) -> dict:
     """Launch a GPU instance. Flows through ALL backend guards (budget,
@@ -310,6 +311,14 @@ async def launch_gpu(
     the idle timeout, nothing on the instance can push it out, and it applies
     even to a box serving a model. Manifold terminates at the ceiling if it
     can reach the instance and save its files first.
+
+    `max_active_seconds` is the ceiling on ACTIVE time, anchored at the
+    moment the instance passes health checks - boot, driver reboots and
+    model-load retries never come out of this budget, so budget the run you
+    actually control instead of hand-sizing "run + 40 minutes for boot".
+    Use it alongside (or instead of) max_lifetime_seconds; the absolute
+    ceiling remains the outer bound and either firing terminates through
+    the same save-files-first flow.
 
     `purpose` is REQUIRED: a short phrase saying what this box is for, e.g.
     "Tally extraction+evaluation run" or "Red Hope mesh cleanup batch". You
@@ -347,6 +356,8 @@ async def launch_gpu(
         body["idle_timeout_seconds"] = idle_timeout_seconds
     if max_lifetime_seconds is not None:
         body["max_lifetime_seconds"] = max_lifetime_seconds
+    if max_active_seconds is not None:
+        body["max_active_seconds"] = max_active_seconds
     return await _call(
         "launch_gpu", "POST", "/instances",
         note=note, args=body, body=body,

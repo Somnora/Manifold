@@ -279,6 +279,37 @@ def validate_max_lifetime(settings, value: float | None) -> float | None:
     return float(value)
 
 
+def validate_max_active(settings, value: float | None) -> float | None:
+    """Check a requested ACTIVE ceiling, or raise LaunchRejected.
+
+    Anchored at active_at (health-check pass), so unlike max_lifetime it
+    needs no boot budget in its floor: the clock has not started while the
+    box boots. The floor is the idle-timeout floor - a bound shorter than
+    the shortest idle window would terminate a box faster than the idle
+    sweep is even allowed to. Rejects rather than clamps, same reasoning as
+    validate_max_lifetime: silently rewriting a number that destroys
+    instances is its own kind of lie.
+    """
+    if value is None:
+        return None
+    minimum = float(settings.idle.timeout_min_seconds)
+    maximum = float(settings.idle.max_lifetime_max_seconds)
+    if value < minimum:
+        raise LaunchRejected(
+            400,
+            f"max_active_seconds must be at least {minimum:.0f}s. It is "
+            f"anchored at the moment the instance becomes ACTIVE (boot "
+            f"excluded), so there is no boot budget to add - but a bound "
+            f"below the minimum idle window would destroy the box faster "
+            f"than the idle sweep itself is permitted to.")
+    if value > maximum:
+        raise LaunchRejected(
+            400,
+            f"max_active_seconds must be at most {maximum:.0f}s "
+            f"({maximum / 86400:.0f} days).")
+    return float(value)
+
+
 def launch_options(
     instance_types: dict[str, InstanceTypeInfo],
     filesystems: list[FilesystemInfo],
@@ -436,6 +467,7 @@ class Orchestrator:
         name: str = "",
         idle_timeout_seconds: float | None = None,
         max_lifetime_seconds: float | None = None,
+        max_active_seconds: float | None = None,
         provider: str = 'lambda',
         created_by: str | None = None,
         purpose: str = "",
@@ -593,6 +625,8 @@ class Orchestrator:
             hourly_rate_cents=price,
             idle_timeout_seconds=idle_timeout_seconds,
             max_lifetime_seconds=max_lifetime_seconds,
+            max_active_seconds=validate_max_active(
+                self.settings, max_active_seconds),
             provider=provider,
             created_by=created_by,
             purpose=purpose,

@@ -5941,3 +5941,35 @@ lost", on the two tools whose descriptions imply safety.
 hours — a filesystem that had just served a 16 GB model read 0 bytes. The
 storage estimate's note now says so; a single reading is not evidence either
 way, in either direction.
+
+## 2026-08-17 — Phase 97: a ceiling anchored where the work starts
+
+**Decided:** `max_active_seconds`, a second per-launch ceiling anchored at
+`active_at` (health-check pass) instead of launch acceptance. The absolute
+`max_lifetime_seconds` remains the outer bound; either firing terminates
+through the same rescue-files-first flow, and the audit detail names WHICH
+ceiling fired.
+
+**Why:** the folklore. An agent measured 35 minutes of a 3-hour ceiling spent
+before the first token — boot, a driver reboot, a ten-minute model load — and
+began sizing every ceiling as "run + 40 minutes" by hand. Sizing rules that
+users must carry in their heads are exactly what a platform exists to absorb;
+the anchor (`active_at`) had been recorded on every launch row all along.
+
+**The rules it inherits and the one it does not.** Deferral is identical to the
+absolute ceiling (a batch job pins; unreachable refuses — you cannot rescue
+what you cannot reach). The floor is NOT: `validate_max_lifetime`'s floor adds
+the whole boot budget because its clock starts before boot; the active clock
+starts after, so its floor is just the minimum idle window (a shorter bound
+would out-race the idle sweep itself). Still reject-not-clamp — silently
+rewriting a number that destroys instances is its own kind of lie.
+
+**Truthful-or-absent, applied:** a box that has not reached active has no
+clock. Breach None, countdown None — never 0 — because "no clock yet" and "0
+seconds left" are different facts on a destructive control. The card renders
+"(clock starts when the instance is active)" for that state, and the warning
+path warns on whichever ceiling lands sooner, named.
+
+Launch-time only for now: the per-instance edit route still edits only the
+absolute ceiling. Deliberate scope cut, noted here so it is a decision rather
+than an oversight.

@@ -166,6 +166,11 @@ export type Instance = {
   // All three are null when no ceiling is set (the default).
   max_lifetime_seconds: number | null;
   ceiling_seconds_remaining: number | null;
+  // The ACTIVE-anchored ceiling (Phase 97): the bound on run time, boot
+  // excluded. active_seconds_remaining is null until the box is active -
+  // "no clock yet" is a different fact from "0 seconds left".
+  max_active_seconds: number | null;
+  active_seconds_remaining: number | null;
   // Why the ceiling fired without terminating: a running batch job, an
   // auto-managed teardown, or an unreachable instance.
   ceiling_deferred_by: string | null;
@@ -295,6 +300,9 @@ export type LaunchRequest = {
   // Hard ceiling on total lifetime, from launch acceptance (boot included).
   // Omit for no ceiling, which is the default.
   max_lifetime_seconds?: number;
+  // Ceiling on ACTIVE time, anchored at health-check pass: budget the run,
+  // not the boot. The absolute ceiling above remains the outer bound.
+  max_active_seconds?: number;
   // What this box is FOR, shown to every agent and page that lists
   // instances. An unattributed box is how someone else's loading model got
   // terminated as a stray.

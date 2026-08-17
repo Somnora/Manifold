@@ -463,6 +463,27 @@ export function InstanceCard({
             it.
           </span>
         )}
+        {/* The ACTIVE-anchored ceiling (Phase 97): run time, boot excluded.
+            Only rendered when set - and its countdown distinguishes "not
+            active yet, no clock" from a real number. */}
+        {instance.max_active_seconds ? (
+          <span
+            className={
+              instance.active_seconds_remaining !== null &&
+              instance.active_seconds_remaining < 900
+                ? "font-medium text-amber-700"
+                : "text-zinc-500"
+            }
+          >
+            Max active {Math.round(instance.max_active_seconds / 3600)}h
+            {instance.active_seconds_remaining === null
+              ? " (clock starts when the instance is active)"
+              : instance.active_seconds_remaining > 0
+                ? ` (${Math.ceil(instance.active_seconds_remaining / 60)}m left)`
+                : " (reached)"}
+            — counted from health-check pass, so boot never spent it.
+          </span>
+        ) : null}
         {editingCeiling ? (
           <form
             onSubmit={async (e) => {

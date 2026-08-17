@@ -249,6 +249,11 @@ class LaunchRequest(BaseModel):
     # provider ACCEPTS the launch (so it includes boot). None = no ceiling,
     # which is the default and the behaviour every existing client gets.
     max_lifetime_seconds: float | None = None
+    # Ceiling on ACTIVE time, anchored at health-check pass (Phase 97):
+    # boot and driver reboots never come out of this budget. The absolute
+    # max_lifetime above remains the outer bound; either firing terminates
+    # through the same rescue-first flow.
+    max_active_seconds: float | None = None
     provider: str = 'lambda'
     # What this box is for, in the launcher's own words (Phase 94). Shown to
     # everyone who lists instances, so a reader who did not launch it can
@@ -1379,6 +1384,7 @@ def create_app(
             name=req.name,
             idle_timeout_seconds=req.idle_timeout_seconds,
             max_lifetime_seconds=req.max_lifetime_seconds,
+            max_active_seconds=req.max_active_seconds,
             provider=req.provider,
             created_by=current_principal(),
             purpose=req.purpose,
