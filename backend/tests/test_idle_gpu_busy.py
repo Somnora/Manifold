@@ -85,6 +85,46 @@ async def test_a_spiky_sample_run_still_counts_as_busy(harness):
     assert harness.terminated == []
 
 
+async def test_a_working_box_reads_busy_LONG_BEFORE_it_is_near_reaping(harness):
+    """The defect the first version of this shipped with, caught against a
+    live instance rather than by these tests.
+
+    Protecting the box from the reaper is only half the job. An agent
+    deciding whether to terminate reads `activity`, and the reap gate does
+    not run until the idle window is nearly spent - so a box 30 seconds into
+    a 7200s window reported state "idle_countdown", busy=false, while its
+    GPU sat at 100% with 36GB held. That is the exact reading that destroyed
+    a model server, being served by the field built to prevent it.
+
+    The original tests all drove the sweep to the reap point and so never
+    asked what a READER sees mid-countdown.
+    """
+    harness.add_instance("i-early", idle_for=30)      # nowhere near TIMEOUT
+    sample(harness, "i-early", 100)
+
+    await harness.dispatcher._check_idle()
+
+    status = harness.dispatcher.activity_status("i-early")
+    assert status["state"] == "gpu_busy"
+    assert status["busy"] is True, (
+        "a reader was told a GPU at 100% is not busy")
+    assert harness.terminated == []
+
+
+async def test_a_quiet_box_mid_window_still_reads_idle(harness):
+    """The other half: if every countdown said busy, the field would be
+    noise and a reader would learn to ignore it - which is how it failed
+    the first time."""
+    harness.add_instance("i-early-quiet", idle_for=30)
+    sample(harness, "i-early-quiet", 0)
+
+    await harness.dispatcher._check_idle()
+
+    status = harness.dispatcher.activity_status("i-early-quiet")
+    assert status["state"] == "idle_countdown"
+    assert status["busy"] is False
+
+
 async def test_an_abandoned_box_is_still_reaped_on_schedule(harness):
     """The Phase 90 case, and the one that pays for this product. Samples
     exist and they all say nothing is happening: that is evidence of no

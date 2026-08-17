@@ -1541,11 +1541,26 @@ class Dispatcher:
                             f"{server.get('template', 'a model server')} is "
                             f"loaded and answering; last request "
                             f"{quiet:.0f}s ago")
+                        continue
+                    # The telemetry question is asked HERE too, not only at
+                    # the reap gate below. The gate protects the box from
+                    # Manifold; this protects it from the reader. A box
+                    # 30 seconds into a 7200s window is nowhere near being
+                    # reaped, so the gate never runs - and an agent looking
+                    # at the list would be told busy=false about a GPU at
+                    # 100%, which is precisely the reading that destroyed
+                    # someone's model server. Verified against a live box
+                    # immediately after shipping the gate alone.
+                    busy = self._telemetry_says_busy(instance_id, timeout)
+                    if busy is not None:
+                        self._note_activity(
+                            instance_id, "gpu_busy", True, busy)
                     else:
                         self._note_activity(
                             instance_id, "idle_countdown", False,
                             f"no jobs or terminal traffic for {quiet:.0f}s "
-                            f"of a {timeout:.0f}s window")
+                            f"of a {timeout:.0f}s window, and no GPU work "
+                            f"in that window either")
                     continue
                 # LAST GATE. Manifold has seen no traffic for a full window,
                 # which is not the same as the box having done nothing - it
