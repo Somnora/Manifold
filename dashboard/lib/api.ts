@@ -295,6 +295,10 @@ export type LaunchRequest = {
   // Hard ceiling on total lifetime, from launch acceptance (boot included).
   // Omit for no ceiling, which is the default.
   max_lifetime_seconds?: number;
+  // What this box is FOR, shown to every agent and page that lists
+  // instances. An unattributed box is how someone else's loading model got
+  // terminated as a stray.
+  purpose?: string;
 };
 
 export type TemplateParameter = {

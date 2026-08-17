@@ -997,7 +997,12 @@ def create_app(
 
     @app.get("/health")
     async def health():
-        return {"status": "ok", "mock": mock}
+        # version: so a client built from an older tree (a frozen MCP bridge
+        # spawned before an upgrade) can NOTICE it is behind. Twice, a tool
+        # shipped that a running agent provably needed and could not call -
+        # and nothing told it a newer surface existed.
+        from .breadcrumb import _version
+        return {"status": "ok", "mock": mock, "version": _version()}
 
     @app.get("/skill", response_class=PlainTextResponse)
     async def agent_skill():
@@ -3879,10 +3884,41 @@ def create_app(
             boot_timeout_seconds=settings.launch.boot_timeout_seconds,
             monthly_budget_usd=prefs.get().guardrails.monthly_budget_usd,
         )
+        # Storage (Phase 95): filesystems bill per GB-month for as long as
+        # they exist, and none of it appears in launch-based spend - a real
+        # ~$50/month sat invisible in every number this product could report
+        # until a manual audit found it. Lambda's API publishes NO rate, so
+        # this is an ESTIMATE at the rate the user wrote in config.yaml,
+        # kept in its own block and never folded into the launch totals -
+        # the same discipline as `unresolved`. None (absent, not $0) when
+        # the rate is switched off or the filesystems cannot be read.
+        storage_estimate = None
+        rate = settings.storage.rate_usd_per_gb_month
+        if rate > 0:
+            try:
+                fs_list = await lambda_client.list_filesystems()
+                # The dollars are computed FROM the displayed GB, so the
+                # block can never contradict itself - a reader multiplying
+                # the two shown numbers must land on the shown estimate.
+                gb = round(
+                    sum((f.bytes_used or 0) for f in fs_list) / 1e9, 3)
+                storage_estimate = {
+                    "filesystems": len(fs_list),
+                    "gb_used": gb,
+                    "rate_usd_per_gb_month": rate,
+                    "usd_per_month_estimate": round(gb * rate, 2),
+                    "note": ("Estimated at the rate in config.yaml "
+                             "(storage.rate_usd_per_gb_month) - Lambda "
+                             "publishes no rate via API. Not included in "
+                             "the launch totals above; verify against your "
+                             "invoice."),
+                }
+            except Exception:   # noqa: BLE001 - unreadable is absent, not $0
+                storage_estimate = None
         # Fixture spend has to be self-identifying wherever it is shown: a
         # dollar figure in a screenshot with no demo marker is the worst
         # artifact this project could publish.
-        return {**summary, "mock": mock}
+        return {**summary, "storage_estimate": storage_estimate, "mock": mock}
 
     @app.get("/spend/series")
     async def spend_series(bucket: str = "day", days: int = 30,

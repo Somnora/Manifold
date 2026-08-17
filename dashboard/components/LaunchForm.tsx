@@ -40,6 +40,7 @@ export function LaunchForm({ onLaunched }: { onLaunched: () => void }) {
   const [mode, setMode] = useState("direct-ssh");
   const [idleTimeout, setIdleTimeout] = useState("");
   const [maxLifetime, setMaxLifetime] = useState("");
+  const [purpose, setPurpose] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState("");
   const [provider, setProvider] = useState("lambda");
@@ -172,6 +173,7 @@ export function LaunchForm({ onLaunched }: { onLaunched: () => void }) {
         ssh_key_name: sshKey || undefined,
         idle_timeout_seconds: idleTimeout ? parseFloat(idleTimeout) : undefined,
         max_lifetime_seconds: maxLifetime ? parseFloat(maxLifetime) : undefined,
+        purpose: purpose.trim() || undefined,
       });
       onLaunched();
     } catch (err) {
@@ -386,6 +388,20 @@ export function LaunchForm({ onLaunched }: { onLaunched: () => void }) {
             <option value="86400">24 hours</option>
             <option value="259200">3 days</option>
           </select>
+        </label>
+        <label className="block text-xs font-medium text-zinc-600">
+          Purpose
+          <input
+            className={`${field} mt-1`}
+            placeholder='e.g. "fine-tune batch for the crop set"'
+            maxLength={200}
+            value={purpose}
+            onChange={(e) => setPurpose(e.target.value)}
+          />
+          <span className="mt-1 block text-[11px] font-normal text-zinc-400">
+            Shown wherever this instance is listed — it is how agents and
+            other sessions know not to touch your box.
+          </span>
         </label>
       </div>
 

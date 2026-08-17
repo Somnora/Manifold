@@ -228,6 +228,22 @@ class HubSettings:
 
 
 @dataclass(frozen=True)
+class StorageSettings:
+    """Filesystem-billing visibility (Phase 95).
+
+    Lambda bills filesystems per GB-month for as long as they exist, and
+    none of that appears in launch-based spend - a real ~$50/month sat
+    invisible in every number this product could report until a manual
+    audit found it. There is NO rate in Lambda's API to read, so this is
+    the honest compromise: a rate the USER writes down, used only for a
+    clearly-labelled estimate that is never folded into the launch totals.
+    0 disables the estimate entirely rather than estimating with a number
+    nobody vouched for.
+    """
+    rate_usd_per_gb_month: float = 0.20
+
+
+@dataclass(frozen=True)
 class TelemetrySettings:
     # How often the dispatcher records a GPU telemetry sample per connected
     # instance. Backs the post-run utilization verdict; advisory only.
@@ -319,6 +335,7 @@ class Settings:
     autopilot: AutopilotSettings = field(default_factory=AutopilotSettings)
     hub: HubSettings = field(default_factory=HubSettings)
     telemetry: TelemetrySettings = field(default_factory=TelemetrySettings)
+    storage: StorageSettings = field(default_factory=StorageSettings)
     diagnostics: DiagnosticsSettings = field(
         default_factory=DiagnosticsSettings)
     server: ServerSettings = field(default_factory=ServerSettings)
@@ -522,6 +539,13 @@ def load_settings(
         ),
         telemetry=TelemetrySettings(
             sample_seconds=float(telemetry.get("sample_seconds", 30)),
+        ),
+        # Named in the loader or unreadable: this loader lists every field
+        # explicitly, and busy_util_pct shipped documented-but-inert for
+        # exactly that omission. Do not add a config key without its line here.
+        storage=StorageSettings(
+            rate_usd_per_gb_month=float(
+                (raw.get("storage") or {}).get("rate_usd_per_gb_month", 0.20)),
         ),
         diagnostics=DiagnosticsSettings(
             log_to_file=bool(diagnostics.get("log_to_file", True)),

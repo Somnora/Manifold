@@ -73,6 +73,44 @@ mcp = FastMCP(
 # aimed at an in-process app instance.
 _client: httpx.AsyncClient | None = None
 
+# Version drift (Phase 95): this bridge is a child of the AGENT'S session,
+# not of the app, so an upgrade behind it leaves it running an older tool
+# schema until the session restarts. Twice, a tool shipped that a running
+# agent provably needed and could not call - and nothing told it a newer
+# surface existed. Checked once per process against /health, then appended
+# to every result while drift exists. stdlib only: this module may import
+# nothing from the rest of the application (AST-enforced).
+_drift_note: str | None = None
+
+
+def _bridge_version() -> str:
+    try:
+        from importlib.metadata import version
+        return version("manifold-backend")
+    except Exception:   # noqa: BLE001
+        return "unknown"
+
+
+async def _version_drift() -> str:
+    global _drift_note
+    if _drift_note is None:
+        try:
+            resp = await _http().get("/health", timeout=5.0)
+            backend = resp.json().get("version", "unknown")
+            mine = _bridge_version()
+            if backend != "unknown" and mine != "unknown" and backend != mine:
+                _drift_note = (
+                    f"your MCP bridge is v{mine} but the backend is "
+                    f"v{backend}: tools added since your session started are "
+                    f"invisible to you. Restart your session to refresh the "
+                    f"tool schema.")
+            else:
+                _drift_note = ""
+        except Exception:   # noqa: BLE001 - drift detection must never
+            # break a real call; try again next call.
+            return ""
+    return _drift_note
+
 
 def _http() -> httpx.AsyncClient:
     global _client
@@ -117,13 +155,35 @@ async def _call(
 
     `request_timeout` overrides the client's default 60s ceiling for calls
     that legitimately hold the socket longer (the wait_for_launch long-poll
-    parks server-side for up to 300s)."""
+    parks server-side for up to 300s).
+
+    CONNECTION-REFUSED IS RETRIED, quietly, for up to ~40s. A refused
+    connection means the request never reached the backend, so retrying
+    anything - including a launch - cannot double an effect. A sub-minute
+    backend restart (an app upgrade) therefore looks like one slow call
+    instead of an error, which matters because a restart provably does not
+    touch in-flight instance work (observed mid-boot and mid-transfer; see
+    DECISIONS.md) - the calls were the only casualty. 40s and not longer
+    because the MCP client kills the whole request at ~60s, and an answer
+    that arrives after the caller stopped listening is not an answer
+    (observed restarts: 24-41s). TIMEOUTS ARE NEVER RETRIED: a timed-out
+    request may have landed, and replaying it could launch twice."""
     args = args or {}
     try:
-        resp = await _http().request(
-            method, path, json=body, params=params,
-            **({"timeout": request_timeout} if request_timeout else {}),
-        )
+        deadline = 40.0
+        waited = 0.0
+        while True:
+            try:
+                resp = await _http().request(
+                    method, path, json=body, params=params,
+                    **({"timeout": request_timeout} if request_timeout else {}),
+                )
+                break
+            except httpx.ConnectError:
+                if waited >= deadline:
+                    raise
+                await asyncio.sleep(3.0)
+                waited += 3.0
         # A healthy backend answers JSON. A 500 that escaped the route,
         # though, is a Starlette plain-text "Internal Server Error" page —
         # calling .json() on that raises a cryptic "Expecting value" decode
@@ -143,15 +203,20 @@ async def _call(
         }
         await _audit(tool, args, note, result["error"])
         return result
+    drift = await _version_drift()
     if resp.status_code >= 400:
         result = {"error": payload.get("detail", f"HTTP {resp.status_code}")}
         # Termination safety hook: return the evidence, not just the error.
         if payload.get("blocked"):
             result["blocked"] = True
             result["unpersisted_files"] = payload.get("unpersisted_files", [])
+        if drift:
+            result["bridge_version_note"] = drift
         await _audit(tool, args, note, f"rejected: {result['error']}")
         return result
     await _audit(tool, args, note, "ok")
+    if drift and isinstance(payload, dict):
+        payload["bridge_version_note"] = drift
     return payload
 
 
@@ -221,10 +286,10 @@ async def launch_gpu(
     instance_type: str,
     region: str,
     filesystem: str,
+    purpose: str,
     connection_mode: str | None = None,
     idle_timeout_seconds: float | None = None,
     max_lifetime_seconds: float | None = None,
-    purpose: str = "",
     note: str = "",
 ) -> dict:
     """Launch a GPU instance. Flows through ALL backend guards (budget,
@@ -245,12 +310,23 @@ async def launch_gpu(
     even to a box serving a model. Manifold terminates at the ceiling if it
     can reach the instance and save its files first.
 
-    ALWAYS pass `purpose`: a short phrase saying what this box is for, e.g.
+    `purpose` is REQUIRED: a short phrase saying what this box is for, e.g.
     "Tally extraction+evaluation run" or "Red Hope mesh cleanup batch". You
     are probably not the only agent on this account, and purpose is what
     everyone else sees in list_instances. A box with no purpose reads as
     unexplained, and an unexplained box gets terminated by someone trying to
-    be helpful — that has already happened here and cost a multi-hour run."""
+    be helpful — that has already happened here and cost a multi-hour run.
+    (The backend still accepts purposeless launches from older bridges and
+    the dashboard; this surface requires it because agents are the
+    population that both causes and suffers the unattributed-box problem.)"""
+    if not purpose.strip():
+        # Refused HERE, with the reason, rather than launching an
+        # unattributed box. Not a guard around the backend - the backend
+        # deliberately stays permissive for old bridges - but a requirement
+        # of this surface.
+        return {"error": "purpose is required: say what this box is for "
+                         "(other agents decide whether to leave it alone "
+                         "based on it)"}
     body = {
         "instance_type": instance_type,
         "region": region,
@@ -431,9 +507,11 @@ async def get_spend(note: str = "") -> dict:
     Two honest limits on every number here:
 
     - It is MANIFOLD-OBSERVED. Only launches Manifold itself started are
-      counted. An instance created in the Lambda console, and filesystem
-      storage (billed per GiB for as long as it exists), are not in these
-      figures. `lower_bound` says so in the response.
+      counted. An instance created in the Lambda console is not in these
+      figures, and filesystem storage (billed per GB-month for as long as
+      it exists) is not in the TOTALS - it appears as its own
+      `storage_estimate` block, at the user-configured rate, never folded
+      in. `lower_bound` says so in the response.
     - It is an UPPER BOUND on what it does count: the clock starts when the
       cloud accepted the launch, while billing really starts a little later,
       when the instance passes health checks. Over-reporting is the safe

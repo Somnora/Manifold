@@ -318,3 +318,11 @@ auto_manage:
 
 database:
   path: manifold.db
+
+storage:
+  # Filesystems bill per GB-month for as long as they exist, and Lambda's
+  # API publishes NO rate to read - so spend reports them as an ESTIMATE at
+  # this rate, in their own block, never folded into the launch totals.
+  # Write the rate from Lambda's current pricing page here; set 0 to switch
+  # the estimate off rather than trust a number nobody vouched for.
+  rate_usd_per_gb_month: 0.20

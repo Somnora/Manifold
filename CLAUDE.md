@@ -78,6 +78,13 @@ npm run dev     # then open http://localhost:3000
 - Secrets stay in .env; never hardcode, log, or echo them.
 - Connection modes (direct-ssh/tailscale) differ ONLY in the dial target.
   No endpoint, business logic, or UI may branch on mode beyond displaying it.
+- Every field is truthful or absent. Never render or return a value that
+  stands in for "unknown": no 0% for missing telemetry, no `false` for
+  "could not determine", no empty list for "the request failed", no invented
+  rates. An agent that finds no field goes looking; an agent that finds a
+  wrong field stops — a wrong value in a payload has already destroyed a
+  working GPU instance. "We cannot tell" is a real answer (null / absent /
+  its own state) and is never collapsed into a reassuring one.
 
 ## Working style
 
