@@ -72,6 +72,26 @@ idle:
   timeout_seconds: 1800
   poll_seconds: 15
 
+  # GPU utilization that counts as "this box is working", whatever Manifold
+  # saw of the traffic driving it. The idle timeout above only ever measured
+  # traffic that came THROUGH Manifold - jobs, the terminal, the chat panel,
+  # the OpenAI proxy - so a model served over your own SSH tunnel, or a
+  # detached training run, looked abandoned while pinning the card. That
+  # cost a real run: an instance was reaped for "idle 1811s" in the same
+  # second its telemetry recorded 100% utilization and 36GB of VRAM held.
+  #
+  # A card doing nothing reports 0-2%, so 10 clears noise. This NARROWS the
+  # reaper rather than loosening it - a genuinely abandoned box still reads
+  # near zero and is still terminated on schedule, and utilization is checked
+  # over the whole idle window because instantaneous readings swing between
+  # 0 and 100 on a busy box. VRAM is deliberately NOT consulted: a loaded
+  # model answering nobody is exactly what should be reaped.
+  #
+  # Set to 0 to switch the check off and judge by Manifold-visible traffic
+  # alone. Not a substitute for a max_lifetime ceiling: nothing here bounds
+  # a job that stays busy forever.
+  busy_util_pct: 10
+
   # The max-lifetime ceiling (opt-in, per launch; unset = no ceiling, and
   # that is the default). Unlike the idle timeout it is measured from the
   # moment the provider ACCEPTS the launch and nothing running on the box can

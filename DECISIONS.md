@@ -5352,3 +5352,193 @@ running agent session.
 Proven both ways: four backend tests (three fail on the old behavior, the
 fourth is the guard that resuming a genuinely dead session still says so),
 and a browser assertion that fails against a backend reverted to Phase 91.
+
+## 2026-08-17 — An instance says whose it is, and whether it is really idle
+
+**Decided:** `GET /instances` carries three new things — `created_by` (which
+principal launched it), `purpose` (what they said it is for), and `activity`
+(the idle sweep's own verdict, with a state, a `busy` flag, and the reason in
+words). `DELETE /instances/{id}` refuses an instance launched by a different
+principal, and the override is `confirm_owner=<that principal>`, not `force`.
+
+**The incident this comes from.** Three agent sessions shared this account
+through one MCP token. One listed instances, found an A100 it had not
+launched, and checked it every way it could: `uptime`, logged-in users,
+running processes, writes to the NFS. All of them said idle. It was a vLLM
+box six minutes into loading a 27B model from the shared HF cache — no users,
+no obvious processes, nothing written, 30GB of VRAM held — and it was
+terminated about sixty seconds before it would have served. The audit note
+reads: "Verified idle before terminating: up 6 min, 0 users, no user
+processes, nothing written to the NFS."
+
+**A correction, because the first version of this entry got it wrong.** It
+said that termination also cost a multi-hour extraction run. It did not, and
+the mistake is worth recording because it nearly buried a worse bug. The two
+boxes killed here rescued `files_found: 0` and were single-purpose and
+relaunchable. The 126-workflow extraction run that died at 07:42 with retry
+exhaustion had a different cause entirely, found by looking instead of
+inferring: at 07:36:56 Manifold's OWN idle sweep terminated instance
+4718a91f for `idle 1811s (limit 1800s)` — while its own telemetry table,
+sampled every 32 seconds, recorded that same box at 36653 MiB of 40960 used
+and GPU utilization of 100%, including a sample written at 07:36:57. The
+model was being served over a hand-rolled SSH tunnel, so no request ever
+reached `touch_activity`, and "no Manifold-visible traffic" was read as "no
+work". Manifold measured a GPU pinned at 100%, wrote it down, and terminated
+the instance for inactivity in the same second. That is the same error as the
+agent's, one layer down and with better evidence available — see the entry
+that follows this one.
+
+Nothing in that reasoning was careless. Every question it asked, the API
+answered, and every question was the wrong one.
+
+**Why the payload, not a convention.** The list an agent sees carried
+`launch_id` and nothing else about origin, so a box in use and a box
+abandoned were byte-for-byte indistinguishable. Attribution existed — Phase
+79 resolves a principal per request, Phase 81 built `api_principals`, and
+`launches.created_by` has been a column since 79 — it just never reached the
+one view everybody reads. The alternative was asking six sessions to each
+remember to call `get_launch_status` per instance before acting. Conventions
+that must be independently rediscovered by every reader are not guards.
+
+**Why `activity` is the interesting half.** Phase 90 already taught the idle
+sweep the exact distinction that was missed: a server not yet answering
+`/v1/models` counts as ACTIVITY, precisely so a 70B downloading for 40
+minutes is not reaped at minute 30. The dispatcher computed that verdict
+every sweep, used it for one decision, and discarded it. Readers got
+`idle_seconds` and reconstructed the judgment by hand from shell commands.
+So the sweep now records its reasoning and `activity_status()` hands it out.
+It is a cache, deliberately: answering "is it loading?" live means probing
+the instance, and this feeds a list the dashboard polls every few seconds.
+Each entry carries its age so a stale verdict can be recognised.
+
+`busy` is the FACTUAL question (is work loaded and running here), not the
+policy question (may Manifold reap this). A serving box that has been quiet
+for a while is `busy: true` and still subject to the idle timeout; the
+arithmetic stays visible in `idle_seconds`/`timeout_seconds`. Conflating the
+two would have produced exactly the original bug in a new field.
+
+Unknown is its own answer. An unreachable box, and an instance no sweep has
+judged yet, both report `busy: null` — never `false`. "No evidence of work"
+is not "evidence of no work", and that inference is the whole bug.
+
+**Why `confirm_owner` and not `force`.** `force` means "burn it, I accept the
+data loss" and skips the rescue entirely. Had it also waived ownership, the
+single call for taking another principal's box would have been the one call
+that destroys their unsaved files without looking. Two different admissions,
+two different keys. `confirm_owner` follows `delete_filesystem`'s
+`confirm_name`: you can only supply it by reading the record first, and a
+guard you can clear without looking is a guard that gets cleared without
+looking. The refusal returns the owner, the purpose and the override, because
+a refusal that withholds whose box it is sends the caller back to try again
+rather than to ask.
+
+**What is deliberately NOT guarded.** The idle sweep and the ceiling call
+`terminate()` too, and they pass no caller. They act for the system, not a
+principal; had they inherited one, idle auto-termination would have silently
+stopped working the moment a second token was issued — the product's central
+feature, disabled by a safety feature. `caller` is opt-in for that reason,
+the same way `request_launch` takes `created_by` explicitly.
+
+An instance with no recorded owner is not guarded either. NULL `created_by`
+means adopted, or launched before this shipped; refusing on an unknown owner
+would teach callers to pass `confirm_owner` reflexively, training away the
+pause the guard exists to create.
+
+**Inert until team mode is on.** With one shared token every launch and every
+caller resolve to the same principal, so nothing changes for a single-user
+install. The guard starts protecting when per-principal tokens are issued.
+That is a configuration step, not a code one, and it is the user's to take.
+
+Proven both ways: 22 tests, 18 of which fail against the code they replace.
+The 4 that pass on both sides are the regression guards — own-box
+termination, the unattributed box, and the sweep never being ownership-checked
+— and they are the ones that would catch this guard being over-applied.
+
+## 2026-08-17 — A GPU at 100% is not idle, whatever Manifold saw of the traffic
+
+**Decided:** Before the idle sweep terminates a box, it consults the GPU
+telemetry Manifold is already collecting. Any sample above
+`idle.busy_util_pct` (default 10) within the idle window defers the reap,
+restarts the window, and writes one audit row. `set_keep_alive` joins the MCP
+tool surface as the manual override.
+
+**The evidence, from two of Manifold's own tables.**
+
+```
+audit_log          2026-08-16T07:36:56  backend  idle_termination
+                   4718a91f... idle 1811s (limit 1800s)
+
+telemetry_samples  07:36:57   36653/40960 MiB   util_pct 100
+                   07:36:23   36653/40960 MiB   util_pct 100
+                   07:35:51   36653/40960 MiB   util_pct 100
+```
+
+Manifold sampled a GPU pinned at 100% with 36GB held, wrote it down, and
+terminated the instance for inactivity in the same second. A 126-workflow
+extraction run failed at 07:42 with retry exhaustion, six minutes after its
+endpoint vanished.
+
+`touch_activity` is called by jobs, the terminal, the chat panel and the
+OpenAI proxy — everything that goes THROUGH Manifold. That box served a model
+over the user's own SSH tunnel, so nothing ever reached it. "No traffic we
+can see" became "no work happening": the same inference an agent made about a
+loading box the same night, one layer down, with better evidence available
+and unread.
+
+**Why this narrows the reaper rather than loosening it.** The distinction
+matters because "make the reaper more reluctant" and "stop the reaper killing
+boxes at 100% util" sound like one request and are not. A genuinely abandoned
+box reads near-zero utilization and is still terminated on schedule — the
+Phase 90 case, the one that pays for this product, pinned by four tests here.
+What this removes is only the case where the box is provably working and the
+sweep cannot see why.
+
+**Why a window, not the latest sample.** Utilization is instantaneous and
+spiky: the instance above read 100, 100, 0, 100, 100, 0 across six
+consecutive samples *while serving*. A rule reading the newest sample would
+have reaped it on roughly half of all passes — a coin flip on someone's job.
+The question asked is "did any sample show work during the period we are
+calling idle", over exactly that period.
+
+**Why peak and not mean.** One busy card out of eight is a working box. The
+mean is the idle-SPEND figure, where under-reporting busyness is the safe
+direction; here it is the reverse, and a mean would let seven idle cards vote
+a real job to death.
+
+**Why VRAM is not consulted.** A loaded model sitting at 0% is precisely the
+abandoned server Phase 90 was written to reap: it holds 30GB forever and
+answers nobody. Protecting on memory would undo that and rebuild the
+hour-long bill. Utilization is work; VRAM is only residency.
+
+**What this deliberately does not cover,** recorded so nobody trusts it
+further than it goes. A CPU-bound phase — CUDA extension builds, weights
+streaming off NFS — shows little GPU utilization, so a long *setup* is not
+protected; a second project's 15-25 minute detached bootstrap has exactly
+that shape. Neither is a box whose telemetry never arrives, where there are
+no samples at all. In both cases the sweep behaves as it did before. This
+only ever ADDS protection on positive evidence of work.
+
+That is also why `peak_util_since` returns the sample COUNT alongside the
+peak. "No samples" and "samples, all zero" are opposite findings — no
+evidence versus evidence of no work — and collapsing them into a bare peak of
+0 would have rebuilt, inside the fix, the exact inference the fix exists to
+remove.
+
+**The money backstop is untouched.** Nothing here bounds a job that stays
+busy forever; the max-lifetime ceiling is checked before the idle verdict,
+never defers to a server, and remains the only guard that applies to a box
+doing real work. A test pins that a ceiling still kills a box at 100%.
+
+**`set_keep_alive` on the MCP surface.** The escape hatch was recommended to
+two agent sessions three times before anyone checked whether they could call
+it: the route and the dashboard switch had existed since Phase 5, and the MCP
+server never got a setter. An override an agent cannot call is not an
+override. Its docstring states the billing consequence and names the ceiling
+as the backstop, because a tool that only says "this keeps your box alive"
+is a tool that leaves boxes alive.
+
+Proven both ways: 12 tests, 6 of which fail against the code they replace.
+The other 6 are the regression guards — abandoned reaped, loaded-but-idle
+reaped, below-threshold reaped, stale samples reaped, no-telemetry unchanged,
+ceiling still fatal — and they are the ones that would catch this being
+turned into a licence to bill.

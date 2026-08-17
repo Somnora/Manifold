@@ -313,6 +313,24 @@ class Dispatcher:
         # Terminal activity is reported by the terminal WS handler (Phase 5);
         # jobs update it too, so "idle" means neither jobs nor shells.
         self.last_activity: dict[str, float] = {}
+        # The idle sweep's own verdict per instance, kept so READERS can see
+        # the reasoning the sweep already does (Phase 94). The sweep knows
+        # the difference between a model that is still loading and a box
+        # nobody wants, and used to spend that knowledge on one decision and
+        # throw it away; an agent looking at the same instance got
+        # idle_seconds and had to guess. It guessed wrong and terminated a
+        # vLLM box six minutes into its warmup.
+        #
+        # A CACHE, deliberately: answering "is it loading?" live means
+        # probing the instance, and this feeds a list the dashboard polls
+        # every few seconds. Each entry carries the sweep tick that wrote
+        # it so a stale verdict can be recognised rather than trusted.
+        self._activity: dict[str, dict] = {}
+        # Last "spared because the GPU was working" reason audited per
+        # instance, so a long job writes ONE row instead of one per poll,
+        # and writes a fresh one when the reason changes. Cleared when the
+        # box goes quiet, so a second busy spell is reported again.
+        self._gpu_busy_noted: dict[str, str] = {}
         # Instances whose idle auto-termination the user switched off; also
         # persisted on the launch row (see keep_alive_enabled).
         self._keep_alive_mem: set[str] = set()
@@ -393,6 +411,117 @@ class Dispatcher:
     def touch_activity(self, instance_id: str) -> None:
         """Record activity (job start/end, terminal traffic) on an instance."""
         self.last_activity[instance_id] = self._clock()
+
+    def _telemetry_says_busy(self, instance_id: str,
+                             window_seconds: float) -> str | None:
+        """Did this GPU do real work during the window we are calling idle?
+
+        Returns the reason to spare it, or None to let the sweep proceed.
+
+        WHY A WINDOW AND NOT THE LATEST SAMPLE. Utilization is instantaneous
+        and spiky: the box that provoked this read 100, 100, 0, 100, 100, 0
+        across six consecutive samples while serving. A single reading is
+        unreliable in BOTH directions, so the question is "did any sample in
+        this window show work", over exactly the period the sweep is about
+        to call idle.
+
+        WHY PEAK AND NOT MEAN. One busy card out of eight is a working box.
+        A mean would let seven idle cards vote a real job to death.
+
+        WHY VRAM IS NOT CONSULTED. A loaded model sitting at 0% is precisely
+        the abandoned server Phase 90 was written to reap - it holds 30GB
+        forever and answers nobody. Protecting on VRAM would undo that and
+        recreate the hour-long bill. Utilization is work; VRAM is only
+        residency.
+
+        WHAT THIS DOES NOT COVER, stated so nobody trusts it further than it
+        goes: a CPU-bound phase - CUDA extension builds, weights streaming
+        off NFS - shows little or no GPU utilization, so a long setup is NOT
+        protected by this. Neither is a box whose telemetry is broken or
+        whose sidecar never came up, where there are no samples at all. In
+        both cases the sweep behaves exactly as it did before. This only
+        ever ADDS protection on positive evidence of work; it never removes
+        any, and it is not a substitute for keep-alive or an idle timeout
+        that matches the job.
+        """
+        threshold = getattr(self.settings.idle, "busy_util_pct", 0)
+        if not threshold:
+            return None                      # switched off in config
+        since = self._iso_seconds_ago(window_seconds)
+        seen = self.db.peak_util_since(instance_id, since)
+        if not seen["samples"]:
+            # No evidence either way. Deliberately NOT treated as "idle":
+            # it is treated as unchanged, which is what the old behaviour
+            # already was. Saying so here so the silence is a decision.
+            return None
+        peak = seen["peak"] or 0
+        if peak < threshold:
+            return None
+        return (f"GPU reached {peak}% utilization in the last "
+                f"{window_seconds:.0f}s ({seen['samples']} sample(s)), so "
+                f"work is running here that Manifold cannot see the traffic "
+                f"for")
+
+    def _iso_seconds_ago(self, seconds: float) -> str:
+        """The wall-clock ISO timestamp `seconds` before now.
+
+        Uses real time, not self._clock: _clock is a monotonic test seam,
+        while telemetry rows are stamped with utcnow(). Comparing the two
+        would silently select nothing.
+        """
+        from datetime import datetime, timedelta, timezone
+        return (datetime.now(timezone.utc)
+                - timedelta(seconds=seconds)).isoformat()
+
+    def _note_activity(self, instance_id: str, state: str, busy: bool | None,
+                       reason: str) -> None:
+        """Record why the sweep judged this instance the way it did."""
+        self._activity[instance_id] = {
+            "state": state, "busy": busy, "reason": reason,
+            "checked_at": self._clock(),
+        }
+
+    def activity_status(self, instance_id: str,
+                        launch: dict | None = None) -> dict:
+        """What the idle sweep last concluded about this instance, for any
+        reader deciding whether the box is doing something.
+
+        `busy` is the FACTUAL question - is work loaded and running here -
+        and is None when the sweep could not tell. It is deliberately not
+        the same question as "may Manifold reap this": a server answering
+        requests is busy, and is still subject to the idle timeout if it
+        goes quiet for the whole window (Phase 90). Policy stays in
+        idle_seconds/timeout_seconds where a reader can see the arithmetic.
+
+        Never guesses. An instance the sweep has not judged yet comes back
+        state "unknown" with busy None, because "we have not looked" and
+        "there is nothing here" are different answers and only one of them
+        is safe to act on.
+
+        `launch` is the instance's launch row when the caller already holds
+        it, and answers the one question the sweep structurally cannot: a
+        box still BOOTING has no SSH connection, so the sweep has never
+        seen it and "unknown" is all it could otherwise say. A booting box
+        is the most misleading thing on the list - nothing is running on it
+        yet, by design, and it is thirty seconds from being someone's job.
+        The first instance destroyed in the 2026-08-17 incident was in
+        exactly this state.
+        """
+        seen = self._activity.get(instance_id)
+        if seen is None:
+            status = (launch or {}).get("status")
+            if status in ("launching", "retrying", "booting"):
+                return {"state": "booting", "busy": True,
+                        "reason": f"still coming up (launch status "
+                                  f"{status!r}); nothing runs on a box that "
+                                  f"has not finished booting, and this one "
+                                  f"is about to be someone's work",
+                        "age_seconds": None}
+            return {"state": "unknown", "busy": None,
+                    "reason": "no idle sweep has judged this instance yet",
+                    "age_seconds": None}
+        return {**{k: v for k, v in seen.items() if k != "checked_at"},
+                "age_seconds": round(self._clock() - seen["checked_at"], 1)}
 
     # -- job completion (the single funnel) ----------------------------------------
 
@@ -1362,13 +1491,31 @@ class Dispatcher:
 
                 # -- idle verdict. Pinned by a BATCH task only (Phase 90); a
                 # server is judged by whether anyone is using it, below.
-                if instance_id in auto_owned or instance_id in pinned_batch:
+                if instance_id in auto_owned:
+                    self._note_activity(
+                        instance_id, "auto_managed", True,
+                        "an auto-managed job owns this instance and will "
+                        "tear it down when it finishes")
+                    continue
+                if instance_id in pinned_batch:
+                    self._note_activity(
+                        instance_id, "batch_running", True,
+                        "a batch job is running here; it pins the instance "
+                        "until it completes")
                     continue
                 if not connected:
                     # Not reachable: don't count unreachable time as idle.
+                    self._note_activity(
+                        instance_id, "unreachable", None,
+                        "not reachable over SSH, so nothing can be "
+                        "concluded about what is running on it")
                     self.last_activity.pop(instance_id, None)
                     continue
                 if self.keep_alive_enabled(instance_id):
+                    self._note_activity(
+                        instance_id, "keep_alive", False,
+                        "idle auto-termination is switched off for this "
+                        "instance; it will not be reaped")
                     continue
                 server = serving.get(instance_id)
                 if server is not None and not await self._server_answering(
@@ -1377,12 +1524,50 @@ class Dispatcher:
                     # window restarts from readiness, not from dispatch. A
                     # 70B that downloads for 40 minutes must never be reaped
                     # at minute 30 for the crime of not being loaded yet.
+                    self._note_activity(
+                        instance_id, "loading", True,
+                        f"{server.get('template', 'a model server')} is "
+                        f"starting up and not answering yet - loading "
+                        f"weights can take far longer than the idle window")
                     self.touch_activity(instance_id)
                     continue
                 timeout = self._effective_timeout(instance_id)
                 last = self.last_activity.setdefault(instance_id, now)
                 if now - last < timeout:
+                    quiet = now - last
+                    if server is not None:
+                        self._note_activity(
+                            instance_id, "serving", True,
+                            f"{server.get('template', 'a model server')} is "
+                            f"loaded and answering; last request "
+                            f"{quiet:.0f}s ago")
+                    else:
+                        self._note_activity(
+                            instance_id, "idle_countdown", False,
+                            f"no jobs or terminal traffic for {quiet:.0f}s "
+                            f"of a {timeout:.0f}s window")
                     continue
+                # LAST GATE. Manifold has seen no traffic for a full window,
+                # which is not the same as the box having done nothing - it
+                # only ever counted the traffic that came through Manifold.
+                # A model served over the user's own SSH tunnel, or a
+                # detached training run, drives a GPU flat out and touches
+                # nothing here. Ask the telemetry we are already collecting.
+                busy = self._telemetry_says_busy(instance_id, timeout)
+                if busy is not None:
+                    self._note_activity(
+                        instance_id, "gpu_busy", True, busy)
+                    # Restart the window from now: the box is working, and
+                    # the next pass should judge the NEXT quiet period, not
+                    # re-run this arithmetic on the same stale timestamp.
+                    self.touch_activity(instance_id)
+                    if self._gpu_busy_noted.get(instance_id) != busy:
+                        self._gpu_busy_noted[instance_id] = busy
+                        self.db.record_audit(
+                            "backend", "idle_deferred_gpu_busy",
+                            f"{instance_id}: {busy}")
+                    continue
+                self._gpu_busy_noted.pop(instance_id, None)
                 await self._terminate_for(
                     instance_id, "idle",
                     f"idle {now - last:.0f}s (limit {timeout:.0f}s)")
@@ -1614,6 +1799,11 @@ class Dispatcher:
         # block the countdown has already fired and re-arming it would hide
         # the fact that this box is over its limit and still billing.
         self.last_activity.pop(instance_id, None)
+        # The stored verdict goes with it: a terminated box that still
+        # answers "serving" would be a lie, and a blocked one is about to be
+        # re-judged on the next pass anyway.
+        self._activity.pop(instance_id, None)
+        self._gpu_busy_noted.pop(instance_id, None)
 
     # -- auto-manage lifecycle loop -----------------------------------------------------
 
