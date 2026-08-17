@@ -287,6 +287,7 @@ async def launch_gpu(
     region: str,
     filesystem: str,
     purpose: str,
+    name: str = "",
     connection_mode: str | None = None,
     idle_timeout_seconds: float | None = None,
     max_lifetime_seconds: float | None = None,
@@ -334,6 +335,12 @@ async def launch_gpu(
     }
     if purpose:
         body["purpose"] = purpose
+    if name:
+        # The human-visible label, from second zero. A box got hand-renamed
+        # in the UI mid-incident because a name was the only ownership
+        # signal that existed; now the launcher can set both the label
+        # (name) and the meaning (purpose) in the same call.
+        body["name"] = name[:64]
     if connection_mode:
         body["connection_mode"] = connection_mode
     if idle_timeout_seconds is not None:
@@ -433,6 +440,12 @@ async def terminate_instance(
     blocked=true with the file list INSTEAD of terminating. Either call
     sync_outputs then retry, or pass force=true to accept the loss.
 
+    SCOPE, stated plainly: the hook checks /workspace/ephemeral - NOT the
+    home directory. State kept in $HOME (logs, venvs, checkouts) dies with
+    the box and never appears in the file list, so "files_found: 0" means
+    nothing IN SCOPE was found, not that nothing was lost. Keep anything
+    worth keeping in ephemeral scratch or on the persistent filesystem.
+
     ONLY TERMINATE BOXES YOU LAUNCHED. Check `created_by` and `purpose` in
     list_instances first. An instance launched by another principal is
     refused with refused=true, the owner's name, and what they said it is
@@ -486,11 +499,32 @@ async def set_keep_alive(
 
 @mcp.tool()
 async def sync_outputs(instance_id: str, note: str = "") -> dict:
-    """rsync the instance's ephemeral scratch to the persistent filesystem
-    (ephemeral-backup/), over the managed SSH connection."""
+    """rsync the instance's ephemeral scratch (/workspace/ephemeral) to
+    the persistent filesystem (ephemeral-backup/), over the managed SSH
+    connection. $HOME is NOT in scope - state kept there dies with the
+    box."""
     return await _call(
         "sync_outputs", "POST", f"/instances/{instance_id}/sync",
         note=note, args={"instance_id": instance_id},
+    )
+
+
+@mcp.tool()
+async def get_spend_breakdown(by: str = "created_by", days: int = 30,
+                              note: str = "") -> dict:
+    """Where the money went, biggest group first, over the trailing `days`.
+
+    `by` is one of: created_by (which principal - answers "what did MY
+    project cost" on a shared account once per-principal tokens exist),
+    purpose (the stated reason for each launch), instance_type, region,
+    provider, status. Rows with no attribution group under "unattributed" /
+    "no stated purpose" - true group names, never guesses, never folded
+    into anything else. Same honest counting as get_spend: every launch is
+    counted, only KNOWN costs are summed."""
+    return await _call(
+        "get_spend_breakdown", "GET", "/spend/breakdown",
+        note=note, args={"by": by, "days": days},
+        params={"by": by, "days": days},
     )
 
 

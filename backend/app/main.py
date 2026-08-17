@@ -3909,9 +3909,11 @@ def create_app(
                     "usd_per_month_estimate": round(gb * rate, 2),
                     "note": ("Estimated at the rate in config.yaml "
                              "(storage.rate_usd_per_gb_month) - Lambda "
-                             "publishes no rate via API. Not included in "
-                             "the launch totals above; verify against your "
-                             "invoice."),
+                             "publishes no rate via API, and its bytes_used "
+                             "counter can lag real contents by hours (a "
+                             "just-deleted or just-written volume reads "
+                             "stale). Not included in the launch totals "
+                             "above; verify against your invoice."),
                 }
             except Exception:   # noqa: BLE001 - unreadable is absent, not $0
                 storage_estimate = None
@@ -3944,7 +3946,7 @@ def create_app(
     async def spend_breakdown(by: str = "instance_type", days: int = 30,
                               tz_offset_minutes: int = 0):
         """Where the money went, biggest first.
-        by: instance_type | region | provider | status."""
+        by: instance_type | region | provider | status | created_by | purpose."""
         rows, live_ids, listed_providers = spend_evidence()
         try:
             groups = spend.breakdown(

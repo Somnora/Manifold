@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import shlex
 import time
 from datetime import datetime, timezone
@@ -120,6 +121,50 @@ def gpu_readiness(exit_code: int, output: str) -> tuple[bool, str]:
     return True, "GPU driver up (no fabric manager on this box)"
 
 
+# A flag's value: version tags, model ids, dtypes, decimals, paths. NO
+# quotes, NO whitespace, NO shell metacharacters - not because a shell is
+# in the path (the serve bootstrap builds argv in python and execvp's it;
+# there is no shell), but because a value that needs anything outside this
+# set is not a tuning value.
+_ARG_VALUE_RE = re.compile(r"^[A-Za-z0-9._:/=-]+$")
+
+
+def _validate_arg_string(param_name: str, raw: str,
+                         allowlist: tuple[str, ...]) -> str | None:
+    """One problem string, or None if `raw` is an acceptable flag string.
+
+    Grammar: tokens are `--flag`, `--flag=value`, or a bare value directly
+    after an allowlisted flag. Every flag must be NAMED in the allowlist -
+    the allowlist matters more than the passthrough (--max-num-seqs is a
+    tuning knob, --trust-remote-code is supply-chain surface), and the
+    refusal carries the full list so the wall is discoverable without
+    hitting it twice.
+    """
+    tokens = str(raw).split()
+    expecting_value = False
+    for tok in tokens:
+        if tok.startswith("-"):
+            flag = tok.split("=", 1)[0]
+            if flag not in allowlist:
+                return (f"parameter '{param_name}': flag '{flag}' is not in "
+                        f"the allowlist ({', '.join(allowlist)})")
+            value = tok.split("=", 1)[1] if "=" in tok else None
+            if value is not None and not _ARG_VALUE_RE.match(value):
+                return (f"parameter '{param_name}': value {value!r} for "
+                        f"{flag} contains characters outside "
+                        f"[A-Za-z0-9._:/=-]")
+            expecting_value = value is None
+        else:
+            if not expecting_value:
+                return (f"parameter '{param_name}': bare value {tok!r} "
+                        f"follows no flag")
+            if not _ARG_VALUE_RE.match(tok):
+                return (f"parameter '{param_name}': value {tok!r} contains "
+                        f"characters outside [A-Za-z0-9._:/=-]")
+            expecting_value = False
+    return None
+
+
 def coerce_parameters(template: JobTemplate, values: dict) -> dict:
     """Validate user values against the template schema; apply defaults.
 
@@ -151,6 +196,11 @@ def coerce_parameters(template: JobTemplate, values: dict) -> dict:
                         raise ValueError(raw)
                 else:
                     result[p.name] = str(raw)
+                    if p.arg_allowlist and result[p.name].strip():
+                        problem = _validate_arg_string(
+                            p.name, result[p.name], p.arg_allowlist)
+                        if problem:
+                            problems.append(problem)
             except (TypeError, ValueError):
                 problems.append(
                     f"parameter '{p.name}' must be {p.type}, got {raw!r}"

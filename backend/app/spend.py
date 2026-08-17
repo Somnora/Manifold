@@ -107,6 +107,11 @@ _BREAKDOWN_KEYS = {
     # Phase 81: spend by principal. Pre-79 rows have no attribution and
     # group under "unattributed" - a true statement, never a guess.
     "created_by": lambda row: row.get("created_by") or "unattributed",
+    # Phase 96: spend by stated purpose - the second axis of "what did this
+    # project cost", reconstructable tonight only by subtracting other
+    # projects' launches by hand. "no stated purpose" is a true group name,
+    # never folded into anything else.
+    "purpose": lambda row: row.get("purpose") or "no stated purpose",
 }
 
 _BUCKETS = ("day", "week", "month")
