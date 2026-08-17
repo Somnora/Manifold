@@ -186,6 +186,45 @@ async def test_old_samples_do_not_protect_forever(harness):
     assert [i for i, _ in harness.terminated] == ["i-was-busy"]
 
 
+async def test_a_reap_records_the_gpu_evidence_that_condemned_it(harness):
+    """Suggested by the session that caused the original incident, and it is
+    the better half of the fix.
+
+    The sparing branch already said why it spared a box. The killing branch
+    recorded only the clock, so a terminated instance left "idle 1811s
+    (limit 1800s)" and nothing about its GPU. Proving the 2026-08-16 reap
+    wrong meant joining audit_log against telemetry_samples by hand - which
+    only happens if someone already suspects. The decision has to be
+    auditable when it is made, not merely recoverable later.
+    """
+    harness.add_instance("i-condemned")
+    for i in range(3):
+        sample(harness, "i-condemned", 0, seconds_ago=10 + i * 32)
+
+    await harness.dispatcher._check_idle()
+
+    assert [i for i, _ in harness.terminated] == ["i-condemned"]
+    detail = next(r["detail"] for r in harness.db.list_audit(limit=50)
+                  if "idle" in r["action"] and "i-condemned" in r["detail"])
+    assert "3 sample(s)" in detail, "the evidence count is missing"
+    assert "0%" in detail, "the peak that condemned it is missing"
+
+
+async def test_a_reap_with_no_telemetry_says_so_rather_than_implying_zero(
+        harness):
+    """"No samples" must not be reported as "GPU at 0%". That is the same
+    absence-of-evidence-as-evidence slip the whole fix exists to remove, and
+    it would read as proof the box was idle."""
+    harness.add_instance("i-blind")
+
+    await harness.dispatcher._check_idle()
+
+    detail = next(r["detail"] for r in harness.db.list_audit(limit=50)
+                  if "idle" in r["action"] and "i-blind" in r["detail"])
+    assert "no GPU telemetry" in detail
+    assert "0%" not in detail, "absence was reported as a zero reading"
+
+
 async def test_the_deferral_is_audited_once_not_every_poll(harness):
     """A long job must leave a trace the user can find, without writing a
     row every 15 seconds for six hours."""

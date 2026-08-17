@@ -462,6 +462,32 @@ class Dispatcher:
                 f"work is running here that Manifold cannot see the traffic "
                 f"for")
 
+    def _telemetry_note(self, instance_id: str, window_seconds: float) -> str:
+        """The GPU evidence behind a reap, in words, for the audit row.
+
+        The sparing branch already records WHY it spared a box. The killing
+        branch recorded only the clock - so a terminated instance left
+        "idle 1811s (limit 1800s)" and nothing about what its GPU had been
+        doing. Reconstructing the 2026-08-16 reap meant joining audit_log
+        against telemetry_samples by hand, which only happens if someone
+        already suspects the sweep was wrong. Naming the evidence at the
+        moment of the decision makes it auditable instead of merely
+        recoverable.
+
+        One extra query, on the rarest event in the loop (a box dies once).
+        """
+        try:
+            seen = self.db.peak_util_since(
+                instance_id, self._iso_seconds_ago(window_seconds))
+        except Exception:   # noqa: BLE001 - never block a reap on a lookup
+            return "GPU telemetry unavailable"
+        if not seen["samples"]:
+            return ("no GPU telemetry in that window, so no evidence of work "
+                    "either way")
+        return (f"GPU peaked at {seen['peak']}% over {seen['samples']} "
+                f"sample(s), under the {self.settings.idle.busy_util_pct}% "
+                f"bar for work")
+
     def _iso_seconds_ago(self, seconds: float) -> str:
         """The wall-clock ISO timestamp `seconds` before now.
 
@@ -1585,7 +1611,8 @@ class Dispatcher:
                 self._gpu_busy_noted.pop(instance_id, None)
                 await self._terminate_for(
                     instance_id, "idle",
-                    f"idle {now - last:.0f}s (limit {timeout:.0f}s)")
+                    f"idle {now - last:.0f}s (limit {timeout:.0f}s); "
+                    f"{self._telemetry_note(instance_id, timeout)}")
             except Exception:   # noqa: BLE001 - see the comment above
                 logger.exception("idle check failed for %s", instance_id)
                 continue
