@@ -608,6 +608,30 @@ class MockSSHConnection:
     async def run(self, command: str):
         self.commands.append(command)
 
+        # Detached-command parity (Phase 95), so mock mode and API-level
+        # tests exercise the real routes: a launch line reports a pid, a
+        # status probe reports RUNNING with a log tail, and the batch
+        # liveness check reports every handle it was asked about as alive.
+        # Perpetually-running is the honest mock: nothing in a fixture
+        # actually executes, and "still going" keeps the sweep-protection
+        # path live in the demo too.
+        if ".manifold/detached" in command:
+            if "tee" in command:
+                out = "4242"
+            elif "---MANIFOLD-LOG---" in command:
+                out = "RUNNING\n---MANIFOLD-LOG---\n(mock detached log)"
+            else:
+                import re as _re
+                out = "\n".join(sorted(
+                    set(_re.findall(r"\bd[0-9a-f]{11}\b", command))))
+
+            class _DetachedResult:
+                exit_status = 0
+                stdout = out
+                stderr = ""
+
+            return _DetachedResult()
+
         class _Result:
             exit_status = 0
             stdout = f"mock output of: {command}"

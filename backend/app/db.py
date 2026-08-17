@@ -255,6 +255,25 @@ CREATE TABLE IF NOT EXISTS project_brief (
     updated_at  TEXT
 );
 
+-- Phase 95: detached commands - long work started through Manifold that
+-- outlives the request (and the backend: all live state is ON the box,
+-- this row is the registry and the history). exit_code NULL with
+-- exited_at set means VANISHED: it ended and how is not knowable - never
+-- rendered as a normal exit.
+CREATE TABLE IF NOT EXISTS detached_commands (
+    handle       TEXT PRIMARY KEY,
+    instance_id  TEXT NOT NULL,
+    command      TEXT NOT NULL,
+    note         TEXT,
+    created_by   TEXT,
+    started_at   TEXT NOT NULL,
+    pid          INTEGER NOT NULL,
+    exit_code    INTEGER,
+    exited_at    TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_detached_instance
+    ON detached_commands(instance_id);
+
 CREATE TABLE IF NOT EXISTS watches (
     id              TEXT PRIMARY KEY,
     created_at      TEXT NOT NULL,
@@ -766,6 +785,54 @@ class Database:
             tuple(instance_ids),
         ).fetchall()
         return {r["instance_id"]: dict(r) for r in rows}
+
+    # -- detached commands (Phase 95) ---------------------------------------
+
+    def create_detached(self, *, handle: str, instance_id: str, command: str,
+                        note: str, created_by: str | None, pid: int) -> None:
+        self._execute(
+            """INSERT INTO detached_commands
+                   (handle, instance_id, command, note, created_by,
+                    started_at, pid)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (handle, instance_id, command, note, created_by, utcnow(), pid),
+        )
+
+    def finish_detached(self, handle: str, exit_code: int | None) -> None:
+        """Settle a handle. exit_code None means VANISHED - it ended and how
+        is not knowable. Idempotent-by-guard: the first settle wins, so a
+        late probe cannot overwrite a recorded exit with a vanish."""
+        self._execute(
+            """UPDATE detached_commands
+                  SET exit_code = ?, exited_at = ?
+                WHERE handle = ? AND exited_at IS NULL""",
+            (exit_code, utcnow(), handle),
+        )
+
+    def open_detached(self, instance_id: str) -> list[dict]:
+        """Handles on this instance that have not settled - what the
+        telemetry loop probes, and what counts as evidence of work."""
+        rows = self._execute(
+            """SELECT * FROM detached_commands
+                WHERE instance_id = ? AND exited_at IS NULL
+                ORDER BY started_at""",
+            (instance_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_detached(self, handle: str) -> dict | None:
+        row = self._execute(
+            "SELECT * FROM detached_commands WHERE handle = ?", (handle,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def list_detached(self, instance_id: str, limit: int = 20) -> list[dict]:
+        rows = self._execute(
+            """SELECT * FROM detached_commands WHERE instance_id = ?
+                ORDER BY started_at DESC LIMIT ?""",
+            (instance_id, limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
 
     def find_launch_by_instance(self, lambda_instance_id: str) -> dict | None:
         row = self._execute(

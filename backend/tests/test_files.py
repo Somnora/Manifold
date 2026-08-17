@@ -301,8 +301,10 @@ def test_mcp_server_still_structurally_thin():
         elif isinstance(node, ast.ImportFrom):
             imported.add(("." * node.level) + (node.module or ""))
     # asyncio: stdlib retry plumbing for wait_for_launch, not backend access.
+    # importlib.metadata: the bridge reads its OWN package version for drift
+    # detection precisely because it may not import app modules to ask them.
     assert imported <= {"__future__", "asyncio", "json", "os", "typing", "httpx",
-                        "mcp.server.fastmcp"}
+                        "importlib.metadata", "mcp.server.fastmcp"}
 
 # -- ranged download + resumable MCP download (Game Admin report 2026-07-17) ------
 

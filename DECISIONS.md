@@ -5833,3 +5833,78 @@ retry connection-refused errors through a restart window (a planned change), and
 it is the fact that makes "install the new backend" a routine operation rather
 than a scheduled outage. The etiquette of asking active sessions for a go/no-go
 remains good manners; this entry is why it is manners rather than necessity.
+
+## 2026-08-17 — Phase 95: facts move out of agents' memories
+
+**Source:** a product review by the heaviest agent user this platform has had —
+six launches, two mistaken terminations, a filesystem migration, a live backend
+upgrade mid-run. Seven findings; five built, each chosen because it moves a fact
+an agent had to REMEMBER into something the platform KNOWS. Verification
+sharpened the best one: the "45s cap" they resented on run_command is ours
+(capped so responses beat the MCP client's ~60s kill), and the nohup-and-poll
+boilerplate they called their most repeated friction was prescribed by that
+tool's own docstring. The workaround was our documented advice.
+
+**run_detached.** The command travels to the box as SFTP bytes — never through a
+shell line, so quoting stops being a hazard and injection stops being a
+category — and runs under setsid with a wrapper that records the exit code.
+State lives on the box plus one registry row, so a backend restart changes
+nothing (the property observed twice on this account). The liveness half is the
+point: the telemetry loop probes open handles in one round trip, and a live pid
+is EVIDENCE that keeps the idle sweep away — fresh evidence only, two sampling
+intervals, because stale confirmation protecting forever would be keep-alive
+wearing a lab coat. Four states read literally: running, exited, vanished
+(ended, HOW unknowable — exit_code stays NULL), unreachable (a state of the
+connection, never of the command). The explicit touch-file hint for work started
+OUTSIDE Manifold was considered and deliberately not built: run_detached exists
+precisely so that work is started through Manifold, and two protection channels
+would give the sweep two stories to reconcile.
+
+**The truthful-or-absent rule is now a hard rule in CLAUDE.md**, not a pattern
+in commit messages. And `purpose` is required at the agent surface: the MCP tool
+refuses a purposeless launch with the reason, while the backend stays permissive
+for the dashboard and older bridges. The dashboard's own launch form gained the
+field it never had — the audit that added `purpose` to the API left the app's
+own button producing unattributed boxes.
+
+**Connection-refused retries, timeouts never.** A refused request never reached
+the backend, so replaying it cannot double an effect; a sub-minute upgrade now
+reads as one slow call. Bounded at ~40s because the MCP client kills the request
+at ~60s and an answer nobody is listening for is not an answer. A TIMED-OUT
+request may have landed — replaying one could launch a second GPU — so timeouts
+surface immediately, always.
+
+**A drifted bridge says so.** /health now carries the backend version; the
+bridge (stdlib-only, per the AST wall — it reads its own version from
+importlib.metadata precisely because it may not import app modules) compares
+once and appends one line to every result while behind. Twice a tool shipped
+that a running agent provably needed and could not call, with nothing telling it
+a newer surface existed. The bridge still cannot be refreshed mid-session — it
+is a child of the agent's session, not of the app — but "you are behind, and
+here is what that costs you" is the half Manifold can own.
+
+**Storage is an estimate, and says whose.** Lambda publishes no filesystem rate,
+so ~$50/month sat invisible in every reportable number until a manual audit.
+The rate now lives in config.yaml where the user vouches for it; spend reports a
+`storage_estimate` block computed FROM its own displayed figures (the two shown
+numbers multiply to the shown estimate), never folded into launch totals, and
+absent — not $0 — when the rate is 0 or the filesystems cannot be read. Born
+readable: a test loads it from YAML, the busy_util_pct lesson applied at birth.
+
+**Deferred:** multi-filesystem mounts (the provider layer already takes a list;
+Manifold's request models narrow it to one — a launch-path change deserving its
+own phase), and true mid-session bridge refresh (not Manifold's to fix).
+
+## 2026-08-17 — Design constraint recorded for the vllm extra_args passthrough
+
+Not built yet (queued for the next phase); written down now because it is the
+kind of fact that dies in a chat scrollback. Both agent reviews rank a template
+`extra_args` passthrough for vllm-serve as the highest-leverage missing piece —
+one inexpressible flag (`--max-num-seqs`) forced a hand-rolled server that cost
+proxy routing, activity visibility, log streaming, and restart supervision in
+one move. The refinement, from the session that hit it: **the allowlist matters
+more than the passthrough.** `--max-num-seqs` and `--gpu-memory-utilization`
+are tuning knobs; `--download-dir` and `--trust-remote-code` are supply-chain
+surface. A template that passes arguments through verbatim has traded an OOM
+problem for a supply-chain one. A dozen NAMED flags covers every case either
+reviewer hit; anything outside the list is refused with the list in the error.

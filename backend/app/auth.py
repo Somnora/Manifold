@@ -201,6 +201,12 @@ ROUTE_ROLES: dict[tuple[str, str], str] = {
     ("POST", "/instances/{instance_id}/rescue"): "operator",
     ("POST", "/instances/{instance_id}/ide-attach"): "operator",
     ("POST", "/instances/{instance_id}/run"): "operator",
+    # Detached commands (Phase 95): starting one is command execution, so it
+    # is operator like /run; reading status is the same privilege as reading
+    # logs. Viewers may watch, not launch.
+    ("POST", "/instances/{instance_id}/run-detached"): "operator",
+    ("GET", "/instances/{instance_id}/detached/{handle}"): "viewer",
+    ("GET", "/instances/{instance_id}/detached"): "viewer",
     ("POST", "/instances/{instance_id}/chat"): "operator",
     ("WS", "/instances/{instance_id}/terminal"): "operator",
     ("WS", "/local/terminal"): "operator",

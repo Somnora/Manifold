@@ -66,9 +66,11 @@ def test_mcp_server_is_structurally_thin():
             module = node.module or ""
             imported.add(("." * node.level) + module)
     # asyncio is stdlib plumbing (retry sleep/deadline in wait_for_launch),
-    # not a path into backend internals.
+    # not a path into backend internals. importlib.metadata likewise: the
+    # bridge reads its OWN package version for drift detection precisely
+    # because it may not import app modules to ask them.
     allowed = {"__future__", "asyncio", "json", "os", "typing", "httpx",
-               "mcp.server.fastmcp"}
+               "importlib.metadata", "mcp.server.fastmcp"}
     assert imported <= allowed, (
         f"MCP server imports beyond the thin-client allowlist: "
         f"{imported - allowed}"
@@ -91,7 +93,7 @@ async def test_budget_guard_identical_for_mcp_and_dashboard(mcp_wired, mock_clie
     result = await mcp_server.launch_gpu(
         instance_type="gpu_8x_a100_80gb_sxm4",
         region="us-east-1",
-        filesystem="manifold-data",
+        filesystem="manifold-data", purpose="test fixture box",
         note="gate-6 parity test",
     )
     assert result["error"] == dashboard_detail
@@ -103,7 +105,7 @@ async def test_budget_guard_identical_for_mcp_and_dashboard(mcp_wired, mock_clie
 async def test_region_guard_applies_to_mcp(mcp_wired, mock_client):
     result = await mcp_server.launch_gpu(
         instance_type="gpu_1x_a10", region="us-west-1",
-        filesystem="manifold-data",
+        filesystem="manifold-data", purpose="test fixture box",
     )
     assert "Region mismatch" in result["error"]
     assert mock_client.launch_calls == []
@@ -113,7 +115,7 @@ async def test_terminate_blocked_returns_file_list(mcp_wired, mock_client):
     import asyncio
     launch = await mcp_server.launch_gpu(
         instance_type="gpu_1x_a10", region="us-east-1",
-        filesystem="manifold-data", note="for hook test",
+        filesystem="manifold-data", purpose="test fixture box", note="for hook test",
     )
     launch_id = launch["launch"]["id"]
     for _ in range(200):
@@ -148,7 +150,7 @@ async def test_wait_for_launch_blocks_until_ready(mcp_wired):
     record in one call - no client poll loop."""
     launch = await mcp_server.launch_gpu(
         instance_type="gpu_1x_a10", region="us-east-1",
-        filesystem="manifold-data", note="wait tool test",
+        filesystem="manifold-data", purpose="test fixture box", note="wait tool test",
     )
     settled = await mcp_server.wait_for_launch(
         launch["launch"]["id"], timeout=5, note="await boot")
@@ -184,7 +186,7 @@ async def test_wait_for_launch_absorbs_a_restart_mid_park(mcp_wired, monkeypatch
     launch that is actually fine."""
     launch = await mcp_server.launch_gpu(
         instance_type="gpu_1x_a10", region="us-east-1",
-        filesystem="manifold-data", note="restart-mid-wait test",
+        filesystem="manifold-data", purpose="test fixture box", note="restart-mid-wait test",
     )
     flaky = _FlakyClient(mcp_server._client, fail_first=1)
     monkeypatch.setattr(mcp_server, "_client", flaky)
@@ -227,7 +229,7 @@ async def test_every_tool_call_is_audited(mcp_wired):
     await mcp_server.list_templates(note="looking for whisper")
     await mcp_server.launch_gpu(
         instance_type="gpu_8x_a100_80gb_sxm4", region="us-east-1",
-        filesystem="manifold-data", note="too expensive on purpose",
+        filesystem="manifold-data", purpose="test fixture box", note="too expensive on purpose",
     )
     resp = await mcp_server._http().get("/audit", params={"actor": "mcp"})
     entries = resp.json()["entries"]
@@ -255,7 +257,7 @@ async def test_worked_example_transcribe_inbox_then_shut_down(mcp_wired, mock_cl
     # Launch and wait until active.
     launch = await mcp_server.launch_gpu(
         instance_type="gpu_1x_a10", region="us-east-1",
-        filesystem="manifold-data", note="GPU for whisper batch",
+        filesystem="manifold-data", purpose="test fixture box", note="GPU for whisper batch",
     )
     launch_id = launch["launch"]["id"]
     for _ in range(300):
