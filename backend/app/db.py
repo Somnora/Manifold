@@ -737,6 +737,36 @@ class Database:
         ).fetchone()
         return {"samples": row["samples"] or 0, "peak": row["peak"]}
 
+    def latest_telemetry(self, instance_ids: list[str]) -> dict[str, dict]:
+        """The most recent GPU sample for each of these instances, keyed by id.
+
+        ONE query for the whole fleet, not one per box: this feeds a view that
+        polls, and the N+1 version would put a query per instance behind every
+        tick. The `(instance_id, at)` index serves it as a seek per id.
+
+        Uses SQLite's documented bare-column-with-MAX form: when MAX() is the
+        aggregate, the other selected columns come from the row that produced
+        it. That is a real guarantee in SQLite, not an accident of ordering.
+
+        An instance with no samples is simply ABSENT from the result, never a
+        row of zeroes. A caller must be able to tell "never measured" from
+        "measured, and idle" - the whole point of the sampling in the first
+        place - and `at` rides along so a caller can also tell a fresh reading
+        from a stale one rather than presenting old numbers as current.
+        """
+        if not instance_ids:
+            return {}
+        marks = ",".join("?" for _ in instance_ids)
+        rows = self._execute(
+            f"""SELECT instance_id, MAX(at) AS at, gpu_name, vram_used_mib,
+                       vram_total_mib, util_pct, util_pct_mean, gpu_count
+                  FROM telemetry_samples
+                 WHERE instance_id IN ({marks})
+                 GROUP BY instance_id""",
+            tuple(instance_ids),
+        ).fetchall()
+        return {r["instance_id"]: dict(r) for r in rows}
+
     def find_launch_by_instance(self, lambda_instance_id: str) -> dict | None:
         row = self._execute(
             """SELECT * FROM launches WHERE lambda_instance_id = ?

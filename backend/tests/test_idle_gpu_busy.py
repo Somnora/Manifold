@@ -271,6 +271,31 @@ async def test_the_check_can_be_switched_off(harness):
     assert [i for i, _ in harness.terminated] == ["i-working"]
 
 
+def test_the_config_key_is_actually_readable(tmp_path):
+    """It shipped documented-but-inert. config.py's loader names every idle
+    field explicitly, so a setting missing from that list keeps its dataclass
+    default whatever config.yaml says - which made "set it to 0 to switch the
+    check off" a false instruction in a comment I wrote."""
+    from app.config import load_settings
+    (tmp_path / "config.yaml").write_text(
+        "idle:\n  timeout_seconds: 1800\n  busy_util_pct: 42\n")
+    settings = load_settings(config_path=tmp_path / "config.yaml",
+                             env_path=tmp_path / ".env")
+    assert settings.idle.busy_util_pct == 42
+
+
+def test_the_window_bound_matches_the_stored_timestamp_format(harness):
+    """SQLite compares these as strings. db.utcnow() writes
+    timespec="seconds"; a bound carrying microseconds sorts AFTER a stored
+    value in the same second ('.' > '+'), silently dropping the boundary
+    second."""
+    from app.db import utcnow
+    bound = harness.dispatcher._iso_seconds_ago(0)
+    assert len(bound) == len(utcnow()), (
+        f"bound {bound!r} does not match stored format {utcnow()!r}")
+    assert "." not in bound.split("+")[0]
+
+
 def test_peak_and_sample_count_are_reported_separately(db):
     """No samples and all-zero samples are opposite findings. Collapsing
     them into a bare peak of 0 would rebuild, inside the fix, the inference

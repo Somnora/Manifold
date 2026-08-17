@@ -10,7 +10,7 @@ import { StatusBadge } from "@/components/Badge";
 import { WatchPanel } from "@/components/WatchPanel";
 import { ClusterPanel } from "@/components/ClusterPanel";
 import { VisualTaskGraph } from "@/components/VisualTaskGraph";
-import { MultiGpuTelemetry } from "@/components/MultiGpuTelemetry";
+import { FleetPanel } from "@/components/FleetPanel";
 import { Onboarding } from "@/components/Onboarding";
 import {
   useSpendSummary,
@@ -67,9 +67,9 @@ export default function InstancesPage() {
   // Gates for the pure-view panels: only render them when they have something
   // to show, so the default (empty/mock) screen isn't three big empty boxes.
   const hasTasks = (taskList?.length ?? 0) > 0;
-  const hasTelemetry = launches.some(
-    (l) => l.status === "active" && l.lambda_instance_id,
-  );
+  // The fleet panel keys off INSTANCES, not launches: it reports on boxes that
+  // exist, and a launch is only a request for one.
+  const hasFleet = instances.some((i) => i.status === "active");
 
   // Launches still working their way toward an instance card.
   const inFlight = launches.filter((l) => IN_FLIGHT.includes(l.status));
@@ -196,7 +196,11 @@ export default function InstancesPage() {
       {/* The task graph and live telemetry are pure views. Mount each only
           when it has data; otherwise show a compact single-line placeholder so
           the empty/mock screen reads as intentional, not broken. */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+      {/* items-start, not the default stretch: these two are independent
+          panels, and letting the shorter one inherit the taller one's height
+          is what left the telemetry panel as one small tile floating in a
+          column of dead space. */}
+      <div className="grid grid-cols-1 items-start gap-6 lg:grid-cols-2">
         {hasTasks ? (
           <VisualTaskGraph />
         ) : (
@@ -204,11 +208,11 @@ export default function InstancesPage() {
             Agent task graph appears here when jobs or cluster tasks run.
           </p>
         )}
-        {hasTelemetry ? (
-          <MultiGpuTelemetry />
+        {hasFleet ? (
+          <FleetPanel instances={instances} />
         ) : (
           <p className="rounded-xl border border-dashed border-zinc-300 bg-zinc-50 px-4 py-3 text-xs text-zinc-500">
-            Live GPU telemetry streams here once an instance is online.
+            Running instances and their GPU load appear here.
           </p>
         )}
       </div>

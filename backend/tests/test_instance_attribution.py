@@ -443,6 +443,64 @@ async def test_a_terminated_box_stops_reporting_serving(harness):
     assert harness.dispatcher.activity_status("i-doomed")["state"] == "unknown"
 
 
+# -- the last GPU reading, for the fleet view -----------------------------------
+
+
+def test_latest_telemetry_returns_the_newest_row_per_instance(db):
+    """One query for the whole fleet. The fleet panel polls, so the per-box
+    version would put a query per instance behind every tick - the shape of
+    the pile-up Phase 93 had to undo."""
+    for at, util in [("2026-08-17T09:00:00+00:00", 10),
+                     ("2026-08-17T09:01:00+00:00", 90),
+                     ("2026-08-17T09:00:30+00:00", 50)]:
+        db.record_telemetry_sample("i-a", gpu_name="A100", vram_used_mib=100,
+                                   vram_total_mib=40960, util_pct=util, at=at)
+    db.record_telemetry_sample("i-b", gpu_name="A100", vram_used_mib=7,
+                               vram_total_mib=40960, util_pct=3,
+                               at="2026-08-17T08:00:00+00:00")
+
+    latest = db.latest_telemetry(["i-a", "i-b"])
+
+    assert latest["i-a"]["util_pct"] == 90, "not the newest row"
+    assert latest["i-a"]["at"] == "2026-08-17T09:01:00+00:00"
+    assert latest["i-b"]["util_pct"] == 3
+
+
+def test_an_unsampled_instance_is_absent_not_zero(db):
+    """A row of zeroes would read as "measured, and idle". Absent means
+    "never measured", and the fleet panel must be able to say so - the same
+    distinction as busy=null."""
+    db.record_telemetry_sample("i-seen", gpu_name="A100", vram_used_mib=1,
+                               vram_total_mib=2, util_pct=0)
+
+    latest = db.latest_telemetry(["i-seen", "i-never"])
+
+    assert "i-seen" in latest
+    assert "i-never" not in latest
+
+
+def test_latest_telemetry_of_nothing_is_not_a_query(db):
+    assert db.latest_telemetry([]) == {}
+
+
+def test_the_instances_payload_carries_the_last_gpu_reading(owner):
+    """End to end: the fleet panel reads this field, and it must be None
+    rather than absent when a box has never been sampled."""
+    iid = launch(owner)
+    inst = instance(owner, iid)
+    assert "telemetry" in inst, "the fleet panel has nothing to render"
+    assert inst["telemetry"] is None, "never sampled must be null, not zeroes"
+
+    owner.app.state.orchestrator.db.record_telemetry_sample(
+        iid, gpu_name="A100", vram_used_mib=36657, vram_total_mib=40960,
+        util_pct=100, util_pct_mean=100.0, gpu_count=1)
+
+    got = instance(owner, iid)["telemetry"]
+    assert got["util_pct"] == 100
+    assert got["vram_used_mib"] == 36657
+    assert got["at"], "a reading with no timestamp cannot be aged"
+
+
 def test_the_verdict_reaches_the_instances_payload(owner):
     """The unit tests above prove the dispatcher knows. This proves it
     actually leaves the dispatcher, which is the entire complaint."""

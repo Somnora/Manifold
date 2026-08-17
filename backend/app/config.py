@@ -482,6 +482,12 @@ def load_settings(
                 idle.get("max_lifetime_max_seconds", 2_592_000)),
             ceiling_warning_seconds=float(
                 idle.get("ceiling_warning_seconds", 600)),
+            # This loader lists every field explicitly, so a new setting that
+            # is not named here is silently unreadable from config.yaml: it
+            # keeps the dataclass default no matter what the file says. This
+            # one shipped documented-but-inert for exactly that reason, which
+            # means "set it to 0 to switch the check off" was untrue.
+            busy_util_pct=int(idle.get("busy_util_pct", 10)),
         ),
         watches=WatchSettings(
             poll_seconds=float(watches.get("poll_seconds", 60)),

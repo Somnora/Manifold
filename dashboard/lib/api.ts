@@ -162,6 +162,48 @@ export type Instance = {
   // Why the ceiling fired without terminating: a running batch job, an
   // auto-managed teardown, or an unreachable instance.
   ceiling_deferred_by: string | null;
+  // WHOSE box, and WHAT FOR. Several agents share one account and this list
+  // was their only view of it; an instance another session was mid-way
+  // through using read as "unexplained" and got terminated. Both are null for
+  // an adopted box and for anything launched before they shipped — rendered
+  // as unattributed, never guessed.
+  created_by: string | null;
+  purpose: string | null;
+  // The idle sweep's own verdict. `busy` is the FACTUAL question (is work
+  // loaded and running here), and is null — never false — when the sweep
+  // could not tell. "No evidence of work" is not "evidence of no work", and
+  // conflating them is what destroyed a model server that was still loading.
+  activity: {
+    state:
+      | "up"
+      | "loading"
+      | "serving"
+      | "gpu_busy"
+      | "batch_running"
+      | "auto_managed"
+      | "keep_alive"
+      | "idle_countdown"
+      | "booting"
+      | "unreachable"
+      | "unknown";
+    busy: boolean | null;
+    reason: string;
+    age_seconds: number | null;
+  };
+  // The last GPU sample the dispatcher recorded (every ~30s), served from
+  // SQLite. null when this box has never been sampled — not a row of zeroes,
+  // because "never measured" and "measured, idle" are different facts. `at`
+  // is here so a stale reading is never drawn as a live one.
+  telemetry: {
+    at: string;
+    gpu_name: string | null;
+    vram_used_mib: number | null;
+    vram_total_mib: number | null;
+    // Busiest card on the box. util_pct_mean is the average across cards.
+    util_pct: number | null;
+    util_pct_mean: number | null;
+    gpu_count: number | null;
+  } | null;
 };
 
 export type Launch = {

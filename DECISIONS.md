@@ -5670,3 +5670,70 @@ launchd/Task Scheduler decision the owner should make deliberately, not somethin
 to inherit from a bug fix. And the tombstone only starts telling the truth after
 the first relaunch that carries it; until then `previous_run_ended_cleanly`
 reports None, which is honest rather than wrong.
+
+## 2026-08-17 — The fleet panel, and why it does not stream
+
+**Decided:** `MultiGpuTelemetry` is replaced by `FleetPanel` — one compact row per
+running instance (name, purpose, GPU and VRAM bars, activity state, idle
+countdown) with an aggregate footer. It reads the LAST RECORDED telemetry sample
+from SQLite, served as a new `telemetry` key on each row of `GET /instances`, and
+it opens no stream of its own.
+
+**What it replaced.** The old panel called itself "Real-time multi-node cluster
+aggregation" and aggregated nothing: it was a tab switcher that rendered ONE
+instance at a time using the same `TelemetryChart` the instance card already shows
+below. So it duplicated the card, labelled each box by launch id while the card
+labelled it by name — two names for one box on one screen — and it did not use
+Manifold's actual cluster concept at all, listing active launches instead.
+
+**Why it looked broken, which was a third, separate thing.** It sits in a
+half-width cell (`grid-cols-1 lg:grid-cols-2`), and CSS grid rows stretch to the
+tallest sibling. One small tile inherited `VisualTaskGraph`'s height, leaving a
+column of dead space. Fixed with `items-start` on the row and `self-start` on the
+panel. The same squeeze is why the card's text wrapped mid-word: `TelemetryChart`
+is built for a full-width instance card.
+
+**Why SQLite and not the live stream.** This is the load-bearing decision.
+`TelemetryChart` gets its numbers over a WebSocket that the backend feeds by
+opening and tearing down an SSH local port forward **every two seconds**
+(`sidecar_client.py`, `_request` → `_forward` → `finally: close`). That is
+affordable for one focused chart. For a fleet list it is not: eight rows would be
+roughly 240 SSH channels a minute to draw eight progress bars, duplicating work
+the dispatcher already does on its own 30s telemetry loop. Nothing in that chain
+multiplexes — `sidecar_for()` builds a fresh client per call.
+
+So the panel reads `telemetry_samples`, which is already collected and paid for,
+via one hoisted `db.latest_telemetry()` query for the whole fleet. Not one query
+per instance inside the loop: this route is the hottest in the app (the home page
+polls it every 2s) and an N+1 there is the shape of the pile-up Phase 93 had to
+undo. The panel itself polls nothing — instances are passed down from the page,
+which is already polling.
+
+**The cost of reading a stored sample is that it can be stale, so the panel says
+so.** Each row carries `at`; past 150s the bars grey out and the row is labelled
+with the reading's age. The aggregate averages only over boxes with a current
+reading and reports how many were excluded, because folding a stale or missing
+box in as zero would drag a busy fleet toward idle — the same
+absence-treated-as-a-zero mistake the rest of this file keeps unlearning. An
+instance never sampled is absent from `latest_telemetry` entirely and renders as
+"No GPU reading yet — not the same as idle", never as 0%.
+
+**Two defects this surfaced, both mine, both from the release two hours earlier.**
+
+- `Instance` in `lib/api.ts` did not declare `activity`, `created_by` or
+  `purpose`. The backend had been sending them since v0.2.4 and TypeScript did
+  not know they existed; there were zero consumers. Fields shipped for agents,
+  invisible to the app.
+- `idle.busy_util_pct` was documented in config.yaml and **unreadable**.
+  `load_settings` names every idle field explicitly, so a setting missing from
+  that list keeps its dataclass default whatever the file says — which made "set
+  it to 0 to switch the check off", a sentence I wrote in that file, untrue.
+  Also fixed: `_iso_seconds_ago` emitted microseconds while `db.utcnow()` writes
+  `timespec="seconds"`, and SQLite compares these as strings, so a bound in the
+  same second sorted after the stored value ('.' > '+') and silently dropped the
+  boundary second from the window.
+
+Both were found by standing the thing up against a mock backend and looking at
+it, not by the tests — which is the same way the `busy: false` defect was found
+two hours earlier, and is becoming the pattern worth naming: these tests are good
+at proving the path they model and blind to the one the user takes.

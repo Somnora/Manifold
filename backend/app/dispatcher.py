@@ -494,10 +494,16 @@ class Dispatcher:
         Uses real time, not self._clock: _clock is a monotonic test seam,
         while telemetry rows are stamped with utcnow(). Comparing the two
         would silently select nothing.
+
+        timespec="seconds" to MATCH db.utcnow() exactly. These are compared as
+        strings by SQLite, and a bound carrying microseconds sorts after a
+        stored value in the same second ('.' > '+'), which quietly drops the
+        boundary second from the window. One second, but the kind of thing
+        that is invisible until it matters.
         """
         from datetime import datetime, timedelta, timezone
-        return (datetime.now(timezone.utc)
-                - timedelta(seconds=seconds)).isoformat()
+        return (datetime.now(timezone.utc) - timedelta(seconds=seconds)
+                ).isoformat(timespec="seconds")
 
     def _note_activity(self, instance_id: str, state: str, busy: bool | None,
                        reason: str) -> None:

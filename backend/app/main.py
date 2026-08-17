@@ -1426,6 +1426,11 @@ def create_app(
     @app.get("/instances")
     async def list_instances():
         instances = await orchestrator.instances_with_state()
+        # Hoisted: ONE query for the whole fleet, not one per instance inside
+        # the loop. This route is the hottest in the app (the home page polls
+        # it every 2s), and an N+1 here would put a query per box behind every
+        # tick — the shape of the pile-up Phase 93 had to undo.
+        latest_telemetry = db.latest_telemetry([i["id"] for i in instances])
         for inst in instances:
             # Loaded ONCE and shared by the three helpers below: this runs on
             # a poll x N instances, and the same row answering all three
@@ -1446,6 +1451,15 @@ def create_app(
             # way to say so. Unconditional, unlike idle: "unreachable" is
             # itself the answer a reader needs most.
             inst["activity"] = dispatcher.activity_status(inst["id"], launch)
+            # The last GPU reading the dispatcher recorded, or None if this box
+            # has never been sampled. None and not a row of zeroes: a reader
+            # must be able to tell "never measured" from "measured, idle", and
+            # `at` rides along so a stale sample cannot be drawn as a live one.
+            # This is the same data the dispatcher already collects every 30s,
+            # served from SQLite - NOT a second live stream. A live read costs
+            # an SSH port-forward per instance every 2 seconds, which is
+            # affordable for one focused chart and not for a fleet list.
+            inst["telemetry"] = latest_telemetry.get(inst["id"])
             # The max-lifetime ceiling sits on the INSTANCE, deliberately not
             # inside inst["idle"]: idle is None for a box that is not
             # connected, and a box that has dropped off SSH while past its
