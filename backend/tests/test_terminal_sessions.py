@@ -15,6 +15,8 @@ from app.terminal_sessions import (
     FLOW_HIGH_WATER,
     FLOW_LOW_WATER,
     SCROLLBACK_CHARS,
+    WS_SHELL_GONE,
+    WS_TAKEN_OVER,
     TerminalSession,
     TerminalSessionManager,
 )
@@ -39,14 +41,22 @@ class FakeWS:
     def __init__(self):
         self.sent: list[str] = []
         self.closed = False
+        # The code we were closed WITH. The panel reconnects on an
+        # unexplained close, so which code a close carries is behavior, not
+        # decoration, and a fake that swallowed the argument would let a
+        # missing one pass. (It did: this signature used to take no code,
+        # so the real close raised TypeError inside a bare `except
+        # Exception: pass` and the socket was never marked closed at all.)
+        self.close_code: int | None = None
 
     async def send_text(self, text: str):
         if self.closed:
             raise RuntimeError("closed")
         self.sent.append(text)
 
-    async def close(self):
+    async def close(self, code: int | None = None):
         self.closed = True
+        self.close_code = code
 
 
 async def test_attach_replays_scrollback():
@@ -180,6 +190,10 @@ async def test_second_attach_steals_the_session():
     await session.attach(first)
     await session.attach(second)
     assert first.closed
+    # TAKEN_OVER, not a bare close. The panel reconnects on an unexplained
+    # one, so without the code these two tabs would steal the session back
+    # and forth from each other for as long as both stayed open.
+    assert first.close_code == WS_TAKEN_OVER
     assert any("attached elsewhere" in t for t in first.sent)
     await session.feed("for the new tab")
     assert second.sent[-1] == "for the new tab"

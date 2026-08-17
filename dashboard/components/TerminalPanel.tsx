@@ -23,6 +23,7 @@ export function TerminalPanel({
   fill,
   sessionId,
   model,
+  resumed,
 }: {
   instanceId?: string;
   wsPath?: string;
@@ -31,19 +32,33 @@ export function TerminalPanel({
   // by the terminal drawer, whose own top-edge handle does the resizing.
   fill?: boolean;
   sessionId?: string;
+  // This panel expects a shell to already exist for its session id (a dock
+  // tab restored from sessionStorage). The backend cannot tell that from a
+  // brand-new id, and it decides whether "your previous shell ended" is
+  // true or a false alarm - so it is told. Any reconnect counts too.
+  resumed?: boolean;
   // Local shells only: pre-wire the shell's environment to this served
   // model via the OpenAI proxy (OPENAI_BASE_URL etc., set backend-side).
   model?: string;
 }) {
   const containerRef = useRef<HTMLDivElement>(null);
-  const [status, setStatus] = useState<"connecting" | "open" | "closed">(
-    "connecting",
-  );
+  // "reconnecting" is a lost socket the panel is actively going back for;
+  // "closed" means it has stopped trying, which now only happens when the
+  // backend said the shell is really gone.
+  const [status, setStatus] = useState<
+    "connecting" | "open" | "closed" | "reconnecting"
+  >("connecting");
   // Which renderer actually took: "webgl" draws glyphs on the GPU; "dom" is
   // xterm's fallback, which is MUCH slower under heavy output. Shown in the
   // header because a silent fallback is indistinguishable from a bug — if
   // the terminal is sluggish, this says whether the GPU path is even live.
   const [renderer, setRenderer] = useState<"webgl" | "dom">("dom");
+  // Read through a ref so it is NOT an effect dependency. Re-running the
+  // effect tears the panel down, and this panel's cleanup sends {"type":
+  // "close"} - which really ends the shell. A prop that only decides the
+  // wording of a banner must never be able to do that.
+  const resumedRef = useRef(resumed);
+  resumedRef.current = resumed;
 
   useEffect(() => {
     const el = containerRef.current;
@@ -182,6 +197,11 @@ export function TerminalPanel({
       // shell stayed at its 80x24 default while the view was wider, and the
       // app wrapped at column 80 and typed back over its own line. Hence the
       // readyState check BEFORE the dedup, not after it.
+      //
+      // `ws` is null while we are between sockets (the backoff after a
+      // dropped connection), so every use of it is guarded rather than
+      // assumed live.
+      let ws: WebSocket | null = null;
       let fitQueued = false;
       let lastCols = 0;
       let lastRows = 0;
@@ -195,7 +215,7 @@ export function TerminalPanel({
           } catch {
             return;
           }
-          if (ws.readyState !== WebSocket.OPEN) return;
+          if (!ws || ws.readyState !== WebSocket.OPEN) return;
           if (term.cols === lastCols && term.rows === lastRows) return;
           lastCols = term.cols;
           lastRows = term.rows;
@@ -236,7 +256,7 @@ export function TerminalPanel({
       term.attachCustomKeyEventHandler((ev) => {
         const down = ev.type === "keydown";
         if (ev.shiftKey && ev.key === "Enter") {
-          if (down && ws.readyState === WebSocket.OPEN) {
+          if (down && ws && ws.readyState === WebSocket.OPEN) {
             // Terminals cannot natively tell Shift+Enter from Enter, so
             // send backslash+CR: the escaped newline the Claude CLI (and
             // every shell, as line continuation) understands.
@@ -267,43 +287,133 @@ export function TerminalPanel({
       });
 
       const path = wsPath ?? `/instances/${instanceId}/terminal`;
-      const params = new URLSearchParams();
-      if (sessionId) params.set("session", sessionId);
-      if (model) params.set("model", model);
-      // Browser WebSockets cannot set headers, so the API token rides as
-      // ?token= (the backend accepts either spelling on WS routes).
-      const token = getToken();
-      if (token) params.set("token", token);
-      const qs = params.size > 0 ? `?${params.toString()}` : "";
-      const ws = new WebSocket(`${wsBase()}${path}${qs}`);
+      // Rebuilt per attempt, not once: the API token can arrive AFTER the
+      // first connect (the TokenGate unlocks mid-session), and a reconnect
+      // that reused a stale query string would be refused forever.
+      const socketUrl = () => {
+        const params = new URLSearchParams();
+        if (sessionId) params.set("session", sessionId);
+        // A restored tab, or any socket after the first: both mean a shell
+        // was supposed to be here. If the backend has to build a new one it
+        // will say so, which is only honest when we actually expected one.
+        if (sessionId && (resumedRef.current || reattaching)) {
+          params.set("resume", "1");
+        }
+        if (model) params.set("model", model);
+        // Browser WebSockets cannot set headers, so the API token rides as
+        // ?token= (the backend accepts either spelling on WS routes).
+        const token = getToken();
+        if (token) params.set("token", token);
+        const qs = params.size > 0 ? `?${params.toString()}` : "";
+        return `${wsBase()}${path}${qs}`;
+      };
 
-      ws.onopen = () => {
-        setStatus("open");
-        // Fit once the socket is up so the initial resize reaches the PTY.
-        requestAnimationFrame(doFit);
-        term.focus();
-      };
-      // Flow control: ack how many chars we've actually rendered so the
-      // backend can pause a firehose (or a full-screen TUI like Claude Code)
-      // instead of letting xterm's write buffer grow without bound — the
-      // remaining cause of the freeze under heavy output. The write callback
-      // fires once xterm has parsed the chunk (the right "rendered" signal)
-      // and carries NO scrollToBottom, so it doesn't bring back the per-chunk
-      // reflow; xterm still auto-scrolls when the viewport is at the bottom.
-      // Acks are batched (~8 KB) to avoid a message per chunk.
-      let unacked = 0;
-      ws.onmessage = (event) => {
-        const data = event.data as string;
-        term.write(data, () => {
-          unacked += data.length;
-          if (unacked >= 8192 && ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify({ type: "ack", bytes: unacked }));
-            unacked = 0;
+      // The backend says "do not come back" with a close code: the shell
+      // ended (4410), another view stole this session (4409), or the origin
+      // was refused (4403). See terminal_sessions.py. EVERY other close is
+      // a lost socket - a slept laptop, a backend restart - and with a
+      // session id the shell is still there, parked, waiting for exactly
+      // this reattach. Phase 91 gave it an 8 hour grace to be parked IN;
+      // nothing used to go back for it, so the grace bought nothing you
+      // could see and a dead rectangle was the whole user experience.
+      const FINAL_CLOSE = [4403, 4409, 4410];
+      let attempt = 0;
+      let reconnectTimer = 0;
+      let reattaching = false;
+      // Set by cleanup. `disposed` covers the same case, but an unmount
+      // races the socket's own close event and reconnecting out of a
+      // torn-down panel would resurrect a shell the user just closed.
+      let closing = false;
+
+      const connect = () => {
+        if (disposed || closing) return;
+        setStatus(reattaching ? "reconnecting" : "connecting");
+        const sock = new WebSocket(socketUrl());
+        ws = sock;
+        // Flow control: ack how many chars we've actually rendered so the
+        // backend can pause a firehose (or a full-screen TUI like Claude
+        // Code) instead of letting xterm's write buffer grow without bound —
+        // the remaining cause of the freeze under heavy output. The write
+        // callback fires once xterm has parsed the chunk (the right
+        // "rendered" signal) and carries NO scrollToBottom, so it doesn't
+        // bring back the per-chunk reflow; xterm still auto-scrolls when the
+        // viewport is at the bottom. Acks are batched (~8 KB) to avoid a
+        // message per chunk. Counted per socket: attach() resets the
+        // backend's side of this accounting for each new viewer.
+        let unacked = 0;
+
+        sock.onopen = () => {
+          attempt = 0;
+          setStatus("open");
+          if (reattaching) {
+            reattaching = false;
+            if (sessionId) {
+              // attach() replays the ENTIRE scrollback, which this terminal
+              // is already displaying. Without the reset the reattach paints
+              // a second copy of the session below the first.
+              term.reset();
+            } else {
+              // No session id means no shell was kept: this is a new one,
+              // and saying so beats a prompt that silently lost its state.
+              term.write(
+                "\r\n[manifold] reconnected. This is a NEW shell; the "
+                + "previous one did not survive.\r\n",
+              );
+            }
           }
-        });
+          // The PTY on the far side knows only the size it was last TOLD,
+          // and lastCols/lastRows mean exactly that - so a fresh socket has
+          // to forget them, or the first refit is deduped away and the shell
+          // wraps at whatever width it had before the window was resized.
+          lastCols = 0;
+          lastRows = 0;
+          // Fit once the socket is up so the initial resize reaches the PTY.
+          requestAnimationFrame(doFit);
+          term.focus();
+        };
+        sock.onmessage = (event) => {
+          const data = event.data as string;
+          term.write(data, () => {
+            unacked += data.length;
+            if (unacked >= 8192 && sock.readyState === WebSocket.OPEN) {
+              sock.send(JSON.stringify({ type: "ack", bytes: unacked }));
+              unacked = 0;
+            }
+          });
+        };
+        // onerror is always followed by onclose, so the decision lives in
+        // one place rather than being made twice from half the information.
+        sock.onerror = () => {};
+        sock.onclose = (ev) => {
+          if (ws === sock) ws = null;
+          if (disposed || closing || FINAL_CLOSE.includes(ev.code)) {
+            setStatus("closed");
+            return;
+          }
+          reattaching = true;
+          setStatus("reconnecting");
+          // Backoff, capped at 10s: a backend that is genuinely down gets
+          // retried patiently rather than hammered, but the first retry is
+          // quick because the overwhelmingly common case is a socket that
+          // died while the machine slept and a backend that is already fine.
+          const delay = Math.min(10_000, 500 * 2 ** attempt);
+          attempt += 1;
+          window.clearTimeout(reconnectTimer);
+          reconnectTimer = window.setTimeout(connect, delay);
+        };
       };
-      ws.onclose = () => setStatus("closed");
-      ws.onerror = () => setStatus("closed");
+      connect();
+
+      // Coming back to the app should not mean waiting out a backoff that
+      // was scheduled while nobody was looking. This IS the reported case:
+      // step away, come back, find the terminal dead.
+      const onVisible = () => {
+        if (document.hidden || disposed || closing || ws) return;
+        window.clearTimeout(reconnectTimer);
+        attempt = 0;
+        connect();
+      };
+      document.addEventListener("visibilitychange", onVisible);
 
       const dataSub = term.onData((data) => {
         // Typing always snaps the view to the cursor (a real terminal's
@@ -311,7 +421,7 @@ export function TerminalPanel({
         // left the user typing "blind" below the fold, which reads as
         // text overwriting itself with no visible cursor.
         term.scrollToBottom();
-        if (ws.readyState === WebSocket.OPEN) {
+        if (ws && ws.readyState === WebSocket.OPEN) {
           ws.send(JSON.stringify({ type: "input", data }));
         }
       });
@@ -349,6 +459,10 @@ export function TerminalPanel({
       io.observe(el);
 
       cleanup = () => {
+        // Before anything else: no close from here may schedule a reconnect.
+        closing = true;
+        window.clearTimeout(reconnectTimer);
+        document.removeEventListener("visibilitychange", onVisible);
         io.disconnect();
         window.clearTimeout(retryTimer);
         releaseWebgl();
@@ -359,10 +473,10 @@ export function TerminalPanel({
         // panel otherwise; a page refresh tears the socket without running
         // this). Tell the backend to really end the shell - a bare socket
         // close would leave it parked awaiting a reattach.
-        if (sessionId && ws.readyState === WebSocket.OPEN) {
+        if (sessionId && ws && ws.readyState === WebSocket.OPEN) {
           ws.send(JSON.stringify({ type: "close" }));
         }
-        ws.close();
+        ws?.close();
         term.dispose();
       };
     })();
@@ -406,12 +520,21 @@ export function TerminalPanel({
           </span>
           <span className="text-zinc-600">·</span>
           <span
+            title={
+              status === "reconnecting"
+                ? "The socket dropped. The shell is still running on the backend; this panel is reattaching to it."
+                : status === "closed"
+                  ? "The shell has ended. Close this tab and open a new one."
+                  : undefined
+            }
             className={
               status === "open"
                 ? "text-emerald-400"
                 : status === "closed"
                   ? "text-red-400"
-                  : "text-zinc-400"
+                  : status === "reconnecting"
+                    ? "text-amber-400"
+                    : "text-zinc-400"
             }
           >
             {status}

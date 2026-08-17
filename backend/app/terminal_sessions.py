@@ -51,6 +51,18 @@ FLOW_WAIT_TIMEOUT = 5.0
 # be generous. (At 5s we resumed flooding mid-choke and undid the pause.)
 FLOW_BUSY_TIMEOUT = 60.0
 
+# Close codes the panel reads, from the 4000-4999 application-private range.
+# A client that reconnects after a dropped socket needs to know which closes
+# it must NOT come back from, and both of these are invisible without a code:
+# they arrive as ordinary closes, indistinguishable from a laptop lid.
+#
+# Reconnecting on GONE resurrects a shell the user just ended, so `exit`
+# would hand back a fresh prompt. Reconnecting on TAKEN_OVER is worse: two
+# tabs holding one session id would steal it from each other forever, each
+# reconnect kicking the other off.
+WS_SHELL_GONE = 4410      # the shell ended; there is nothing to come back to
+WS_TAKEN_OVER = 4409      # another view attached this session; it owns it now
+
 
 class TerminalSession:
     """One live shell + its recent output, attachable by at most one WS.
@@ -159,7 +171,7 @@ class TerminalSession:
         if ws is not None:
             try:
                 await ws.send_text("\r\n[manifold] shell exited\r\n")
-                await ws.close()
+                await ws.close(code=WS_SHELL_GONE)
             except Exception:
                 pass
 
@@ -174,7 +186,7 @@ class TerminalSession:
             try:
                 await old.send_text(
                     "\r\n[manifold] this session was attached elsewhere\r\n")
-                await old.close()
+                await old.close(code=WS_TAKEN_OVER)
             except Exception:
                 pass
         # Snapshot the scrollback and adopt the socket BEFORE the (awaited)

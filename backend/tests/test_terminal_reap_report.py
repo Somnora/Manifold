@@ -17,6 +17,8 @@ import pytest
 
 from app.terminal_sessions import TerminalSession, TerminalSessionManager
 
+from tests.test_terminal import launch_connected, read_until
+
 
 def make_session(session_id="local:t"):
     closed = []
@@ -198,6 +200,65 @@ def test_the_notice_never_reads_a_transcript(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(home))
 
     assert secret not in _replaced_shell_notice(local_cwd=str(cwd))
+
+
+# -- and it only fires when it is TRUE (Phase 93) -----------------------------
+#
+# Shipped in Phase 91, the notice was fed on every new session id, so a
+# brand-new dock tab opened to "The previous shell for this session had
+# ended" - a false report of lost work on the one screen whose entire job is
+# being honest about lost work. The backend cannot tell a fresh id from one
+# whose shell it reaped (after a restart it remembers neither), so the client
+# says which it is with ?resume=1.
+
+
+def test_a_brand_new_tab_is_not_told_it_lost_a_shell(client):
+    """The bug, named. No resume flag means the client never expected a shell
+    here, so there is nothing to report the ending of."""
+    instance_id = launch_connected(client)
+    with client.websocket_connect(
+            f"/instances/{instance_id}/terminal?session=brandnew") as ws:
+        banner = read_until(ws, "$ ")
+    assert "previous shell" not in banner
+    assert "mock shell" in banner            # it is a working shell, just quiet
+
+
+def test_resuming_a_session_whose_shell_is_gone_still_says_so(client):
+    """The case the notice exists for, and it must survive the fix: the tab
+    was restored (or the socket reconnected), and what it came back to is
+    not there any more."""
+    instance_id = launch_connected(client)
+    url = f"/instances/{instance_id}/terminal?session=gone"
+    with client.websocket_connect(url) as ws:
+        read_until(ws, "$ ")
+        ws.send_json({"type": "close"})      # the shell really ends
+    with client.websocket_connect(f"{url}&resume=1") as ws:
+        banner = read_until(ws, "$ ")
+    assert "previous shell" in banner
+
+
+def test_reattaching_to_a_LIVE_shell_says_nothing(client):
+    """The everyday reattach. Nothing ended, so nothing is announced - and
+    the scrollback that comes back must not have grown a notice in it."""
+    instance_id = launch_connected(client)
+    url = f"/instances/{instance_id}/terminal?session=alive"
+    with client.websocket_connect(url) as ws:
+        read_until(ws, "$ ")
+    with client.websocket_connect(f"{url}&resume=1") as ws:
+        replay = ws.receive_text()
+    assert "previous shell" not in replay
+    assert "mock shell" in replay             # same shell, replayed
+
+
+def test_the_local_shell_follows_the_same_rule(client):
+    """Both terminal routes feed this notice; the local one is where the
+    user's Claude sessions actually live, so it is asserted separately
+    rather than assumed to match."""
+    with client.websocket_connect(
+            "/local/terminal?session=fresh",
+            headers={"origin": "http://localhost:3000"}) as ws:
+        first = ws.receive_text()
+    assert "previous shell" not in first
 
 
 def test_terminal_reaped_is_a_notification_kind():
