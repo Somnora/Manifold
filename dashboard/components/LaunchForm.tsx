@@ -40,6 +40,7 @@ export function LaunchForm({ onLaunched }: { onLaunched: () => void }) {
   const [mode, setMode] = useState("direct-ssh");
   const [idleTimeout, setIdleTimeout] = useState("");
   const [maxLifetime, setMaxLifetime] = useState("");
+  const [maxActive, setMaxActive] = useState("");
   const [purpose, setPurpose] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState("");
@@ -173,6 +174,7 @@ export function LaunchForm({ onLaunched }: { onLaunched: () => void }) {
         ssh_key_name: sshKey || undefined,
         idle_timeout_seconds: idleTimeout ? parseFloat(idleTimeout) : undefined,
         max_lifetime_seconds: maxLifetime ? parseFloat(maxLifetime) : undefined,
+        max_active_seconds: maxActive ? parseFloat(maxActive) : undefined,
         purpose: purpose.trim() || undefined,
       });
       onLaunched();
@@ -388,6 +390,25 @@ export function LaunchForm({ onLaunched }: { onLaunched: () => void }) {
             <option value="86400">24 hours</option>
             <option value="259200">3 days</option>
           </select>
+        </label>
+        <label className="block text-xs font-medium text-zinc-600">
+          Max active time
+          <select
+            className={`${field} mt-1`}
+            value={maxActive}
+            onChange={(e) => setMaxActive(e.target.value)}
+          >
+            <option value="">None</option>
+            <option value="3600">1 hour</option>
+            <option value="7200">2 hours</option>
+            <option value="14400">4 hours</option>
+            <option value="28800">8 hours</option>
+            <option value="86400">24 hours</option>
+          </select>
+          <span className="mt-1 block text-[11px] font-normal text-zinc-400">
+            Counted from when the instance becomes active — boot never
+            spends it. Max lifetime above stays the outer bound.
+          </span>
         </label>
         <label className="block text-xs font-medium text-zinc-600">
           Purpose

@@ -33,7 +33,7 @@ import logging
 import uuid
 import re
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Awaitable, Callable
 
@@ -228,6 +228,23 @@ def launch_progress(launch: dict, boot_timeout_seconds: float,
     return enriched
 
 
+def _interval_seconds(start_iso, end_iso) -> float | None:
+    """Seconds between two ISO stamps, or None when either is missing or
+    unreadable - an unknowable duration is omitted, never zeroed."""
+    if not start_iso or not end_iso:
+        return None
+    try:
+        start = datetime.fromisoformat(str(start_iso))
+        end = datetime.fromisoformat(str(end_iso))
+    except (TypeError, ValueError):
+        return None
+    if start.tzinfo is None:
+        start = start.replace(tzinfo=timezone.utc)
+    if end.tzinfo is None:
+        end = end.replace(tzinfo=timezone.utc)
+    return (end - start).total_seconds()
+
+
 def max_lifetime_bounds(settings) -> tuple[float, float]:
     """The (minimum, maximum) a max_lifetime_seconds may take.
 
@@ -276,6 +293,37 @@ def validate_max_lifetime(settings, value: float | None) -> float | None:
             f"max_lifetime_seconds must be at most {maximum:.0f}s "
             f"({maximum / 86400:.0f} days).",
         )
+    return float(value)
+
+
+def validate_max_active(settings, value: float | None) -> float | None:
+    """Check a requested ACTIVE ceiling, or raise LaunchRejected.
+
+    Anchored at active_at (health-check pass), so unlike max_lifetime it
+    needs no boot budget in its floor: the clock has not started while the
+    box boots. The floor is the idle-timeout floor - a bound shorter than
+    the shortest idle window would terminate a box faster than the idle
+    sweep is even allowed to. Rejects rather than clamps, same reasoning as
+    validate_max_lifetime: silently rewriting a number that destroys
+    instances is its own kind of lie.
+    """
+    if value is None:
+        return None
+    minimum = float(settings.idle.timeout_min_seconds)
+    maximum = float(settings.idle.max_lifetime_max_seconds)
+    if value < minimum:
+        raise LaunchRejected(
+            400,
+            f"max_active_seconds must be at least {minimum:.0f}s. It is "
+            f"anchored at the moment the instance becomes ACTIVE (boot "
+            f"excluded), so there is no boot budget to add - but a bound "
+            f"below the minimum idle window would destroy the box faster "
+            f"than the idle sweep itself is permitted to.")
+    if value > maximum:
+        raise LaunchRejected(
+            400,
+            f"max_active_seconds must be at most {maximum:.0f}s "
+            f"({maximum / 86400:.0f} days).")
     return float(value)
 
 
@@ -387,6 +435,9 @@ class Orchestrator:
         # no prefs means the built-in defaults, no notifier means no pings.
         self.prefs = prefs
         self.notifier = notifier
+        # Injected post-construction by create_app (the Worklog is built
+        # later there); None = no instance-lifetime entries, never an error.
+        self.worklog = None
         # connect_fn(host) returns the coroutine factory a ManagedConnection
         # uses to dial; tests and mock mode inject one, real mode uses asyncssh.
         self._connect_fn = connect_fn
@@ -436,6 +487,7 @@ class Orchestrator:
         name: str = "",
         idle_timeout_seconds: float | None = None,
         max_lifetime_seconds: float | None = None,
+        max_active_seconds: float | None = None,
         provider: str = 'lambda',
         created_by: str | None = None,
         purpose: str = "",
@@ -593,6 +645,8 @@ class Orchestrator:
             hourly_rate_cents=price,
             idle_timeout_seconds=idle_timeout_seconds,
             max_lifetime_seconds=max_lifetime_seconds,
+            max_active_seconds=validate_max_active(
+                self.settings, max_active_seconds),
             provider=provider,
             created_by=created_by,
             purpose=purpose,
@@ -1065,7 +1119,8 @@ class Orchestrator:
 
     async def terminate(self, instance_id: str, *, force: bool = False,
                         caller: str | None = None,
-                        confirm_owner: str = "") -> dict:
+                        confirm_owner: str = "",
+                        reason: str = "") -> dict:
         """Terminate an instance, rescuing its data first.
 
         `caller` is the principal asking, and passing it OPTS IN to the
@@ -1149,12 +1204,60 @@ class Orchestrator:
             self.db.update_launch(
                 launch["id"], status="terminated", terminated_at=utcnow()
             )
+            # Phase 97: an instance LIFETIME is work worth a worklog entry.
+            # get_work_log answered "what happened on this account" with
+            # jobs and autopilot runs only, so days of raw GPU sessions -
+            # launches, notes, durations, costs, terminations - left no
+            # trace, and "what are these A100s?" became a whodunit. The
+            # data was already held; it just never reached the log.
+            self._worklog_instance(launch, instance_id,
+                                   reason or (f"requested by {caller}"
+                                              if caller else "requested"))
         remove_ssh_config_block(instance_id)
         # The box is gone: forget its blocked-notification state so a future
         # instance id collision (or a re-adopted box) can ping again.
         self._blocked_notified.pop(instance_id, None)
         return {"instance_id": instance_id, "terminated": True,
                 "rescue": report}
+
+    def _worklog_instance(self, launch: dict, instance_id: str,
+                          reason: str) -> None:
+        """One worklog entry per instance lifetime, from data already held.
+
+        Best-effort and never raises: a log entry must not be able to break
+        a termination. Cost is the same figure spend.py reports - rate x
+        wall clock from acceptance, an UPPER BOUND, and says so; unknowable
+        pieces are omitted rather than zeroed.
+        """
+        if self.worklog is None:
+            return
+        try:
+            lines = [
+                f"instance {instance_id[:12]} "
+                f"({launch.get('launched_type') or launch.get('requested_type')}"
+                f", {launch.get('region')})",
+                (f"purpose: {launch['purpose']}" if launch.get("purpose")
+                 else "purpose: (none stated)"),
+                (f"launched by {launch['created_by']}"
+                 if launch.get("created_by") else "launcher unattributed"),
+                f"ended: {reason}",
+            ]
+            for label, start in (("active", launch.get("active_at")),
+                                 ("total", launch.get("launched_at"))):
+                secs = _interval_seconds(start, utcnow())
+                if secs is not None:
+                    lines.append(f"{label} time: {secs / 3600:.1f}h")
+            rate = launch.get("hourly_rate_cents")
+            total = _interval_seconds(launch.get("launched_at"), utcnow())
+            if rate and total is not None:
+                lines.append(
+                    f"cost upper bound: ~${rate / 100 * total / 3600:.2f} "
+                    f"(rate x wall clock from acceptance; billing really "
+                    f"starts at health-check pass)")
+            self.worklog.record("instance session ended", lines)
+        except Exception:   # noqa: BLE001
+            logger.warning("instance worklog entry failed for %s",
+                           instance_id, exc_info=True)
 
     @staticmethod
     def _unsaved_key(report: dict) -> frozenset[str]:
@@ -1531,6 +1634,10 @@ class Orchestrator:
                     launch["id"], status="terminated",
                     terminated_at=utcnow(), resolved_at=utcnow(),
                 )
+                self._worklog_instance(
+                    launch, instance_id,
+                    "terminated outside Manifold (vanished from the "
+                    "provider's list)")
                 self.db.record_audit(
                     "backend", "external_termination_detected",
                     f"launch {launch['id']}: instance {instance_id} is no "

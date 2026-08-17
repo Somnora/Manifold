@@ -5941,3 +5941,67 @@ lost", on the two tools whose descriptions imply safety.
 hours — a filesystem that had just served a 16 GB model read 0 bytes. The
 storage estimate's note now says so; a single reading is not evidence either
 way, in either direction.
+
+## 2026-08-17 — Phase 97: a ceiling anchored where the work starts
+
+**Decided:** `max_active_seconds`, a second per-launch ceiling anchored at
+`active_at` (health-check pass) instead of launch acceptance. The absolute
+`max_lifetime_seconds` remains the outer bound; either firing terminates
+through the same rescue-files-first flow, and the audit detail names WHICH
+ceiling fired.
+
+**Why:** the folklore. An agent measured 35 minutes of a 3-hour ceiling spent
+before the first token — boot, a driver reboot, a ten-minute model load — and
+began sizing every ceiling as "run + 40 minutes" by hand. Sizing rules that
+users must carry in their heads are exactly what a platform exists to absorb;
+the anchor (`active_at`) had been recorded on every launch row all along.
+
+**The rules it inherits and the one it does not.** Deferral is identical to the
+absolute ceiling (a batch job pins; unreachable refuses — you cannot rescue
+what you cannot reach). The floor is NOT: `validate_max_lifetime`'s floor adds
+the whole boot budget because its clock starts before boot; the active clock
+starts after, so its floor is just the minimum idle window (a shorter bound
+would out-race the idle sweep itself). Still reject-not-clamp — silently
+rewriting a number that destroys instances is its own kind of lie.
+
+**Truthful-or-absent, applied:** a box that has not reached active has no
+clock. Breach None, countdown None — never 0 — because "no clock yet" and "0
+seconds left" are different facts on a destructive control. The card renders
+"(clock starts when the instance is active)" for that state, and the warning
+path warns on whichever ceiling lands sooner, named.
+
+Launch-time only for now: the per-instance edit route still edits only the
+absolute ceiling. Deliberate scope cut, noted here so it is a decision rather
+than an oversight.
+
+## 2026-08-17 — Phase 97, parts 2-3: lifetimes reach the log, and Settings uses its page
+
+**Instance-lifetime worklog entries.** get_work_log answered "what happened on
+this account" with jobs and autopilot runs only, so days of raw GPU sessions —
+launches, notes, durations, costs, terminations — left no trace, and "what are
+these A100s?" became a whodunit. Every launch that settles now writes one entry
+from data already held: purpose (or "(none stated)"), launcher (or
+"unattributed"), active and total time, a cost upper bound carrying spend.py's
+own disclaimer, and the REASON it ended — threaded from the sweep, so an idle
+reap logs "idle: idle 1811s (limit 1800s)" and the reconcile path logs
+"terminated outside Manifold". Best-effort by construction: a log entry must
+never be able to break a termination, and unknowable durations are omitted,
+never zeroed. Fixing the reason plumbing surfaced five tests asserting
+terminate()'s kwargs EXACTLY (`== {"force": False}`); they now assert the claim
+they guard — force is False, never unattended — instead of an incidental dict
+shape.
+
+**The Settings page.** Every card lived in a 672px column with no mx-auto —
+left-hugging inside the centered 1104px layout, dead space growing with the
+window. Now: the Status card spans the full container; everything below flows
+in two PACKED column stacks. Not grid auto-placement — the first attempt showed
+placement pairing a short card with a tall one and leaving a hole beneath it
+(screenshotted, rejected) — two space-y flows pack each column tightly, credentials
+entry down the left, the big reference panels down the right, single column
+again on narrow windows. Verified by screenshot against the mock rig, not by
+assumption.
+
+**Process note, earned twice tonight:** two concurrent `uv run` invocations
+against the same project can deadlock on the environment lock — a 4-minute
+suite sat wedged for 1h40m while the visual rig's mock backend held uv's
+attention. Run the rig or the suite, not both.

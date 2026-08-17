@@ -358,6 +358,12 @@ class Database:
         # not ask for one) means no ceiling — nothing about the idle loop
         # changes for them.
         self._ensure_column("launches", "max_lifetime_seconds", "REAL")
+        # Phase 97: a second ceiling anchored at active_at (health-check
+        # pass) instead of launch acceptance - the bound on the part the
+        # user actually controls. Agents were sizing max_lifetime as
+        # "run + 40 minutes" by hand to absorb boot; folklore a platform
+        # exists to absorb. NULL = unset, the default.
+        self._ensure_column("launches", "max_active_seconds", "REAL")
         # Phase 76b: a telemetry sample describes the whole box, not GPU 0.
         # Rows written before this exist and have both columns NULL, which
         # spend.idle_spend reads as "that span was never measured" rather
@@ -461,6 +467,7 @@ class Database:
         hourly_rate_cents: int,
         idle_timeout_seconds: float | None = None,
         max_lifetime_seconds: float | None = None,
+        max_active_seconds: float | None = None,
         provider: str = "lambda",
         launch_id: str | None = None,
         created_at: str | None = None,
@@ -483,13 +490,13 @@ class Database:
             """INSERT INTO launches
                (id, provider, created_at, requested_type, region, filesystem,
                 connection_mode, hourly_rate_cents, status,
-                idle_timeout_seconds, max_lifetime_seconds, created_by,
-                purpose)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'launching', ?, ?, ?, ?)""",
+                idle_timeout_seconds, max_lifetime_seconds,
+                max_active_seconds, created_by, purpose)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'launching', ?, ?, ?, ?, ?)""",
             (launch_id, provider, created_at or utcnow(), requested_type,
              region, filesystem, connection_mode, hourly_rate_cents,
-             idle_timeout_seconds, max_lifetime_seconds, created_by,
-             (purpose or "").strip() or None),
+             idle_timeout_seconds, max_lifetime_seconds, max_active_seconds,
+             created_by, (purpose or "").strip() or None),
         )
         return launch_id
 
@@ -499,7 +506,7 @@ class Database:
             "launched_type", "hourly_rate_cents",
             "launched_at", "active_at", "terminated_at", "keep_alive",
             "idle_timeout_seconds", "last_seen_at", "resolved_at",
-            "max_lifetime_seconds",
+            "max_lifetime_seconds", "max_active_seconds",
         }
         unknown = set(fields) - allowed
         if unknown:
