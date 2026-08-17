@@ -85,6 +85,46 @@ async def test_a_spiky_sample_run_still_counts_as_busy(harness):
     assert harness.terminated == []
 
 
+async def test_a_working_box_reads_busy_LONG_BEFORE_it_is_near_reaping(harness):
+    """The defect the first version of this shipped with, caught against a
+    live instance rather than by these tests.
+
+    Protecting the box from the reaper is only half the job. An agent
+    deciding whether to terminate reads `activity`, and the reap gate does
+    not run until the idle window is nearly spent - so a box 30 seconds into
+    a 7200s window reported state "idle_countdown", busy=false, while its
+    GPU sat at 100% with 36GB held. That is the exact reading that destroyed
+    a model server, being served by the field built to prevent it.
+
+    The original tests all drove the sweep to the reap point and so never
+    asked what a READER sees mid-countdown.
+    """
+    harness.add_instance("i-early", idle_for=30)      # nowhere near TIMEOUT
+    sample(harness, "i-early", 100)
+
+    await harness.dispatcher._check_idle()
+
+    status = harness.dispatcher.activity_status("i-early")
+    assert status["state"] == "gpu_busy"
+    assert status["busy"] is True, (
+        "a reader was told a GPU at 100% is not busy")
+    assert harness.terminated == []
+
+
+async def test_a_quiet_box_mid_window_still_reads_idle(harness):
+    """The other half: if every countdown said busy, the field would be
+    noise and a reader would learn to ignore it - which is how it failed
+    the first time."""
+    harness.add_instance("i-early-quiet", idle_for=30)
+    sample(harness, "i-early-quiet", 0)
+
+    await harness.dispatcher._check_idle()
+
+    status = harness.dispatcher.activity_status("i-early-quiet")
+    assert status["state"] == "idle_countdown"
+    assert status["busy"] is False
+
+
 async def test_an_abandoned_box_is_still_reaped_on_schedule(harness):
     """The Phase 90 case, and the one that pays for this product. Samples
     exist and they all say nothing is happening: that is evidence of no
@@ -144,6 +184,45 @@ async def test_old_samples_do_not_protect_forever(harness):
     await harness.dispatcher._check_idle()
 
     assert [i for i, _ in harness.terminated] == ["i-was-busy"]
+
+
+async def test_a_reap_records_the_gpu_evidence_that_condemned_it(harness):
+    """Suggested by the session that caused the original incident, and it is
+    the better half of the fix.
+
+    The sparing branch already said why it spared a box. The killing branch
+    recorded only the clock, so a terminated instance left "idle 1811s
+    (limit 1800s)" and nothing about its GPU. Proving the 2026-08-16 reap
+    wrong meant joining audit_log against telemetry_samples by hand - which
+    only happens if someone already suspects. The decision has to be
+    auditable when it is made, not merely recoverable later.
+    """
+    harness.add_instance("i-condemned")
+    for i in range(3):
+        sample(harness, "i-condemned", 0, seconds_ago=10 + i * 32)
+
+    await harness.dispatcher._check_idle()
+
+    assert [i for i, _ in harness.terminated] == ["i-condemned"]
+    detail = next(r["detail"] for r in harness.db.list_audit(limit=50)
+                  if "idle" in r["action"] and "i-condemned" in r["detail"])
+    assert "3 sample(s)" in detail, "the evidence count is missing"
+    assert "0%" in detail, "the peak that condemned it is missing"
+
+
+async def test_a_reap_with_no_telemetry_says_so_rather_than_implying_zero(
+        harness):
+    """"No samples" must not be reported as "GPU at 0%". That is the same
+    absence-of-evidence-as-evidence slip the whole fix exists to remove, and
+    it would read as proof the box was idle."""
+    harness.add_instance("i-blind")
+
+    await harness.dispatcher._check_idle()
+
+    detail = next(r["detail"] for r in harness.db.list_audit(limit=50)
+                  if "idle" in r["action"] and "i-blind" in r["detail"])
+    assert "no GPU telemetry" in detail
+    assert "0%" not in detail, "absence was reported as a zero reading"
 
 
 async def test_the_deferral_is_audited_once_not_every_poll(harness):

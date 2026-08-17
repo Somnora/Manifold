@@ -48,6 +48,18 @@ def _watch_parent() -> None:
             sys.stdin.buffer.read()   # blocks until the pipe closes
         except Exception:
             pass
+        # Leave a tombstone BEFORE os._exit, which bypasses the FastAPI
+        # lifespan, atexit and every finally in the process. Without this
+        # line a normal Cmd-Q is indistinguishable from a crash in the
+        # record - which is exactly how a 331-second quit on 2026-08-16
+        # was investigated for hours as a silent crash. Best-effort and
+        # never raises: a tombstone must not be able to wedge a shutdown.
+        try:
+            from app.config import DATA_ROOT
+            from app.liveness import record_stop
+            record_stop(DATA_ROOT / "manifold.db", "shell gone (app quit)")
+        except Exception:   # noqa: BLE001
+            pass
         print("manifold: shell gone (stdin EOF); shutting down", flush=True)
         os._exit(0)
 

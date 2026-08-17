@@ -5542,3 +5542,131 @@ The other 6 are the regression guards — abandoned reaped, loaded-but-idle
 reaped, below-threshold reaped, stale samples reaped, no-telemetry unchanged,
 ceiling still fatal — and they are the ones that would catch this being
 turned into a licence to bill.
+
+## 2026-08-17 — What the GPU-utilization gate does not cover, in the words of the lane it fails
+
+**Recorded because the gap is structural, not incidental.** The idle sweep now
+spares a box whose GPU shows work (see the entry above). The session running the
+Red Hope 3D lane took its whole run apart afterwards and produced the sharpest
+statement of what that still misses:
+
+> the shape of the exposed job is not exotic. It is "provision an env, then use
+> the GPU" — the normal opening of every batch either of us runs, and the quiet
+> half is always at the front, before any burst exists to spare it.
+
+That is the important sentence. The gate is evidence-based, and evidence
+accumulates *after* the risky window rather than during it.
+
+**The measured case.** A TRELLIS.2 bootstrap: stage 4 of 6 alone — flash_attn,
+flex_gemm, cumesh, o-voxel — ran CPU-and-ninja bound at `build procs: 5` with the
+GPU polled four times and never above 0%. It fit inside the 1800s window only
+because the 16 GB model download collapsed to 37 seconds off a warm NFS cache.
+On a cold cache, that stage plus the download exceeds the window, the gate finds
+nothing above the bar, and the box is reaped mid-provision. Nothing in the
+telemetry would have hinted at it, and the person hitting it would blame the box.
+
+By contrast the same lane's actual work — thirteen bakes at ~3 minutes each,
+peaks of 64% and 97% between 0% troughs — held the window comfortably. The gate
+spares real GPU work on merit. It is provisioning it cannot see.
+
+**Why the fix is not "also protect a quiet new box".** Three reasons, and none of
+them is that the gap does not matter:
+
+- A blanket grace period after first connection is a licence to bill for a box
+  that boots, does nothing, and is forgotten — the failure Phase 90 exists to
+  prevent, reintroduced at the front of the lifecycle instead of the back.
+- The honest existing answer is per-launch: `idle_timeout_seconds` sized to the
+  job, or `set_keep_alive` around the provisioning stretch. Both are explicit,
+  both are already there, and both put the decision with whoever knows how long
+  their bootstrap takes.
+- Guessing "this box is probably still provisioning" from boot age is the same
+  species of inference — reasoning from a proxy instead of evidence — that this
+  whole sequence of entries exists to remove.
+
+So the gate stays narrow and this stays documented. What would change the
+calculus is a signal that is actual evidence of provisioning rather than a proxy
+for it: the sidecar already reports processes, and a build running under the
+job's own working directory is a fact rather than a guess. That is a larger
+change than tonight's and it is not made here.
+
+**The operational advice, until then:** size `idle_timeout_seconds` to cover the
+cold-cache bootstrap, not the warm one. The warm number is the one you will
+measure and the cold one is the one that kills you.
+
+## 2026-08-17 — Manifold reports its own death, and deliberately cannot cure it
+
+**Decided:** A new `backend/app/liveness.py` that observes, classifies and
+says — `up | lagging | wedged | app_gone | backend_died | unknown` — plus a
+tombstone (`backend_started` / `backend_stopped` audit rows) so the next boot can
+tell a quit from a death. Exposed as `manifold-watch`, folded into
+`manifold-doctor`, and summarised in one sentence the MCP bridge hands any agent
+that gets ECONNREFUSED. **It never restarts, kills or starts anything.**
+
+**The incident, and the wrong turn.** The desktop app stopped at 23:21:25 and
+came back at 23:26:56 — 331 seconds — while a $1.99/hr A100 billed and five MCP
+bridges got connection-refused. Nobody was told; another agent session found it
+by being blocked and asking a human.
+
+Then the diagnosis went wrong, and that is the more useful half. No crash report,
+no jetsam record, the machine never slept (`pmset`: *Total Sleep/Wakes since
+boot: 0*), and the log stopped mid-line with no shutdown marker — so it read
+exactly like a silent crash, and hours went into hunting one. It was almost
+certainly a normal quit: `desktop.py`'s parent watchdog calls `os._exit(0)`,
+which bypasses the FastAPI lifespan, and its only message goes to stdout rather
+than the log. **A deliberate quit and a silent crash were indistinguishable in
+the record.** That is the defect. Not that the app stops — it is allowed to stop
+— but that stopping leaves no trace and announces nothing while paid work depends
+on it.
+
+A first pass at the same log also concluded a *three-hour* outage, by reading
+`manifold.log` and never noticing `manifold.log.1`. A full gap scan over both
+files (76,724 stamped lines) finds exactly one gap over 45 seconds, and it is
+331s. Rotation is not an edge case in this codebase; it is the thing that
+produced the wrong answer twice.
+
+**Why a reporter and not a supervisor.** An auto-restarter was the obvious fix
+and three independent attacks killed it:
+
+- It would have fought a user pressing Cmd-Q. Tonight proves the deliberate quit
+  is the common case, not the rare one.
+- **A restart reseeds `dispatcher.last_activity`.** A restart loop therefore
+  pins the idle countdown at zero and silently disables idle auto-termination —
+  the product's central money guard, switched off by a safety feature. Two of the
+  three proposals claimed the opposite until this was pointed out.
+- A supervisor that quietly revives a crashing backend converts a loud failure
+  into a quiet one, which is the direction this entire codebase spends its effort
+  travelling away from.
+
+So the strongest thing this module does is print a sentence. A test greps its own
+source for `Popen`, `os.kill`, `SIGTERM` and friends, so a later contributor who
+adds the ability to act has to argue with the reasoning rather than with nobody.
+
+**Wedged is not dead, and the thresholds are measured.** The same log carries
+nine `event_loop_blocked` warnings, worst 4.4s. A process that is alive and slow
+must never be handled like one that is gone, because the correct responses are
+opposite. So `lagging` starts at 2s — just above the worst observed stall — and
+`wedged` at 10s, far enough beyond the distribution that the verdict means a real
+wedge. Both are reported; neither is acted on. Guessing those numbers instead of
+reading them off the record would have been the same species of error as the rest
+of this file.
+
+**`unknown` is a real answer.** Where `pgrep` does not exist (Windows, a stripped
+container) `shell_running()` returns None, not False — answering False would
+manufacture a `backend_died` verdict out of a question that was never asked. Same
+rule as `busy: null` in the instances payload, and `previous_run_ended_cleanly`
+returning None on a database with no history rather than reporting a crash.
+
+**No invented numbers.** The message says *"3 instance(s) still running on Lambda
+and still billing"* and never a dollar figure, because `live_launches()` selects
+no rate column. On its first real run against the live database it reported three
+while a stale `list_instances` in the same session said one — and the reporter
+was right: two more A100s had launched four minutes earlier. The tool caught its
+author being out of date, which is the job.
+
+**What it does not cover.** It cannot see a backend that is up and wrong, only
+one that is absent or unresponsive. `manifold-watch` runs for as long as someone
+runs it; it is not a daemon and does not survive a logout — making it one is a
+launchd/Task Scheduler decision the owner should make deliberately, not something
+to inherit from a bug fix. And the tombstone only starts telling the truth after
+the first relaunch that carries it; until then `previous_run_ended_cleanly`
+reports None, which is honest rather than wrong.
