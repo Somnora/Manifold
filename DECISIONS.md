@@ -5807,3 +5807,29 @@ seeded job renders; killed mid-view, the banner + greyed snapshot appear and "No
 active jobs." does not; cold-loaded during the outage — the manufactured-claims
 case — Jobs, Autopilot and Storage all decline to invent an empty state. 15
 assertions, all of which fail against the previous code.
+
+## 2026-08-17 — Observed: a backend restart does not touch in-flight instance work
+
+**Recorded as an observed property, not a design intention** — the design intent
+existed (instances outlive the backend; `resume_pending_launches()` and
+`adopt_running_instances()` re-attach on boot), but tonight it was demonstrated
+under both lifecycle phases, on the live account, by accident of timing rather
+than by test:
+
+- **Mid-boot** (v0.2.4 install): an A100 was 181 seconds into boot when the
+  backend went down for 331s. The launch row persisted, the boot continued on
+  Lambda's side, and the new backend resumed the wait and adopted the box.
+- **Mid-transfer** (v0.2.6 install): a detached rsync — 34 GB, 11,690 files,
+  running between two instances — started ~7 minutes before the restart and ran
+  straight through the 24-second window. It never blinked, and a full `-c`
+  checksum verification afterward reported zero mismatches across every file.
+
+What actually breaks during a restart is exactly one thing: MCP/HTTP calls fail
+for the duration, including parked `wait_for_launch` long-polls, which return an
+error the caller should retry rather than read as a failed launch.
+
+**Why this is worth a line:** it is the safety argument for making the bridge
+retry connection-refused errors through a restart window (a planned change), and
+it is the fact that makes "install the new backend" a routine operation rather
+than a scheduled outage. The etiquette of asking active sessions for a go/no-go
+remains good manners; this entry is why it is manners rather than necessity.
