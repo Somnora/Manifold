@@ -415,7 +415,8 @@ class Dispatcher:
             "checked_at": self._clock(),
         }
 
-    def activity_status(self, instance_id: str) -> dict:
+    def activity_status(self, instance_id: str,
+                        launch: dict | None = None) -> dict:
         """What the idle sweep last concluded about this instance, for any
         reader deciding whether the box is doing something.
 
@@ -430,9 +431,26 @@ class Dispatcher:
         state "unknown" with busy None, because "we have not looked" and
         "there is nothing here" are different answers and only one of them
         is safe to act on.
+
+        `launch` is the instance's launch row when the caller already holds
+        it, and answers the one question the sweep structurally cannot: a
+        box still BOOTING has no SSH connection, so the sweep has never
+        seen it and "unknown" is all it could otherwise say. A booting box
+        is the most misleading thing on the list - nothing is running on it
+        yet, by design, and it is thirty seconds from being someone's job.
+        The first instance destroyed in the 2026-08-17 incident was in
+        exactly this state.
         """
         seen = self._activity.get(instance_id)
         if seen is None:
+            status = (launch or {}).get("status")
+            if status in ("launching", "retrying", "booting"):
+                return {"state": "booting", "busy": True,
+                        "reason": f"still coming up (launch status "
+                                  f"{status!r}); nothing runs on a box that "
+                                  f"has not finished booting, and this one "
+                                  f"is about to be someone's work",
+                        "age_seconds": None}
             return {"state": "unknown", "busy": None,
                     "reason": "no idle sweep has judged this instance yet",
                     "age_seconds": None}

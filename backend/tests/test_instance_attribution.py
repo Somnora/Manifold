@@ -395,6 +395,41 @@ def test_an_unjudged_instance_is_unknown_not_idle(harness):
     assert status["age_seconds"] is None
 
 
+@pytest.mark.parametrize("status", ["launching", "retrying", "booting"])
+def test_a_booting_instance_says_booting_not_unknown(harness, status):
+    """The first box destroyed in the incident was still BOOTING. It has no
+    SSH connection, so the sweep has never seen it and could only say
+    "unknown" - and "unknown" is what a reader talks itself past. The launch
+    row answers it for free, since the caller already holds the row."""
+    result = harness.dispatcher.activity_status(
+        "i-coming-up", {"status": status})
+    assert result["state"] == "booting"
+    assert result["busy"] is True
+    assert status in result["reason"]
+
+
+@pytest.mark.parametrize("status", ["active", "terminated", "failed"])
+def test_a_settled_launch_does_not_claim_to_be_booting(harness, status):
+    """The guard on the guard: only the pre-active statuses mean "coming
+    up". A terminated or failed launch reporting busy=true would protect
+    boxes that no longer exist and make the field noise."""
+    result = harness.dispatcher.activity_status(
+        "i-settled", {"status": status})
+    assert result["state"] == "unknown"
+    assert result["busy"] is None
+
+
+async def test_a_real_verdict_beats_the_launch_row(harness):
+    """Once the sweep has actually looked, what it SAW wins over what the
+    launch row implies. A row that still says booting while the box is up
+    and idle must not keep it protected forever."""
+    harness.add_instance("i-up", idle_for=TIMEOUT / 2)
+    await harness.dispatcher._check_idle()
+
+    result = harness.dispatcher.activity_status("i-up", {"status": "booting"})
+    assert result["state"] == "idle_countdown"
+
+
 async def test_a_terminated_box_stops_reporting_serving(harness):
     """A verdict that outlives its instance is a lie waiting to be read."""
     # Inside its window, so the sweep records a verdict instead of reaping it

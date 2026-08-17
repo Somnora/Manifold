@@ -1402,6 +1402,10 @@ def create_app(
     async def list_instances():
         instances = await orchestrator.instances_with_state()
         for inst in instances:
+            # Loaded ONCE and shared by the three helpers below: this runs on
+            # a poll x N instances, and the same row answering all three
+            # questions is both cheaper and impossible to get inconsistent.
+            launch = db.find_launch_by_instance(inst["id"])
             # Idle auto-termination countdown + keep-alive switch state, so
             # the card can warn BEFORE the dispatcher acts (a live instance
             # vanished mid-test-session with no warning; never again).
@@ -1416,13 +1420,12 @@ def create_app(
             # serving. The dispatcher already knew better; it just had no
             # way to say so. Unconditional, unlike idle: "unreachable" is
             # itself the answer a reader needs most.
-            inst["activity"] = dispatcher.activity_status(inst["id"])
+            inst["activity"] = dispatcher.activity_status(inst["id"], launch)
             # The max-lifetime ceiling sits on the INSTANCE, deliberately not
             # inside inst["idle"]: idle is None for a box that is not
             # connected, and a box that has dropped off SSH while past its
             # ceiling is precisely the one whose limit the user needs to see.
-            inst.update(dispatcher.ceiling_status(
-                inst["id"], db.find_launch_by_instance(inst["id"])))
+            inst.update(dispatcher.ceiling_status(inst["id"], launch))
         # Agents act on this data: fixture state must be self-identifying
         # (an agent once had to spot a TEST-NET IP to detect mock mode).
         return {"instances": instances, "mock": mock}
