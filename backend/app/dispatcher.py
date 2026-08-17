@@ -331,6 +331,12 @@ class Dispatcher:
         # and writes a fresh one when the reason changes. Cleared when the
         # box goes quiet, so a second busy spell is reported again.
         self._gpu_busy_noted: dict[str, str] = {}
+        # What the last detached-command probe saw per instance (Phase 95):
+        # (checked_at monotonic, handles confirmed ALIVE). The probe rides
+        # the 30s telemetry loop; the 15s idle sweep reads this instead of
+        # probing again, and treats it as evidence only while FRESH - stale
+        # confirmation is no confirmation (see _check_idle).
+        self._detached_alive: dict[str, tuple[float, list[str]]] = {}
         # Instances whose idle auto-termination the user switched off; also
         # persisted on the launch row (see keep_alive_enabled).
         self._keep_alive_mem: set[str] = set()
@@ -411,6 +417,54 @@ class Dispatcher:
     def touch_activity(self, instance_id: str) -> None:
         """Record activity (job start/end, terminal traffic) on an instance."""
         self.last_activity[instance_id] = self._clock()
+
+    async def _probe_detached(self, instance_id: str, conn) -> None:
+        """One SSH round trip that settles finished detached commands and
+        records which are still alive. No open handles, no SSH cost."""
+        from . import detached as det
+        open_rows = self.db.open_detached(instance_id)
+        if not open_rows:
+            self._detached_alive.pop(instance_id, None)
+            return
+        pid_by_handle = {r["handle"]: r["pid"] for r in open_rows}
+        _code, stdout, _err = await conn.run(
+            det.pids_alive_line(pid_by_handle), timeout=20.0)
+        alive, settled = det.parse_pids_alive(stdout)
+        for handle, exit_code in settled.items():
+            self.db.finish_detached(handle, exit_code)
+            self.db.record_audit(
+                "backend", "detached_finished",
+                f"{instance_id}: {handle} "
+                + (f"exit {exit_code}" if exit_code is not None
+                   # None is VANISHED: it ended, and how is not knowable.
+                   # Never written as an exit code.
+                   else "vanished (no exit recorded - reboot or external kill)"))
+        if alive:
+            self.touch_activity(instance_id)
+            self._detached_alive[instance_id] = (self._clock(), sorted(alive))
+        else:
+            self._detached_alive.pop(instance_id, None)
+
+    def _detached_evidence(self, instance_id: str) -> str | None:
+        """The reason to spare this box, if a detached command was confirmed
+        alive RECENTLY. Stale confirmation is no confirmation: past two
+        telemetry intervals with no sighting, this returns None and the
+        sweep judges by its other signals - an evidence gate that outlives
+        its evidence would be keep-alive wearing a lab coat."""
+        seen = self._detached_alive.get(instance_id)
+        if seen is None:
+            return None
+        checked_at, handles = seen
+        max_age = max(90.0, self.settings.telemetry.sample_seconds * 2 + 10)
+        if self._clock() - checked_at > max_age:
+            return None
+        rows = {r["handle"]: r for r in self.db.open_detached(instance_id)}
+        names = ", ".join(
+            f"{h} ({(rows.get(h) or {}).get('note') or (rows.get(h) or {}).get('command', '')[:40]})"
+            for h in handles[:3])
+        more = f" and {len(handles) - 3} more" if len(handles) > 3 else ""
+        return (f"detached command(s) confirmed running here: {names}{more} - "
+                f"work started through Manifold protects its own box")
 
     def _telemetry_says_busy(self, instance_id: str,
                              window_seconds: float) -> str | None:
@@ -1549,6 +1603,18 @@ class Dispatcher:
                         "idle auto-termination is switched off for this "
                         "instance; it will not be reaped")
                     continue
+                # Detached work (Phase 95): a pid the telemetry probe
+                # confirmed alive within the last couple of intervals is
+                # evidence of work - the case the GPU gate below cannot see
+                # (an rsync or a compile is 0% GPU from start to finish).
+                # Fresh evidence only; _detached_evidence returns None once
+                # the sighting goes stale.
+                evidence = self._detached_evidence(instance_id)
+                if evidence is not None:
+                    self._note_activity(
+                        instance_id, "detached_running", True, evidence)
+                    self.touch_activity(instance_id)
+                    continue
                 server = serving.get(instance_id)
                 if server is not None and not await self._server_answering(
                         instance_id, server):
@@ -2318,6 +2384,17 @@ class Dispatcher:
         for instance_id, conn in list(self.orchestrator.connections.items()):
             if conn.state != ConnectionState.CONNECTED:
                 continue
+            # Detached commands first (Phase 95): work started through
+            # Manifold asserts its own liveness. One probe covers every
+            # open handle on the box; a live pid is evidence of work, and
+            # evidence - not an agent's memory of having started something -
+            # is what keeps the idle sweep's hands off a busy box.
+            try:
+                await self._probe_detached(instance_id, conn)
+            except Exception:   # noqa: BLE001 - a probe failure must never
+                # break telemetry sampling; the sweep just sees stale (i.e.
+                # no) confirmation and judges by its other signals.
+                logger.exception("detached probe failed for %s", instance_id)
             gpus = None
             sidecar = self.orchestrator.sidecar_for(instance_id)
             if sidecar is not None:

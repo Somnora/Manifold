@@ -560,15 +560,64 @@ async def run_command(instance_id: str, command: str, timeout: float = 45,
     arrives before an MCP client request timeout (~60s). Use this for the
     quick real commands in between: inspecting files, checking nvidia-smi,
     preparing directories. Anything longer belongs in a job (run_job
-    streams logs and survives restarts) - or start it detached
-    (`nohup ... > log 2>&1 &`) and check the log with a later
-    run_command."""
+    streams logs and survives restarts) or in run_detached - do NOT
+    hand-roll `nohup ... &` here: run_detached does that properly, records
+    the exit code, and keeps the idle sweep off the box while it runs."""
     timeout = max(1.0, min(float(timeout), 50.0))
     return await _call(
         "run_command", "POST", f"/instances/{instance_id}/run",
         note=note, args={"instance_id": instance_id, "command": command[:200]},
         body={"command": command, "timeout": timeout},
         request_timeout=timeout + 10.0,
+    )
+
+
+@mcp.tool()
+async def run_detached(instance_id: str, command: str, purpose: str = "",
+                       note: str = "") -> dict:
+    """Start LONG work on the instance - a transfer, a compile, a bootstrap,
+    anything that outlasts run_command's 50s cap - and return immediately
+    with a handle. The command runs under setsid on the box, so it survives
+    the SSH connection, this call, and even a backend restart; its exit
+    code is recorded when it finishes.
+
+    THIS ALSO PROTECTS THE BOX. While the command runs, Manifold's
+    telemetry probe counts it as activity, so the idle sweep will not reap
+    the instance mid-transfer even at 0% GPU - the case where a working box
+    is otherwise indistinguishable from an abandoned one. You do NOT need
+    to poll to keep it alive, and you do not need set_keep_alive for work
+    started this way.
+
+    `purpose` is what the work IS, in words - it appears in the activity
+    verdict every other agent sees, so a good purpose is how your box
+    avoids being mistaken for a stray. Poll detached_status(handle) for
+    progress and the log tail; the full log is at
+    ~/.manifold/detached/<handle>.log on the instance."""
+    body = {"command": command, "note": purpose}
+    return await _call(
+        "run_detached", "POST", f"/instances/{instance_id}/run-detached",
+        note=note,
+        args={"instance_id": instance_id, "command": command[:200],
+              "purpose": purpose},
+        body=body,
+    )
+
+
+@mcp.tool()
+async def detached_status(instance_id: str, handle: str,
+                          note: str = "") -> dict:
+    """Where a detached command stands: `state` is running | exited (with
+    exit_code) | vanished | unreachable.
+
+    Read the states literally. VANISHED means it ended and HOW is not
+    knowable (a reboot, an external kill) - it is not a normal exit and not
+    an error code. UNREACHABLE is a state of the connection, not the
+    command: the work may well still be running; retry rather than
+    concluding it stopped. `log_tail` carries the last lines of output."""
+    return await _call(
+        "detached_status", "GET",
+        f"/instances/{instance_id}/detached/{handle}",
+        note=note, args={"instance_id": instance_id, "handle": handle},
     )
 
 

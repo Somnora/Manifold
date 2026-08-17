@@ -384,6 +384,13 @@ class RunCommandRequest(BaseModel):
     timeout: float = Field(default=120.0, gt=0, le=600)
 
 
+class RunDetachedRequest(BaseModel):
+    command: str = Field(min_length=1, max_length=16384)
+    # What this work is, in words. Lands in the activity verdict that keeps
+    # the idle sweep off the box, so a good note is self-defence.
+    note: str = Field(default="", max_length=200)
+
+
 class RenameRequest(BaseModel):
     # Empty restores the Lambda launch-time name.
     name: str = Field(default="", max_length=64)
@@ -1564,6 +1571,106 @@ def create_app(
             "stderr": stderr[-cap:],
             "truncated": len(stdout) > cap or len(stderr) > cap,
         }
+
+    @app.post("/instances/{instance_id}/run-detached", status_code=202)
+    async def run_detached_command(instance_id: str, req: RunDetachedRequest):
+        """Start long work that outlives this request - and the backend.
+
+        The command is written VERBATIM to a script on the box over SFTP
+        (file bytes, never interpolated into a shell line), launched under
+        setsid with a wrapper that records the exit code on completion.
+        While it runs, the telemetry loop's probe counts it as activity, so
+        the box protects itself from the idle sweep without anyone
+        remembering to poll or set keep-alive. Poll GET
+        /instances/{id}/detached/{handle} for status and the log tail.
+        """
+        from . import detached as det
+        conn = orchestrator.connections.get(instance_id)
+        if conn is None or conn.ssh_connection() is None:
+            raise HTTPException(409, f"no connected instance {instance_id}")
+        if len(db.open_detached(instance_id)) >= det.MAX_OPEN_PER_INSTANCE:
+            raise HTTPException(
+                409, f"{det.MAX_OPEN_PER_INSTANCE} detached commands are "
+                     f"already open on {instance_id}; wait for some to "
+                     f"finish or check their status")
+        handle = det.new_handle()
+
+        async def script_bytes():
+            yield req.command.encode()
+
+        try:
+            await conn.sftp_write(det.script_sftp_path(handle), script_bytes())
+            _code, stdout, stderr = await conn.run(
+                det.launch_line(handle), timeout=20.0)
+        except ConnectionError as exc:
+            raise HTTPException(409, str(exc))
+        try:
+            pid = int(stdout.strip().splitlines()[-1])
+        except (ValueError, IndexError):
+            raise HTTPException(
+                502, f"detached launch did not report a pid "
+                     f"(stdout {stdout[-200:]!r}, stderr {stderr[-200:]!r})")
+        db.create_detached(handle=handle, instance_id=instance_id,
+                           command=req.command, note=req.note,
+                           created_by=current_principal(), pid=pid)
+        dispatcher.touch_activity(instance_id)
+        db.record_audit(
+            current_principal(), "detached_started",
+            f"{instance_id}: {handle} pid {pid} "
+            f"{(req.note or req.command)[:160]!r}")
+        return {"handle": handle, "instance_id": instance_id, "pid": pid,
+                "log_path": f"~/.manifold/detached/{handle}.log"}
+
+    @app.get("/instances/{instance_id}/detached/{handle}")
+    async def detached_status(instance_id: str, handle: str):
+        """Where a detached command stands: running | exited | vanished |
+        unreachable. Unreachable is a state of the CONNECTION, not of the
+        command - a box we cannot probe is never reported as stopped."""
+        from . import detached as det
+        if not det.HANDLE_RE.match(handle):
+            raise HTTPException(404, f"no detached command {handle!r}")
+        row = db.get_detached(handle)
+        if row is None or row["instance_id"] != instance_id:
+            raise HTTPException(404, f"no detached command {handle!r} "
+                                     f"on {instance_id}")
+
+        def payload(state: str, exit_code, log_tail):
+            return {
+                "handle": handle, "instance_id": instance_id, "state": state,
+                "exit_code": exit_code, "started_at": row["started_at"],
+                "command": row["command"], "note": row["note"],
+                "created_by": row["created_by"], "log_tail": log_tail,
+            }
+
+        conn = orchestrator.connections.get(instance_id)
+        reachable = conn is not None and conn.ssh_connection() is not None
+        if row["exited_at"] is not None and not reachable:
+            # Settled in the registry; the box (and its log) may be gone.
+            state = "exited" if row["exit_code"] is not None else "vanished"
+            return payload(state, row["exit_code"], None)
+        if not reachable:
+            return payload("unreachable", None, None)
+        try:
+            _code, stdout, _err = await conn.run(
+                det.probe_line(handle), timeout=20.0)
+        except ConnectionError:
+            return payload("unreachable", None, None)
+        state, exit_code, log_tail = det.parse_probe(stdout)
+        if state == "running":
+            dispatcher.touch_activity(instance_id)
+        elif state in ("exited", "vanished") and row["exited_at"] is None:
+            db.finish_detached(handle,
+                               exit_code if state == "exited" else None)
+        # A settled registry row is the tie-breaker for a probe that could
+        # not read the exit file (e.g. cleaned up on the box).
+        if state == "unknown" and row["exited_at"] is not None:
+            state = "exited" if row["exit_code"] is not None else "vanished"
+            exit_code = row["exit_code"]
+        return payload(state, exit_code, log_tail)
+
+    @app.get("/instances/{instance_id}/detached")
+    async def list_detached_commands(instance_id: str):
+        return {"detached": db.list_detached(instance_id)}
 
     @app.get("/instances/{instance_id}/metrics")
     async def instance_metrics(instance_id: str):
