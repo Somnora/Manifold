@@ -5367,10 +5367,26 @@ launched, and checked it every way it could: `uptime`, logged-in users,
 running processes, writes to the NFS. All of them said idle. It was a vLLM
 box six minutes into loading a 27B model from the shared HF cache — no users,
 no obvious processes, nothing written, 30GB of VRAM held — and it was
-terminated about sixty seconds before it would have served. A multi-hour
-extraction run died with it. The audit note reads: "Verified idle before
-terminating: up 6 min, 0 users, no user processes, nothing written to the
-NFS."
+terminated about sixty seconds before it would have served. The audit note
+reads: "Verified idle before terminating: up 6 min, 0 users, no user
+processes, nothing written to the NFS."
+
+**A correction, because the first version of this entry got it wrong.** It
+said that termination also cost a multi-hour extraction run. It did not, and
+the mistake is worth recording because it nearly buried a worse bug. The two
+boxes killed here rescued `files_found: 0` and were single-purpose and
+relaunchable. The 126-workflow extraction run that died at 07:42 with retry
+exhaustion had a different cause entirely, found by looking instead of
+inferring: at 07:36:56 Manifold's OWN idle sweep terminated instance
+4718a91f for `idle 1811s (limit 1800s)` — while its own telemetry table,
+sampled every 32 seconds, recorded that same box at 36653 MiB of 40960 used
+and GPU utilization of 100%, including a sample written at 07:36:57. The
+model was being served over a hand-rolled SSH tunnel, so no request ever
+reached `touch_activity`, and "no Manifold-visible traffic" was read as "no
+work". Manifold measured a GPU pinned at 100%, wrote it down, and terminated
+the instance for inactivity in the same second. That is the same error as the
+agent's, one layer down and with better evidence available — see the entry
+that follows this one.
 
 Nothing in that reasoning was careless. Every question it asked, the API
 answered, and every question was the wrong one.

@@ -6,10 +6,17 @@ launched, checked it the only ways it could - uptime, logged-in users,
 processes, writes to the NFS - and concluded it was a stray. It was a
 vLLM box six minutes into loading Qwen3.5-27B from the shared HF cache:
 no users, no obvious processes, nothing written, 30GB of VRAM held. It
-terminated it about sixty seconds before the model would have served, and
-a multi-hour extraction run died with it. The note it left reads
-"Verified idle before terminating: up 6 min, 0 users, no user processes,
-nothing written to the NFS."
+terminated it about sixty seconds before the model would have served. The
+note it left reads "Verified idle before terminating: up 6 min, 0 users, no
+user processes, nothing written to the NFS."
+
+(An earlier version of this docstring also blamed that termination for a
+multi-hour extraction run dying the same morning. It did not: that run was
+killed at 07:36:56 by Manifold's own idle sweep, which reaped a box its own
+telemetry had just recorded at 100% GPU utilization and 36GB of VRAM held.
+Same error, one layer down. Kept here because assuming a second failure
+shared a cause with the first is exactly the reflex these tests exist to
+discourage.)
 
 Nothing in that reasoning was careless. The API had told it everything it
 asked, and everything it asked was the wrong question, because:
