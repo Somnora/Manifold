@@ -5894,3 +5894,17 @@ readable: a test loads it from YAML, the busy_util_pct lesson applied at birth.
 **Deferred:** multi-filesystem mounts (the provider layer already takes a list;
 Manifold's request models narrow it to one — a launch-path change deserving its
 own phase), and true mid-session bridge refresh (not Manifold's to fix).
+
+## 2026-08-17 — Design constraint recorded for the vllm extra_args passthrough
+
+Not built yet (queued for the next phase); written down now because it is the
+kind of fact that dies in a chat scrollback. Both agent reviews rank a template
+`extra_args` passthrough for vllm-serve as the highest-leverage missing piece —
+one inexpressible flag (`--max-num-seqs`) forced a hand-rolled server that cost
+proxy routing, activity visibility, log streaming, and restart supervision in
+one move. The refinement, from the session that hit it: **the allowlist matters
+more than the passthrough.** `--max-num-seqs` and `--gpu-memory-utilization`
+are tuning knobs; `--download-dir` and `--trust-remote-code` are supply-chain
+surface. A template that passes arguments through verbatim has traded an OOM
+problem for a supply-chain one. A dozen NAMED flags covers every case either
+reviewer hit; anything outside the list is refused with the list in the error.
