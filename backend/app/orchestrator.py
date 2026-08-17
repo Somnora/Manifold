@@ -128,6 +128,37 @@ class TerminationBlocked(Exception):
         self.report = report or {}
 
 
+class TerminationRefused(Exception):
+    """Termination refused: this instance belongs to another principal.
+
+    Deliberately NOT folded into force=true. force means "burn it, I accept
+    the data loss" and skips the rescue entirely — so if it also waived
+    ownership, the one call for taking someone else's box would be the one
+    call that destroys their unsaved files without looking. These are two
+    different admissions and they get two different keys.
+
+    The override is confirm_owner: the caller must name the principal they
+    are overriding, which they can only learn by reading the instance. That
+    is the same shape as delete_filesystem's confirm_name, and for the same
+    reason — a guard you can clear without looking is a guard that gets
+    cleared without looking.
+    """
+
+    def __init__(self, instance_id: str, owner: str, purpose: str | None,
+                 caller: str):
+        detail = f" It is described as: {purpose}." if purpose else ""
+        super().__init__(
+            f"Instance {instance_id} was launched by {owner!r}, not by "
+            f"{caller!r}.{detail} If you are certain it should be "
+            f"terminated, pass confirm_owner={owner!r}. Prefer asking its "
+            f"owner first: a box that looks idle may be loading a model."
+        )
+        self.instance_id = instance_id
+        self.owner = owner
+        self.purpose = purpose
+        self.caller = caller
+
+
 @dataclass
 class LaunchPlan:
     """Everything _run_launch needs, resolved and validated up front."""
@@ -407,6 +438,7 @@ class Orchestrator:
         max_lifetime_seconds: float | None = None,
         provider: str = 'lambda',
         created_by: str | None = None,
+        purpose: str = "",
     ) -> dict:
         """Validate and admit a launch; returns the persisted launch row.
 
@@ -563,6 +595,7 @@ class Orchestrator:
             max_lifetime_seconds=max_lifetime_seconds,
             provider=provider,
             created_by=created_by,
+            purpose=purpose,
         )
         plan = LaunchPlan(
             launch_id=launch_id,
@@ -1030,8 +1063,27 @@ class Orchestrator:
         from .preferences import DataSafetyPrefs
         return self.prefs.get().data_safety if self.prefs else DataSafetyPrefs()
 
-    async def terminate(self, instance_id: str, *, force: bool = False) -> dict:
+    async def terminate(self, instance_id: str, *, force: bool = False,
+                        caller: str | None = None,
+                        confirm_owner: str = "") -> dict:
         """Terminate an instance, rescuing its data first.
+
+        `caller` is the principal asking, and passing it OPTS IN to the
+        ownership guard: an instance launched by a different principal is
+        refused unless confirm_owner names that principal. It is passed
+        explicitly, and defaults to None (no check), for the same reason
+        request_launch takes created_by explicitly — half the callers here
+        are background loops. The idle sweep and the ceiling terminate on
+        the system's behalf, not a principal's, and must never be told a
+        box "belongs to someone else"; that is the whole point of them.
+
+        The guard is inert on a single-principal install, because every
+        launch and every caller resolve to the same name. It starts
+        protecting when per-principal tokens are issued (Phase 81 team
+        mode), and it cannot protect a box with no recorded owner: a NULL
+        created_by (adopted, or launched before Phase 94) is unattributed,
+        and refusing on an unknown owner would just teach callers to pass
+        confirm_owner reflexively.
 
         Unless force=true:
         1. Ask the sidecar what valuable files sit in ephemeral scratch (the
@@ -1048,6 +1100,28 @@ class Orchestrator:
         proceed — the hook is best-effort evidence, not a way to wedge
         termination. force=true skips all of it: the explicit "burn it".
         """
+        # Ownership first: refuse before the rescue runs. Rescue talks to the
+        # instance over SSH and can take seconds; a call that was never going
+        # to be allowed should not touch someone else's box at all.
+        if caller is not None:
+            owned = self.db.find_launch_by_instance(instance_id)
+            owner = (owned or {}).get("created_by") or ""
+            if owner and owner != caller and confirm_owner != owner:
+                self.db.record_audit(
+                    caller, "terminate_refused",
+                    f"{instance_id}: launched by {owner}, not {caller}; "
+                    f"refused (pass confirm_owner to override)")
+                raise TerminationRefused(
+                    instance_id, owner, (owned or {}).get("purpose"), caller)
+            if owner and owner != caller:
+                # Allowed, but deliberately loud: one principal destroying
+                # another's box is exactly the event tonight's incident
+                # review needed and could not find.
+                self.db.record_audit(
+                    caller, "terminate_across_owners",
+                    f"{instance_id}: launched by {owner}, terminated by "
+                    f"{caller} with confirm_owner")
+
         report = None
         if not force:
             report = await self.rescue(instance_id)
@@ -1360,6 +1434,16 @@ class Orchestrator:
                 "connection_state": conn.state.value if conn else "disconnected",
                 "connection_error": conn.last_error if conn else "",
                 "launch_id": launch["id"] if launch else None,
+                # WHOSE box, and WHAT FOR (Phase 94). Several agents share
+                # one account, and this list was their only view of it: it
+                # carried launch_id and nothing that said who was behind it,
+                # so an instance another session was mid-way through using
+                # read as "unexplained" and got terminated. Both fields are
+                # None for an adopted box (no launch row) and for anything
+                # launched before this shipped - rendered as unattributed,
+                # never guessed.
+                "created_by": (launch.get("created_by") if launch else None),
+                "purpose": (launch.get("purpose") if launch else None),
             })
         return result
 

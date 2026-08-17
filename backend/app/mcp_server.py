@@ -207,6 +207,7 @@ async def launch_gpu(
     connection_mode: str | None = None,
     idle_timeout_seconds: float | None = None,
     max_lifetime_seconds: float | None = None,
+    purpose: str = "",
     note: str = "",
 ) -> dict:
     """Launch a GPU instance. Flows through ALL backend guards (budget,
@@ -225,12 +226,21 @@ async def launch_gpu(
     that does not cover the boot budget rather than quietly raising it. Unlike
     the idle timeout, nothing on the instance can push it out, and it applies
     even to a box serving a model. Manifold terminates at the ceiling if it
-    can reach the instance and save its files first."""
+    can reach the instance and save its files first.
+
+    ALWAYS pass `purpose`: a short phrase saying what this box is for, e.g.
+    "Tally extraction+evaluation run" or "Red Hope mesh cleanup batch". You
+    are probably not the only agent on this account, and purpose is what
+    everyone else sees in list_instances. A box with no purpose reads as
+    unexplained, and an unexplained box gets terminated by someone trying to
+    be helpful — that has already happened here and cost a multi-hour run."""
     body = {
         "instance_type": instance_type,
         "region": region,
         "filesystem": filesystem,
     }
+    if purpose:
+        body["purpose"] = purpose
     if connection_mode:
         body["connection_mode"] = connection_mode
     if idle_timeout_seconds is not None:
@@ -308,22 +318,49 @@ async def wait_for_launch(launch_id: str, timeout: float = 45,
 @mcp.tool()
 async def list_instances(note: str = "") -> dict:
     """Running instances with live status, SSH connection state, GPU type,
-    region, and hourly rate."""
+    region, and hourly rate.
+
+    Also `created_by` (which principal launched it), `purpose` (what they
+    said it is for), and `activity` — the idle sweep's own verdict, with a
+    `state` (loading | serving | batch_running | auto_managed | keep_alive |
+    idle_countdown | unreachable | unknown), a `busy` flag, and the reason
+    in words. Read those three before acting on anyone's instance but your
+    own. busy=null means the sweep could not tell, which is not the same as
+    false and must not be treated as one."""
     return await _call("list_instances", "GET", "/instances", note=note)
 
 
 @mcp.tool()
 async def terminate_instance(
-    instance_id: str, force: bool = False, note: str = ""
+    instance_id: str, force: bool = False, confirm_owner: str = "",
+    note: str = ""
 ) -> dict:
     """Terminate an instance. With force=false the safety hook checks for
     unsaved files in ephemeral scratch first: if any exist, this returns
     blocked=true with the file list INSTEAD of terminating. Either call
-    sync_outputs then retry, or pass force=true to accept the loss."""
+    sync_outputs then retry, or pass force=true to accept the loss.
+
+    ONLY TERMINATE BOXES YOU LAUNCHED. Check `created_by` and `purpose` in
+    list_instances first. An instance launched by another principal is
+    refused with refused=true, the owner's name, and what they said it is
+    for; confirm_owner=<that name> overrides, and is for when you are sure,
+    not for when you are unsure.
+
+    A box that looks idle is the case to be most careful about, not least.
+    Read `activity` in list_instances before concluding anything: a model
+    server loading its weights has no user processes, writes nothing, and
+    holds the GPU for 10+ minutes, which is indistinguishable from an
+    abandoned box by every signal except that one. If you believe someone
+    else's instance should die, ask the human rather than deciding."""
+    params: dict = {"force": str(force).lower()}
+    if confirm_owner:
+        params["confirm_owner"] = confirm_owner
     return await _call(
         "terminate_instance", "DELETE", f"/instances/{instance_id}",
-        note=note, args={"instance_id": instance_id, "force": force},
-        params={"force": str(force).lower()},
+        note=note,
+        args={"instance_id": instance_id, "force": force,
+              "confirm_owner": confirm_owner},
+        params=params,
     )
 
 

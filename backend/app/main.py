@@ -75,6 +75,7 @@ from .orchestrator import (
     LaunchRejected,
     Orchestrator,
     TerminationBlocked,
+    TerminationRefused,
     launch_options,
     launch_progress,
     max_lifetime_bounds,
@@ -249,6 +250,11 @@ class LaunchRequest(BaseModel):
     # which is the default and the behaviour every existing client gets.
     max_lifetime_seconds: float | None = None
     provider: str = 'lambda'
+    # What this box is for, in the launcher's own words (Phase 94). Shown to
+    # everyone who lists instances, so a reader who did not launch it can
+    # tell work from waste. Optional: an empty purpose is reported as
+    # unattributed rather than filled in with a guess.
+    purpose: str = Field(default="", max_length=200)
 
 
 class ClusterLaunchRequest(BaseModel):
@@ -925,6 +931,27 @@ def create_app(
             },
         )
 
+    @app.exception_handler(TerminationRefused)
+    async def _termination_refused(request, exc: TerminationRefused):
+        from fastapi.responses import JSONResponse
+        # 409 and, crucially, the OWNER: a refusal that would not say whose
+        # box it is leaves the caller exactly where it started, which is
+        # how a box gets terminated on a second try instead of a question.
+        # purpose is included for the same reason - "Tally extraction run"
+        # ends the discussion faster than any policy text.
+        return JSONResponse(
+            status_code=409,
+            content={
+                "detail": str(exc),
+                "refused": True,
+                "instance_id": exc.instance_id,
+                "owner": exc.owner,
+                "purpose": exc.purpose,
+                "caller": exc.caller,
+                "override": {"confirm_owner": exc.owner},
+            },
+        )
+
     @app.exception_handler(LambdaAPIError)
     async def _lambda_error(request, exc: LambdaAPIError):
         from fastapi.responses import JSONResponse
@@ -1317,6 +1344,7 @@ def create_app(
             max_lifetime_seconds=req.max_lifetime_seconds,
             provider=req.provider,
             created_by=current_principal(),
+            purpose=req.purpose,
         )
         return {"launch": launch}
 
@@ -1381,6 +1409,14 @@ def create_app(
                 dispatcher.idle_status(inst["id"])
                 if inst["connection_state"] == "connected" else None
             )
+            # WHY the sweep judges it that way (Phase 94). idle_seconds alone
+            # cannot distinguish a model loading its weights from a box
+            # nobody wants — an agent read "up 6 min, no user processes" as
+            # abandoned and terminated a vLLM instance 60 seconds from
+            # serving. The dispatcher already knew better; it just had no
+            # way to say so. Unconditional, unlike idle: "unreachable" is
+            # itself the answer a reader needs most.
+            inst["activity"] = dispatcher.activity_status(inst["id"])
             # The max-lifetime ceiling sits on the INSTANCE, deliberately not
             # inside inst["idle"]: idle is None for a box that is not
             # connected, and a box that has dropped off SSH while past its
@@ -1407,8 +1443,15 @@ def create_app(
         return {"instance_id": instance_id, "name": req.name.strip()}
 
     @app.delete("/instances/{instance_id}")
-    async def terminate_instance(instance_id: str, force: bool = False):
-        return await orchestrator.terminate(instance_id, force=force)
+    async def terminate_instance(instance_id: str, force: bool = False,
+                                 confirm_owner: str = ""):
+        # caller is passed HERE and not read inside the orchestrator, because
+        # the background loops that also call terminate() (idle sweep,
+        # ceiling) act for the system rather than a principal and must not be
+        # ownership-checked. A request, by definition, has someone behind it.
+        return await orchestrator.terminate(
+            instance_id, force=force, caller=current_principal(),
+            confirm_owner=confirm_owner)
 
     @app.post("/instances/{instance_id}/sync")
     async def sync_instance(instance_id: str):

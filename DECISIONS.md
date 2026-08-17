@@ -5352,3 +5352,88 @@ running agent session.
 Proven both ways: four backend tests (three fail on the old behavior, the
 fourth is the guard that resuming a genuinely dead session still says so),
 and a browser assertion that fails against a backend reverted to Phase 91.
+
+## 2026-08-17 — An instance says whose it is, and whether it is really idle
+
+**Decided:** `GET /instances` carries three new things — `created_by` (which
+principal launched it), `purpose` (what they said it is for), and `activity`
+(the idle sweep's own verdict, with a state, a `busy` flag, and the reason in
+words). `DELETE /instances/{id}` refuses an instance launched by a different
+principal, and the override is `confirm_owner=<that principal>`, not `force`.
+
+**The incident this comes from.** Three agent sessions shared this account
+through one MCP token. One listed instances, found an A100 it had not
+launched, and checked it every way it could: `uptime`, logged-in users,
+running processes, writes to the NFS. All of them said idle. It was a vLLM
+box six minutes into loading a 27B model from the shared HF cache — no users,
+no obvious processes, nothing written, 30GB of VRAM held — and it was
+terminated about sixty seconds before it would have served. A multi-hour
+extraction run died with it. The audit note reads: "Verified idle before
+terminating: up 6 min, 0 users, no user processes, nothing written to the
+NFS."
+
+Nothing in that reasoning was careless. Every question it asked, the API
+answered, and every question was the wrong one.
+
+**Why the payload, not a convention.** The list an agent sees carried
+`launch_id` and nothing else about origin, so a box in use and a box
+abandoned were byte-for-byte indistinguishable. Attribution existed — Phase
+79 resolves a principal per request, Phase 81 built `api_principals`, and
+`launches.created_by` has been a column since 79 — it just never reached the
+one view everybody reads. The alternative was asking six sessions to each
+remember to call `get_launch_status` per instance before acting. Conventions
+that must be independently rediscovered by every reader are not guards.
+
+**Why `activity` is the interesting half.** Phase 90 already taught the idle
+sweep the exact distinction that was missed: a server not yet answering
+`/v1/models` counts as ACTIVITY, precisely so a 70B downloading for 40
+minutes is not reaped at minute 30. The dispatcher computed that verdict
+every sweep, used it for one decision, and discarded it. Readers got
+`idle_seconds` and reconstructed the judgment by hand from shell commands.
+So the sweep now records its reasoning and `activity_status()` hands it out.
+It is a cache, deliberately: answering "is it loading?" live means probing
+the instance, and this feeds a list the dashboard polls every few seconds.
+Each entry carries its age so a stale verdict can be recognised.
+
+`busy` is the FACTUAL question (is work loaded and running here), not the
+policy question (may Manifold reap this). A serving box that has been quiet
+for a while is `busy: true` and still subject to the idle timeout; the
+arithmetic stays visible in `idle_seconds`/`timeout_seconds`. Conflating the
+two would have produced exactly the original bug in a new field.
+
+Unknown is its own answer. An unreachable box, and an instance no sweep has
+judged yet, both report `busy: null` — never `false`. "No evidence of work"
+is not "evidence of no work", and that inference is the whole bug.
+
+**Why `confirm_owner` and not `force`.** `force` means "burn it, I accept the
+data loss" and skips the rescue entirely. Had it also waived ownership, the
+single call for taking another principal's box would have been the one call
+that destroys their unsaved files without looking. Two different admissions,
+two different keys. `confirm_owner` follows `delete_filesystem`'s
+`confirm_name`: you can only supply it by reading the record first, and a
+guard you can clear without looking is a guard that gets cleared without
+looking. The refusal returns the owner, the purpose and the override, because
+a refusal that withholds whose box it is sends the caller back to try again
+rather than to ask.
+
+**What is deliberately NOT guarded.** The idle sweep and the ceiling call
+`terminate()` too, and they pass no caller. They act for the system, not a
+principal; had they inherited one, idle auto-termination would have silently
+stopped working the moment a second token was issued — the product's central
+feature, disabled by a safety feature. `caller` is opt-in for that reason,
+the same way `request_launch` takes `created_by` explicitly.
+
+An instance with no recorded owner is not guarded either. NULL `created_by`
+means adopted, or launched before this shipped; refusing on an unknown owner
+would teach callers to pass `confirm_owner` reflexively, training away the
+pause the guard exists to create.
+
+**Inert until team mode is on.** With one shared token every launch and every
+caller resolve to the same principal, so nothing changes for a single-user
+install. The guard starts protecting when per-principal tokens are issued.
+That is a configuration step, not a code one, and it is the user's to take.
+
+Proven both ways: 22 tests, 18 of which fail against the code they replace.
+The 4 that pass on both sides are the regression guards — own-box
+termination, the unattributed box, and the sweep never being ownership-checked
+— and they are the ones that would catch this guard being over-applied.

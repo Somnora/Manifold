@@ -372,6 +372,14 @@ class Database:
         self._ensure_column("tasks", "created_by", "TEXT")
         self._ensure_column("watches", "created_by", "TEXT")
         self._ensure_column("agent_runs", "created_by", "TEXT")
+        # Phase 94: what this box is FOR, in the launcher's own words. Free
+        # text, carried into the instances payload so a reader who did not
+        # launch it can tell work from waste. NULL on historical rows and
+        # never inferred: an empty purpose reads as "nobody said", which is
+        # the honest answer and the one that makes a reader ask rather than
+        # assume. See DECISIONS.md - an agent read an unattributed box as a
+        # stray and terminated a model that was still loading.
+        self._ensure_column("launches", "purpose", "TEXT")
         # Phase 80: a principal's role. Pre-80 rows default to operator -
         # exactly what a minted token could do before roles existed (act,
         # but not manage credentials or policy).
@@ -438,6 +446,7 @@ class Database:
         launch_id: str | None = None,
         created_at: str | None = None,
         created_by: str | None = None,
+        purpose: str | None = None,
     ) -> str:
         """Insert a launch row and return its id.
 
@@ -455,11 +464,13 @@ class Database:
             """INSERT INTO launches
                (id, provider, created_at, requested_type, region, filesystem,
                 connection_mode, hourly_rate_cents, status,
-                idle_timeout_seconds, max_lifetime_seconds, created_by)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'launching', ?, ?, ?)""",
+                idle_timeout_seconds, max_lifetime_seconds, created_by,
+                purpose)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'launching', ?, ?, ?, ?)""",
             (launch_id, provider, created_at or utcnow(), requested_type,
              region, filesystem, connection_mode, hourly_rate_cents,
-             idle_timeout_seconds, max_lifetime_seconds, created_by),
+             idle_timeout_seconds, max_lifetime_seconds, created_by,
+             (purpose or "").strip() or None),
         )
         return launch_id
 
