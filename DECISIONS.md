@@ -5908,3 +5908,36 @@ are tuning knobs; `--download-dir` and `--trust-remote-code` are supply-chain
 surface. A template that passes arguments through verbatim has traded an OOM
 problem for a supply-chain one. A dozen NAMED flags covers every case either
 reviewer hit; anything outside the list is refused with the list in the error.
+
+## 2026-08-17 — Phase 96: the missing flag, and three cheap truths
+
+**The flag.** Both agent reviews ranked the same root cause first: vllm-serve
+could not express `--max-num-seqs`, so a model that OOMs a 40 GB A100 without it
+forced a hand-rolled server — which then cost proxy routing, activity
+visibility (the 07:42 reap), log streaming, and restart supervision, all
+casualties of one inexpressible flag. The fix is `extra_args` on vllm-serve,
+built to the constraint recorded before it: **the allowlist matters more than
+the passthrough.** Twelve named tuning flags; `--trust-remote-code` and
+`--download-dir` are deliberately absent (supply-chain surface, not knobs); the
+backend refuses anything else at enqueue with the full list in the error, and
+`to_api` publishes the list so the wall is discoverable without being hit.
+Mechanically safe by construction: the template's bootstrap builds argv in
+Python and execvp's it — no shell ever sees the value — so validation is purely
+about which vLLM flags pass, with a conservative value charset anyway. The
+mechanism (`arg_allowlist` on any string parameter, load-time-checked) is
+generic; sglang-serve can adopt it when someone needs it.
+
+**Three truths.** The launcher can now set the display `name` from MCP (a box
+got hand-renamed in the UI mid-incident because a name was the only ownership
+signal that existed; `LaunchRequest` had the field all along — the tool never
+exposed it). Spend breaks down by `purpose` (and the Phase-81 `created_by`
+grouping is finally surfaced to agents via `get_spend_breakdown` — it existed
+for months with no agent-reachable reader, the unshown-field pattern again).
+And the rescue hook's scope is stated where it matters: `/workspace/ephemeral`,
+NOT `$HOME` — so "files_found: 0" reads as "nothing in scope", not "nothing was
+lost", on the two tools whose descriptions imply safety.
+
+**A caveat learned live:** Lambda's `bytes_used` counter lags real contents by
+hours — a filesystem that had just served a 16 GB model read 0 bytes. The
+storage estimate's note now says so; a single reading is not evidence either
+way, in either direction.

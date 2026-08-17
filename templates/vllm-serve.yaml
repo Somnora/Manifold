@@ -17,7 +17,7 @@ command: >
 
   (model_id, max_context, port, tensor_parallel, tool_call_parser,
    enable_lora, max_loras, max_cpu_loras, lora_modules, max_lora_rank,
-   speculative_model, num_speculative_tokens) = sys.argv[1:13]
+   speculative_model, num_speculative_tokens, extra_args) = sys.argv[1:14]
 
   cmd = [
       "vllm", "serve", model_id,
@@ -46,12 +46,15 @@ command: >
       if num_speculative_tokens and str(num_speculative_tokens).isdigit():
           cmd.extend(["--num-speculative-tokens", str(num_speculative_tokens)])
 
+  if str(extra_args).strip():
+      cmd.extend(str(extra_args).split())
+
   joined = " ".join(cmd)
 
   print(f"manifold: launching vllm -> {joined}", flush=True)
 
   os.execvp(cmd[0], cmd)
-  ' {{model_id}} {{max_context}} {{port}} {{tensor_parallel}} {{tool_call_parser}} {{enable_lora}} {{max_loras}} {{max_cpu_loras}} {{lora_modules}} {{max_lora_rank}} {{speculative_model}} {{num_speculative_tokens}}
+  ' {{model_id}} {{max_context}} {{port}} {{tensor_parallel}} {{tool_call_parser}} {{enable_lora}} {{max_loras}} {{max_cpu_loras}} {{lora_modules}} {{max_lora_rank}} {{speculative_model}} {{num_speculative_tokens}} {{extra_args}}
 
 parameters:
   - name: model_id
@@ -101,6 +104,29 @@ parameters:
     type: integer
     default: 5
     description: Number of speculative tokens to sample per draft step when speculative_model is set.
+  # Phase 96. One inexpressible flag (--max-num-seqs on a 40GB A100) forced a
+  # hand-rolled server that cost proxy routing, activity visibility, log
+  # streaming, and restart supervision in one move. The allowlist matters more
+  # than the passthrough: these are tuning knobs; --trust-remote-code and
+  # --download-dir are supply-chain surface and are deliberately absent. The
+  # backend refuses any flag not named here, with this list in the error.
+  - name: extra_args
+    type: string
+    default: ""
+    description: Extra vLLM tuning flags from the allowlist, space-separated, e.g. "--max-num-seqs 8 --gpu-memory-utilization 0.90". Flags outside the allowlist are refused at enqueue.
+    arg_allowlist:
+      - --max-num-seqs
+      - --gpu-memory-utilization
+      - --max-num-batched-tokens
+      - --swap-space
+      - --dtype
+      - --quantization
+      - --kv-cache-dtype
+      - --enforce-eager
+      - --seed
+      - --disable-log-requests
+      - --max-seq-len-to-capture
+      - --cpu-offload-gb
 
 volumes:
   # HuggingFace cache on persistent storage: models survive the instance.

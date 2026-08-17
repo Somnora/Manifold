@@ -72,6 +72,14 @@ class TemplateParameter:
     type: str
     description: str
     default: object | None = None
+    # Phase 96: a passthrough parameter's permitted flags. Empty = an
+    # ordinary parameter. Non-empty = the value is a flag string and the
+    # backend refuses any flag not named here, with the list in the error.
+    # THE ALLOWLIST MATTERS MORE THAN THE PASSTHROUGH (see DECISIONS.md):
+    # --max-num-seqs is a tuning knob; --trust-remote-code is supply-chain
+    # surface, and a template that passes arguments through verbatim has
+    # traded an OOM problem for a worse one.
+    arg_allowlist: tuple[str, ...] = ()
 
     @property
     def required(self) -> bool:
@@ -138,6 +146,10 @@ class JobTemplate:
                     "description": p.description,
                     "default": p.default,
                     "required": p.required,
+                    # Surfaced so agents and the UI can SEE which flags are
+                    # permitted instead of discovering the wall by hitting it.
+                    **({"arg_allowlist": list(p.arg_allowlist)}
+                       if p.arg_allowlist else {}),
                 }
                 for p in self.parameters
             ],
@@ -183,9 +195,16 @@ def parse_template(text: str, source: str = "<inline>") -> JobTemplate:
                 f"template '{name}': parameter '{p['name']}' has unknown type "
                 f"'{ptype}' (valid: {', '.join(PARAMETER_TYPES)})"
             )
+        allowlist = p.get("arg_allowlist") or []
+        if allowlist and ptype != "string":
+            raise TemplateError(
+                f"template '{name}': parameter '{p['name']}' has an "
+                f"arg_allowlist but type '{ptype}' - only a string can "
+                f"carry flags")
         parameters.append(TemplateParameter(
             name=str(p["name"]), type=ptype,
             description=str(p["description"]), default=p.get("default"),
+            arg_allowlist=tuple(str(f) for f in allowlist),
         ))
     declared = {p.name for p in parameters}
 
