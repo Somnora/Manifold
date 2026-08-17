@@ -159,9 +159,31 @@ def diagnose(
                 fail(f"something answers at {api_url} but it is not "
                      f"Manifold (/health returned {resp.status_code})")
         except httpx.HTTPError as exc:
+            # "No backend" used to be the whole answer, and it is the least
+            # useful half of one: it cannot tell a quit from a crash from a
+            # wedge, so the reader's next step was guesswork. On 2026-08-16
+            # that guesswork cost hours. Say WHICH kind of absent, and what
+            # is still billing while it is.
+            from .liveness import (APP_GONE, WEDGED, Probe, classify,
+                                   count_live_launches, describe,
+                                   last_log_timestamp, shell_running)
+            state = classify(
+                Probe(False, None, 0.0, "refused"),
+                shell_alive=shell_running())
             fail(f"no backend at {api_url} ({exc.__class__.__name__}). "
-                 f"Start the Manifold app, or from a dev checkout: "
-                 f"uv run uvicorn app.main:create_default_app --factory")
+                 + describe(state,
+                            since=last_log_timestamp(data_root / "logs"),
+                            live_launches=count_live_launches(
+                                data_root / "manifold.db")))
+            if state == APP_GONE:
+                info("relaunch Manifold.app, or from a dev checkout: "
+                     "uv run uvicorn app.main:create_default_app --factory")
+            elif state == WEDGED:
+                info("it is running, so do NOT kill it blindly: check "
+                     "logs/manifold.log for event_loop_blocked first")
+            else:
+                info("start the Manifold app, or from a dev checkout: "
+                     "uv run uvicorn app.main:create_default_app --factory")
 
         # 2. token present and accepted? (never the value)
         token, source = resolve_token(data_root)

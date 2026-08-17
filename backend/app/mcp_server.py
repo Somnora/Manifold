@@ -32,6 +32,21 @@ API_URL = os.environ.get("MANIFOLD_API_URL", "http://localhost:8000")
 # the .env path to copy it from.
 API_TOKEN = os.environ.get("MANIFOLD_API_TOKEN", "")
 
+# What an agent should DO about an unreachable backend. On 2026-08-16 a
+# peer session got ECONNREFUSED on every call, could not tell "quit" from
+# "crashed" from "wedged" from "misconfigured", and waited - blocked, with
+# a $1.99/hr GPU it could not reach - until it gave up and asked a human.
+# The bridge cannot classify (it is HTTP-only by construction), but it can
+# say where the answer lives. Deliberately mentions that INSTANCES SURVIVE:
+# the wrong reaction to a dead backend is to assume the work died with it.
+_UNREACHABLE_HINT = (
+    "The Manifold app is probably not running - the backend goes down with "
+    "it by design. Any GPU instances are UNAFFECTED and still billing; they "
+    "outlive the backend and will be re-adopted when it returns. Relaunch "
+    "Manifold, then run `manifold-doctor` (or `manifold-watch --once`) to "
+    "see whether it is gone, wedged, or merely slow."
+)
+
 mcp = FastMCP(
     "manifold",
     instructions=(
@@ -122,7 +137,8 @@ async def _call(
                        or f"HTTP {resp.status_code} (non-JSON response)"}
     except httpx.HTTPError as exc:
         result = {
-            "error": f"Manifold backend unreachable at {API_URL}: {exc}",
+            "error": f"Manifold backend unreachable at {API_URL}: {exc}. "
+                     f"{_UNREACHABLE_HINT}",
             "unreachable": True,
         }
         await _audit(tool, args, note, result["error"])
@@ -151,7 +167,8 @@ async def get_skill(note: str = "") -> str:
     try:
         resp = await _http().get("/skill")
     except httpx.HTTPError as exc:
-        return f"Manifold backend unreachable at {API_URL}: {exc}"
+        return (f"Manifold backend unreachable at {API_URL}: {exc}. "
+                f"{_UNREACHABLE_HINT}")
     if resp.status_code >= 400:
         return f"skill document unavailable (HTTP {resp.status_code})"
     await _audit("get_skill", {}, note, "ok")

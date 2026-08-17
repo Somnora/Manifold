@@ -772,6 +772,25 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        # -- the tombstone (Phase 94c) ---------------------------------------
+        # Ask, before anything else, whether the PREVIOUS run stopped on
+        # purpose. Until this shipped there was no way to tell: a clean quit
+        # bypasses this lifespan via desktop.py's os._exit, so it left the
+        # log ending mid-line with no marker - identical to a crash. A
+        # 331-second quit on 2026-08-16 was chased for hours as a silent
+        # crash for exactly that reason. None means "no prior marker", which
+        # is not the same as "it crashed" and must not be reported as one.
+        from .liveness import previous_run_ended_cleanly
+        clean = previous_run_ended_cleanly(settings.db_path)
+        if clean is False:
+            logger.warning(
+                "the previous backend run stopped without recording a "
+                "shutdown - it was killed or it crashed, rather than being "
+                "quit. See the log directory for what it was doing.")
+            db.record_audit("backend", "backend_died_unrecorded",
+                            "the previous run left no shutdown marker")
+        db.record_audit("backend", "backend_started",
+                        f"pid {os.getpid()}")
         # Re-attach to instances still running on Lambda (e.g. after a
         # backend restart) before starting the loops, so the dispatcher and
         # idle watcher see them immediately. Best-effort; never blocks boot.
@@ -802,6 +821,12 @@ def create_app(
             lag_task = asyncio.create_task(loop_lag_monitor(
                 threshold_seconds=settings.diagnostics.loop_lag_seconds))
         yield
+        # The other half of the tombstone. This runs on a GRACEFUL stop
+        # (uvicorn caught SIGTERM/SIGINT, the test harness exited the
+        # context). It deliberately does NOT run under desktop.py's
+        # os._exit path - that one writes its own row before exiting,
+        # because nothing here would get the chance.
+        db.record_audit("backend", "backend_stopped", "lifespan shutdown")
         if lag_task is not None:
             lag_task.cancel()
         await autopilot.stop()
