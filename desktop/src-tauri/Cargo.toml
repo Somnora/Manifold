@@ -1,6 +1,6 @@
 [package]
 name = "manifold-desktop"
-version = "0.2.5"
+version = "0.2.6"
 description = "Manifold - Lambda Cloud GPU orchestrator"
 edition = "2021"
 
