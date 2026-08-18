@@ -134,3 +134,37 @@ def test_task_logs_tail_over_http(client):
     lines = [l["line"] for l in
              client.get(f"/tasks/{task_id}/logs?tail=10").json()["lines"]]
     assert lines == [f"line {i}" for i in range(16, 26)]
+
+
+# -- Phase 108: reads are atomic across threads -------------------------------
+
+
+def test_cross_thread_reads_never_lose_the_row(client):
+    """The CI flake that failed two green trees in one day: _execute's
+    lock covered execute+commit, but the cursor was consumed OUTSIDE the
+    lock, and a statement from another thread resets it - a just-written
+    task row read back as None. Tests drive the queue from the pytest
+    thread while the app loop runs its own queries, so this hammers that
+    exact interleaving; with materialized rows it must never lose."""
+    import threading
+
+    db = client.app.state.orchestrator.db
+    stop = threading.Event()
+
+    def noise():
+        while not stop.is_set():
+            db.list_tasks()
+            db.list_audit(limit=5)
+
+    t = threading.Thread(target=noise, daemon=True)
+    t.start()
+    try:
+        queue = client.app.state.queue
+        for i in range(300):
+            task_id = queue.enqueue(template=f"ghost-{i}", parameters={"n": i})
+            task = queue.get(task_id)
+            assert task is not None, f"row {i} vanished between write and read"
+            assert task["parameters"] == {"n": i}, f"row {i} garbled"
+    finally:
+        stop.set()
+        t.join(timeout=5)
