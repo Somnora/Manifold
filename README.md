@@ -5,7 +5,7 @@ ever losing a file or leaking a dollar. One guarded FastAPI backend owns
 every action; a dashboard, a desktop app, and an MCP server for AI agents
 are all thin clients of it.
 
-![The Manifold dashboard: launch pipeline, live instance with GPU telemetry, capacity watches](docs/images/dashboard.png)
+![The Manifold dashboard: the launch form with purpose and runtime ceilings, and an attributed live instance](docs/images/dashboard.png)
 
 ## Try it in 90 seconds, no credentials
 
@@ -57,7 +57,13 @@ client:
 
 - **Spend guards.** Budget cap, concurrency limit, and a live burn rate in
   the header. Idle instances auto-terminate (default 30 min, keep-alive one
-  click away). Capacity watches can auto-launch the moment a region frees up.
+  click away), and the sweep checks the GPU before it acts: a box at 100%
+  utilization is never "idle", even when the work driving it is invisible
+  to Manifold. Two ceilings bound every launch: max lifetime (absolute, boot
+  included) and max active time (counted from health-check pass, so a slow
+  boot never spends your run budget). Capacity watches can auto-launch the
+  moment a region frees up. Even filesystem storage, which the provider's
+  API does not price, appears as a labeled estimate at a rate you configure.
 - **Termination saves before it destroys.** Shutting down first rescues
   ephemeral files per your data-safety policy, and refuses if something
   could not be saved. There is exactly one explicit "burn it" override.
@@ -66,7 +72,9 @@ client:
   managed SSH connection. The OpenAI-compatible proxy on your machine is the
   one public face.
 - **Everything is audited.** Every launch, job, command, and agent tool call
-  lands in one audit log.
+  lands in one audit log that is never pruned. It once reconstructed a night
+  of cross-agent terminations that two sessions remembered differently; the
+  log was the account both accepted.
 
 ## Jobs, not shell sessions
 
@@ -74,9 +82,15 @@ Work is YAML job templates run as supervised containers: `vllm-serve`,
 `sglang-serve`, `whisper-batch`, `axolotl-finetune`, `llm-synthesize`,
 `lora-merge`, `sdxl-generate`, `script-run`, and more. Jobs stream logs,
 survive backend restarts, and can auto-manage their own instance: rent a
-GPU, run, sync outputs, terminate.
+GPU, run, sync outputs, terminate. Templates take tuning flags through a
+per-template allowlist (`extra_args: "--max-num-seqs 8"` on vllm-serve);
+anything outside the list is refused at enqueue with the list in the error.
+For long work that fits no template, `run_detached` starts a command that
+survives disconnects and backend restarts, records its exit code, and
+counts as activity, so the box protects itself from the idle sweep while
+an rsync or a compile runs.
 
-![The Jobs page: cost estimate before launch, a served model going ready, job history with logs](docs/images/jobs.png)
+![The Jobs page: a served model ready with tuning flags via extra_args, cost estimate before launch, job history](docs/images/jobs.png)
 
 The whole distillation loop is templates end to end: `llm-synthesize`
 (teacher writes a training set) -> `axolotl-finetune` (LoRA on the student)
@@ -90,10 +104,19 @@ new filebases in any region from the Storage page.
 
 ## Built for AI agents
 
-Any MCP client (Claude Code, Claude Desktop, Codex, Gemini CLI) gets 37
+Any MCP client (Claude Code, Claude Desktop, Codex, Gemini CLI) gets 41
 tools that flow through the same guarded backend, so an agent hits the same
-budget walls you do. With the desktop app installed, registration is one
-line, no dev checkout:
+budget walls you do. Several agents can share one account safely: every
+launch carries a required `purpose` and a `created_by`, every instance
+reports the idle sweep's own verdict on whether it is busy (with "cannot
+tell" as a real answer, never dressed as "no"), and terminating another
+principal's box is refused unless the caller names the owner. That design
+came from a real incident: one agent terminated another's model server
+mid-load because every cheap signal said the box was idle. The fix was not
+asking agents to be more careful; it was making the payload carry the
+facts.
+
+With the desktop app installed, registration is one line, no dev checkout:
 
 ```bash
 claude mcp add manifold --scope user -- "/Applications/Manifold.app/Contents/MacOS/manifold-backend" --mcp
@@ -155,7 +178,7 @@ Build instructions: `docs/desktop-build.md`.
 ```bash
 cd backend
 uv sync
-uv run pytest          # 970+ tests, all against mocks; no live spend
+uv run pytest          # 1,190+ tests, all against mocks; no live spend
 ```
 
 Hard rules: no live spend in tests, all guards live in the backend, clients
@@ -164,4 +187,4 @@ never get a path around them. The full list is in `CLAUDE.md`, and
 
 ## License
 
-MIT — see `LICENSE`.
+MIT. See `LICENSE`.
