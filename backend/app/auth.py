@@ -205,6 +205,11 @@ ROUTE_ROLES: dict[tuple[str, str], str] = {
     # is operator like /run; reading status is the same privilege as reading
     # logs. Viewers may watch, not launch.
     ("POST", "/instances/{instance_id}/run-detached"): "operator",
+    # Registered endpoints (Phase 99): registering changes what the proxy
+    # routes, so it is operator; reading the list is viewer.
+    ("POST", "/instances/{instance_id}/endpoints"): "operator",
+    ("GET", "/instances/{instance_id}/endpoints"): "viewer",
+    ("DELETE", "/instances/{instance_id}/endpoints/{port}"): "operator",
     ("GET", "/instances/{instance_id}/detached/{handle}"): "viewer",
     ("GET", "/instances/{instance_id}/detached"): "viewer",
     ("POST", "/instances/{instance_id}/chat"): "operator",

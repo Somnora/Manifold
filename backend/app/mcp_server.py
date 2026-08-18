@@ -482,6 +482,46 @@ async def terminate_instance(
 
 
 @mcp.tool()
+async def register_endpoint(instance_id: str, port: int, model_id: str,
+                            purpose: str = "", note: str = "") -> dict:
+    """Adopt a model server YOU started by hand into the OpenAI proxy.
+
+    Use this when no template can express your serve command: start the
+    server yourself (bind it to 127.0.0.1 on the instance - loopback only,
+    per the hard rule), then register its port here. From that moment it
+    is a first-class citizen: routed at localhost:8000/v1 under
+    `model_id`, listed by /v1/models once it answers, and its proxy
+    traffic COUNTS AS ACTIVITY, so using it keeps the idle sweep away.
+
+    This closes the gap that cost a real run: a hand-started server used
+    to be invisible to the proxy AND the activity tracker in one move -
+    the box looked abandoned the entire time it served. Prefer a template
+    (vllm-serve takes extra_args for tuning flags); register when the
+    template genuinely cannot express what you need. Re-registering the
+    same port updates the model id. Registration dies with the instance."""
+    return await _call(
+        "register_endpoint", "POST", f"/instances/{instance_id}/endpoints",
+        note=note,
+        args={"instance_id": instance_id, "port": port,
+              "model_id": model_id, "purpose": purpose},
+        body={"port": port, "model_id": model_id, "note": purpose},
+    )
+
+
+@mcp.tool()
+async def deregister_endpoint(instance_id: str, port: int,
+                              note: str = "") -> dict:
+    """Remove a registered endpoint from the proxy. The server itself is
+    untouched - this only stops routing to it. Registrations also clean up
+    automatically when the instance terminates."""
+    return await _call(
+        "deregister_endpoint", "DELETE",
+        f"/instances/{instance_id}/endpoints/{port}",
+        note=note, args={"instance_id": instance_id, "port": port},
+    )
+
+
+@mcp.tool()
 async def set_keep_alive(
     instance_id: str, enabled: bool, note: str = ""
 ) -> dict:
