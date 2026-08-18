@@ -13,7 +13,9 @@ backend) already running to answer.
 
 `manifold-backend --doctor` prints the end-to-end wiring checklist
 (backend up? token accepted? registered in which agent configs, at what
-scope?) and exits nonzero when an agent would be blocked. See app/doctor.py.
+scope? does the bridge complete a real MCP handshake?) and exits nonzero
+when an agent would be blocked. Add `--handshake` to run only the
+handshake self-test, `--no-handshake` to skip it. See app/doctor.py.
 
 MANIFOLD_MOCK=1 works here exactly as in development - the packaged app can
 be demoed with zero credentials and zero spend.
