@@ -6005,3 +6005,31 @@ assumption.
 against the same project can deadlock on the environment lock — a 4-minute
 suite sat wedged for 1h40m while the visual rig's mock backend held uv's
 attention. Run the rig or the suite, not both.
+
+## 2026-08-18 — Phase 98: the front door tells the truth, and the hot table stops growing
+
+**The agent onboarding doc was four phases stale.** `docs/manifold-skill.md` is
+the first thing every agent reads (`get_skill`, ordered by the MCP server's own
+instructions), and it described the pre-incident surface: no `purpose` (now
+required — the doc walked new agents into a schema error), no `run_detached`,
+one ceiling, and an idle-protection claim that had become false. Every peer
+session this week learned the new surface from chat messages — the exact
+failure class both reviews named, at the documentation layer: data that existed
+and was not carried to the sentence agents act on first. The doc now opens its
+multi-agent section with the three rules the incident taught, each with its
+one-line origin story, because a rule with its incident attached survives
+paraphrase. `mcp-setup.md`'s tool table matches the real signatures.
+
+**Telemetry retention.** `telemetry_samples` gained a row per connected
+instance every 30s forever, and since Phase 96 it is read on every `/instances`
+poll. An hourly prune now rides the telemetry loop (no loop of its own).
+Default 30 days, DELIBERATELY equal to `max_lifetime_max_seconds`: idle-spend
+accounting reads samples across a launch's whole window, so no live launch may
+outlive its own telemetry. 0 keeps everything. One audit row per prune that
+deleted anything.
+
+**`audit_log` is never pruned, and that is now pinned by a test** that greps
+the db module for `DELETE FROM audit_log`. It is the forensic record:
+reconstructing one night of terminations depended on rows nobody knew they
+would need. Whoever adds a prune path someday argues with that test and that
+night, not with nobody.

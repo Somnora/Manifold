@@ -187,12 +187,12 @@ registration commands and the live last-call status.
 | Tool | What it does |
 | --- | --- |
 | `list_launch_options()` | Ranked {type, region, filesystem} targets that have capacity NOW, co-located with your data first — call before `launch_gpu` |
-| `launch_gpu(instance_type, region, filesystem, connection_mode?)` | Launch through ALL guards; returns a launch id |
+| `launch_gpu(instance_type, region, filesystem, purpose, name?, max_active_seconds?, ...)` | Launch through ALL guards; `purpose` is required (it is what other agents see); returns a launch id |
 | `get_launch_status(launch_id)` | One snapshot: phase + boot countdown while it boots |
 | `wait_for_launch(launch_id, timeout=120)` | Block until active/failed instead of polling (best for slow SXM4 boots) |
-| `list_instances()` | Live instances + SSH connection state |
+| `list_instances()` | Live instances: SSH state, `created_by`, `purpose`, the idle sweep's `activity` verdict, and the last GPU telemetry sample |
 | `get_spend()` | What the launches have cost (today / week / month to date / all time) + the current $/hour burn — call it before an expensive launch so the agent can limit itself |
-| `terminate_instance(id, force=false)` | force=false returns the unsaved-file list instead of terminating |
+| `terminate_instance(id, force=false, confirm_owner?)` | force=false returns the unsaved-file list instead of terminating; another principal's box is refused unless `confirm_owner` names them |
 | `sync_outputs(instance_id)` | rsync ephemeral scratch → persistent filesystem |
 | `list_templates()` | Job templates with parameter schemas |
 | `run_job(template, parameters)` | Enqueue a job; validated immediately |
@@ -200,7 +200,10 @@ registration commands and the live last-call status.
 | `list_filesystems()` / `list_persistent_files(prefix)` | Persistent storage; browses over SSH (no S3 keys) when a box is up, else via the S3 Files API |
 | `upload_file(local_path, remote_path)` | Push a file from this machine to the instance (SFTP) |
 | `download_file(remote_path, local_path)` | Pull results back to this machine (SFTP) |
-| `run_command(instance_id, command, timeout=120)` | ONE shell command on the instance, audited with its exit code |
+| `run_command(instance_id, command, timeout=45)` | ONE shell command, capped at 50s, audited with its exit code |
+| `run_detached(instance_id, command, purpose)` / `detached_status(id, handle)` | Long work that outlives the call (and backend restarts); a running detached pid counts as activity, so the box protects itself from the idle sweep |
+| `set_keep_alive(instance_id, enabled)` | Switch idle auto-termination off for one box (for long CPU/IO work started outside Manifold); the max-lifetime ceiling still applies |
+| `get_spend_breakdown(by)` | Spend by `created_by`, `purpose`, type, region — "what did MY project cost" on a shared account |
 | `save_template(yaml_text)` / `delete_template(name)` | Author a custom job template (see docs/custom-templates.md) |
 
 Two honest limits on every number `get_spend` returns: it counts only
@@ -230,7 +233,8 @@ Activity):
    target is `gpu_1x_a10` in `us-east-1` on `manifold-data` (co-located with
    the inbox, and available right now), so no region is guessed blind.
 3. `launch_gpu(instance_type="gpu_1x_a10", region="us-east-1",
-   filesystem="manifold-data", note="GPU for whisper batch")` → launch id.
+   filesystem="manifold-data", purpose="whisper batch for the interview set",
+   note="GPU for whisper batch")` → launch id.
    If this had breached the budget or concurrency cap, the tool would have
    returned the guard's message and the agent would have to tell you no.
 4. `get_launch_status(...)` polled until `active`.

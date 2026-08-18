@@ -387,6 +387,9 @@ class Dispatcher:
         # probing again, and treats it as evidence only while FRESH - stale
         # confirmation is no confirmation (see _check_idle).
         self._detached_alive: dict[str, tuple[float, list[str]]] = {}
+        # Last telemetry prune (Phase 98), monotonic. Hourly cadence riding
+        # the telemetry loop - retention needs no loop of its own.
+        self._last_prune = 0.0
         # Instances whose idle auto-termination the user switched off; also
         # persisted on the launch row (see keep_alive_enabled).
         self._keep_alive_mem: set[str] = set()
@@ -2399,6 +2402,38 @@ class Dispatcher:
             + ": cancelled by user")
         return {"cancelled": task_id}
 
+    def _maybe_prune_telemetry(self) -> None:
+        """Hourly: drop samples older than telemetry.retain_days.
+
+        The table grows forever otherwise, and since Phase 96 it has a
+        reader on the hottest route (latest_telemetry on every /instances
+        poll). 30-day default so no live launch can outlive its telemetry
+        (the ceiling max is 30 days, and idle-spend accounting reads
+        samples across a launch's whole window). 0 disables. One audit row
+        per prune that deleted anything - never one per pass, and NEVER
+        audit_log itself: that is the forensic record.
+        """
+        retain = getattr(self.settings.telemetry, "retain_days", 0)
+        if not retain:
+            return
+        now = self._clock()
+        if now - self._last_prune < 3600.0:
+            return
+        self._last_prune = now
+        try:
+            from datetime import datetime, timedelta, timezone
+            cutoff = (datetime.now(timezone.utc)
+                      - timedelta(days=float(retain))).isoformat(
+                          timespec="seconds")
+            deleted = self.db.prune_telemetry(cutoff)
+            if deleted:
+                self.db.record_audit(
+                    "backend", "telemetry_pruned",
+                    f"{deleted} sample(s) older than {retain:.0f}d removed")
+        except Exception:   # noqa: BLE001 - retention must never break
+            # sampling; try again next hour.
+            logger.exception("telemetry prune failed")
+
     # -- telemetry sampling loop -------------------------------------------------------
 
     async def _telemetry_loop(self) -> None:
@@ -2491,6 +2526,7 @@ class Dispatcher:
         return out
 
     async def _sample_telemetry_once(self) -> None:
+        self._maybe_prune_telemetry()
         for instance_id, conn in list(self.orchestrator.connections.items()):
             if conn.state != ConnectionState.CONNECTED:
                 continue

@@ -326,3 +326,12 @@ storage:
   # Write the rate from Lambda's current pricing page here; set 0 to switch
   # the estimate off rather than trust a number nobody vouched for.
   rate_usd_per_gb_month: 0.20
+
+telemetry:
+  # Sampling cadence for the per-instance GPU rows (see backend docs), and
+  # how long those rows are kept. 30 days and not shorter: the max-lifetime
+  # ceiling allows 30-day launches, and idle-spend accounting reads samples
+  # across a launch's whole window - no live launch may outlive its own
+  # telemetry. 0 keeps everything forever. The audit log is NEVER pruned.
+  sample_seconds: 30
+  retain_days: 30

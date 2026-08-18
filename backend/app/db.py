@@ -841,6 +841,17 @@ class Database:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    def prune_telemetry(self, before_iso: str) -> int:
+        """Delete samples older than the cutoff; returns how many went.
+
+        Only telemetry. audit_log is deliberately never pruned - it is the
+        forensic record, and reconstructing one night of terminations
+        depended on rows nobody knew they would need.
+        """
+        cur = self._execute(
+            "DELETE FROM telemetry_samples WHERE at < ?", (before_iso,))
+        return cur.rowcount
+
     def find_launch_by_instance(self, lambda_instance_id: str) -> dict | None:
         row = self._execute(
             """SELECT * FROM launches WHERE lambda_instance_id = ?
