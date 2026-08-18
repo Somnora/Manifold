@@ -216,6 +216,15 @@ export type Instance = {
     util_pct_mean: number | null;
     gpu_count: number | null;
   } | null;
+  // The launch's bootstrap script, if it was given one AND has started.
+  // Absent means either no script or not started yet - the field appears
+  // the moment there is something real to say, and never guesses a state.
+  // A nonzero exit never terminates the box; it is reported and left alone.
+  bootstrap?: {
+    state: "running" | "exited" | "vanished" | "unreachable";
+    // Present only for "exited". Absent is not zero.
+    exit_code?: number;
+  };
 };
 
 export type Launch = {
@@ -293,6 +302,11 @@ export type LaunchRequest = {
   instance_type: string;
   region: string;
   filesystem: string;
+  // More filesystems to mount beside the primary one, for a run that reads
+  // one dataset and writes another. Attach-only: jobs still mount the
+  // primary, extras are reached at /lambda/nfs/<name>. Same region as the
+  // launch, max 4; the backend enforces both.
+  extra_filesystems?: string[];
   connection_mode: string;
   ssh_key_name?: string;
   name?: string;
@@ -307,6 +321,8 @@ export type LaunchRequest = {
   // instances. An unattributed box is how someone else's loading model got
   // terminated as a stray.
   purpose?: string;
+  // A setup script the instance runs once when it comes up. Omit for none.
+  bootstrap?: string;
 };
 
 export type TemplateParameter = {
@@ -640,7 +656,8 @@ export type NotificationKind =
   | "instance_idle"
   | "instance_ceiling"
   | "budget_threshold"
-  | "terminal_reaped";
+  | "terminal_reaped"
+  | "bootstrap_failed";
 
 export type Preferences = {
   approvals: Record<GateableAction, boolean>;
@@ -660,6 +677,11 @@ export type Preferences = {
     // A cumulative monthly wallet. Reported, never enforced. 0 = unset.
     monthly_budget_usd: number;
   };
+  // Which cloud a launch that names no provider lands on. Agents and the
+  // MCP bridge follow it, so one choice here moves the whole project.
+  providers: {
+    default_provider: string;
+  };
   // Mirror every worklog entry into this folder (Obsidian vault, repo).
   worklog: {
     mirror_dir: string;
@@ -677,6 +699,7 @@ export type PreferencesPatch = {
   notifications?: Partial<Record<NotificationKind | "desktop", boolean>>;
   data_safety?: Partial<Preferences["data_safety"]>;
   guardrails?: Partial<Preferences["guardrails"]>;
+  providers?: Partial<Preferences["providers"]>;
   worklog?: Partial<Preferences["worklog"]>;
   onboarding?: Partial<Preferences["onboarding"]>;
 };
@@ -1107,6 +1130,10 @@ export const api = {
       preferences: Preferences;
       gateable_actions: GateableAction[];
       notification_kinds: NotificationKind[];
+      // The clouds this backend registered: the legal values for
+      // providers.default_provider, so the control never offers one the
+      // launch path would refuse.
+      registered_providers: string[];
       guardrail_defaults: {
         max_concurrent_instances: number;
         max_hourly_spend_usd: number;

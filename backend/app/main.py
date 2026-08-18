@@ -43,6 +43,7 @@ from .db import Database, utcnow
 from .config import update_env_file
 from .lambda_api import (
     FilesystemInfo,
+    InstanceTypeInfo,
     LambdaAPIError,
     LambdaClient,
     MockLambdaClient,
@@ -241,6 +242,13 @@ class LaunchRequest(BaseModel):
     instance_type: str
     region: str
     filesystem: str
+    # Phase 103: more filesystems to MOUNT beside the primary one, for a run
+    # that reads one dataset and writes another. Attach-only: jobs still mount
+    # the primary, and extras are reached by absolute /lambda/nfs/<name> path
+    # from commands, the file routes and a shell. The orchestrator owns every
+    # rule about them (cap, duplicates, region lock) so background callers hit
+    # the same wall this one does.
+    extra_filesystems: list[str] = Field(default_factory=list)
     connection_mode: str | None = None
     ssh_key_name: str | None = None    # falls back to ssh.key_name in config.yaml
     name: str = Field(default="", max_length=64)
@@ -254,12 +262,23 @@ class LaunchRequest(BaseModel):
     # max_lifetime above remains the outer bound; either firing terminates
     # through the same rescue-first flow.
     max_active_seconds: float | None = None
-    provider: str = 'lambda'
+    # None = "use the account's default provider" (Phase 102), which is what
+    # a client that never heard of the toggle sends. Naming one still wins,
+    # and the dashboard always names one. The default lives in preferences
+    # and is resolved in the orchestrator, never here: a route that picked
+    # the cloud would be a second place the answer is decided.
+    provider: str | None = None
     # What this box is for, in the launcher's own words (Phase 94). Shown to
     # everyone who lists instances, so a reader who did not launch it can
     # tell work from waste. Optional: an empty purpose is reported as
     # unattributed rather than filled in with a guess.
     purpose: str = Field(default="", max_length=200)
+    # A setup script the box runs once when it comes up (Phase 104): the
+    # clone-install-pull dance nobody should have to come back and start by
+    # hand. Empty = none, and none is the default. 16 KiB matches the
+    # detached-command cap these bytes travel through anyway; over it the
+    # request is refused with the number rather than truncated.
+    bootstrap: str = Field(default="", max_length=16384)
 
 
 class ClusterLaunchRequest(BaseModel):
@@ -270,6 +289,14 @@ class ClusterLaunchRequest(BaseModel):
     connection_mode: str | None = None
     ssh_key_name: str | None = None
     name: str = ""
+    # Explicitly 'lambda', NOT the Phase 102 account default: a cluster's
+    # nodes have to reach each other, so it stays on one proven cloud until
+    # cross-provider clusters are designed. See Orchestrator.launch_cluster.
+    # (There is a second, identical ClusterLaunchRequest nested inside
+    # create_app next to the /clusters/launch route. FastAPI resolves the
+    # annotation against module globals - see the note on PrincipalRequest -
+    # so THIS one is what parses the body; the nested copy is dead weight
+    # that must be kept in step until someone deletes it.)
     provider: str = "lambda"
 
 
@@ -366,6 +393,11 @@ class PreferencesPatch(BaseModel):
     notifications: dict | None = None
     data_safety: dict | None = None
     guardrails: dict | None = None
+    # {"default_provider": "lambda"|"gcp"|...}: which cloud a launch that
+    # names no provider lands on. Validated in the route against the
+    # registered providers - preferences.py cannot see the registry, and
+    # silently keeping the old value would look like a saved setting.
+    providers: dict | None = None
     # Every section of Preferences must be listed here. A section that is
     # missing is dropped by model_dump(exclude_none=True) before the handler
     # ever sees it, so PUT returns 200 with the value unchanged - a silent
@@ -1195,6 +1227,11 @@ def create_app(
             "preferences": prefs.get().to_dict(),
             "gateable_actions": list(GATEABLE_ACTIONS),
             "notification_kinds": list(NOTIFICATION_KINDS),
+            # The legal values for preferences.providers.default_provider:
+            # the clouds THIS backend registered, so the Settings control
+            # can never offer a name the launch path would refuse.
+            "registered_providers": sorted(
+                n for n, _ in orchestrator.providers.items()),
             # What the guardrails fall back to when unset (0) here - the
             # Settings page shows these as placeholders.
             "guardrail_defaults": {
@@ -1207,12 +1244,27 @@ def create_app(
 
     @app.put("/preferences")
     async def update_preferences(patch: PreferencesPatch):
+        # The default provider is the one preference whose legal values are
+        # not knowable inside preferences.py: they are the providers THIS
+        # backend registered. Checked here, where the registry is in reach,
+        # and REFUSED rather than clamped - a silently-ignored write would
+        # read as "saved" and then send every default launch to the old
+        # cloud. The orchestrator checks again at launch time.
+        requested = (patch.providers or {}).get("default_provider")
+        if requested is not None:
+            registered = sorted(n for n, _ in orchestrator.providers.items())
+            if requested not in registered:
+                raise HTTPException(
+                    422,
+                    f"Unknown provider '{requested}'. Registered providers: "
+                    f"{', '.join(registered) or '(none)'}.")
         updated = prefs.update(patch.model_dump(exclude_none=True))
         db.record_audit(
             current_principal(), "preferences_update",
             f"approvals={sorted(updated.approvals.gated_actions())} "
             f"data_safety.to_local={updated.data_safety.to_local} "
-            f"data_safety.if_unsaveable={updated.data_safety.if_unsaveable}",
+            f"data_safety.if_unsaveable={updated.data_safety.if_unsaveable} "
+            f"providers.default={updated.providers.default_provider}",
         )
         return {"preferences": updated.to_dict()}
 
@@ -1359,14 +1411,63 @@ def create_app(
                     f"?project={getattr(cloud, 'project_id', '')}")}
 
     @app.get("/launch-options")
-    async def launch_options_route():
-        """Launchable (type, region, filesystem) targets that Lambda can
+    async def launch_options_route(provider: str | None = None):
+        """Launchable (type, region, filesystem) targets one cloud can
         satisfy right now, ranked so options co-located with the user's
         existing data come first. The launch form and any agent use this to
-        pick an available, co-located target instead of guessing a region."""
-        types = await lambda_client.list_instance_types()
-        filesystems = await lambda_client.list_filesystems()
-        options = launch_options(types, filesystems)
+        pick an available, co-located target instead of guessing a region.
+
+        Which cloud: the account's default provider (Phase 102) unless
+        ?provider= names another. Agents are taught to copy a target
+        straight into launch_gpu, so after a default flip this route MUST
+        follow - Lambda targets against a GCP default are a list of
+        guaranteed rejections. Every row names its own provider, and so
+        does the response.
+        """
+        try:
+            resolved = orchestrator.resolve_provider(provider)
+        except LaunchRejected as exc:
+            # Same shape /instance-types uses for an unknown provider.
+            raise HTTPException(422, exc.detail)
+        cloud = orchestrator.providers.get_provider(resolved)
+        if resolved == "lambda":
+            types = await lambda_client.list_instance_types()
+            filesystems = await lambda_client.list_filesystems()
+        else:
+            # Persistent filesystems are a Lambda feature, and request_launch
+            # refuses one on any other provider - so every target here is
+            # honestly scratch-only rather than pretending co-location.
+            filesystems = []
+            try:
+                specs = await cloud.list_instance_types()
+            except ProviderUnavailable as exc:
+                raise HTTPException(503, str(exc))
+            except ProviderError as exc:
+                raise HTTPException(502, str(exc))
+            # Same adaptation /instance-types makes for a non-Lambda
+            # catalog, so a GPU reads identically on both routes.
+            types = {
+                spec.name: InstanceTypeInfo(
+                    name=spec.name,
+                    description=spec.description,
+                    gpu_description=(
+                        f"{spec.gpu_type} ({spec.gpu_ram_gb} GB)"
+                        if spec.gpus and spec.gpu_type else "N/A"),
+                    price_cents_per_hour=spec.price_cents_per_hour,
+                    specs={"vcpus": spec.vcpus, "memory_gib": spec.ram_gb,
+                           "storage_gib": 0, "gpus": spec.gpus},
+                    regions_with_capacity=list(spec.regions_available),
+                )
+                for spec in specs
+            }
+        options = launch_options(types, filesystems, provider=resolved)
+        options["provider"] = resolved
+        # An empty target list from a cloud nobody has set up yet would read
+        # as "no capacity anywhere". Present ONLY when there is a reason, so
+        # its absence still means what it always meant.
+        reason = cloud.unconfigured_reason()
+        if reason:
+            options["unavailable_reason"] = reason
         # Agents act on this data: fixture state must be self-identifying
         # (an agent once had to spot a TEST-NET IP to detect mock mode).
         options["mock"] = mock
@@ -1412,6 +1513,7 @@ def create_app(
             instance_type=req.instance_type,
             region=req.region,
             filesystem=req.filesystem,
+            extra_filesystems=req.extra_filesystems,
             connection_mode=req.connection_mode,
             ssh_key_name=req.ssh_key_name,
             name=req.name,
@@ -1421,6 +1523,7 @@ def create_app(
             provider=req.provider,
             created_by=current_principal(),
             purpose=req.purpose,
+            bootstrap=req.bootstrap,
         )
         return {"launch": launch}
 
@@ -1476,6 +1579,7 @@ def create_app(
 
     @app.get("/instances")
     async def list_instances():
+        from . import bootstrap as boot
         instances = await orchestrator.instances_with_state()
         # Hoisted: ONE query for the whole fleet, not one per instance inside
         # the loop. This route is the hottest in the app (the home page polls
@@ -1516,6 +1620,17 @@ def create_app(
             # connected, and a box that has dropped off SSH while past its
             # ceiling is precisely the one whose limit the user needs to see.
             inst.update(dispatcher.ceiling_status(inst["id"], launch))
+            # The launch bootstrap (Phase 104), read off the detached row -
+            # no probe, because this route is polled every 2s per instance.
+            # The key is ABSENT for a launch that had no script and for one
+            # whose script has not started yet: "we have nothing to say" is
+            # not one of the four states and is not invented into one.
+            if launch and launch.get("bootstrap"):
+                report = boot.report(
+                    db.find_detached_by_note(boot.note_for(launch["id"])),
+                    connected=inst["connection_state"] == "connected")
+                if report is not None:
+                    inst["bootstrap"] = report
         # Agents act on this data: fixture state must be self-identifying
         # (an agent once had to spot a TEST-NET IP to detect mock mode).
         return {"instances": instances, "mock": mock}
@@ -1632,31 +1747,17 @@ def create_app(
         conn = orchestrator.connections.get(instance_id)
         if conn is None or conn.ssh_connection() is None:
             raise HTTPException(409, f"no connected instance {instance_id}")
-        if len(db.open_detached(instance_id)) >= det.MAX_OPEN_PER_INSTANCE:
-            raise HTTPException(
-                409, f"{det.MAX_OPEN_PER_INSTANCE} detached commands are "
-                     f"already open on {instance_id}; wait for some to "
-                     f"finish or check their status")
-        handle = det.new_handle()
-
-        async def script_bytes():
-            yield req.command.encode()
-
+        # The write-launch-parse-register sequence lives in detached.py, so
+        # the launch-bootstrap sweep runs the identical one (Phase 104).
         try:
-            await conn.sftp_write(det.script_sftp_path(handle), script_bytes())
-            _code, stdout, stderr = await conn.run(
-                det.launch_line(handle), timeout=20.0)
+            started = await det.start_detached(
+                conn, db, instance_id=instance_id, command=req.command,
+                note=req.note, created_by=current_principal())
         except ConnectionError as exc:
             raise HTTPException(409, str(exc))
-        try:
-            pid = int(stdout.strip().splitlines()[-1])
-        except (ValueError, IndexError):
-            raise HTTPException(
-                502, f"detached launch did not report a pid "
-                     f"(stdout {stdout[-200:]!r}, stderr {stderr[-200:]!r})")
-        db.create_detached(handle=handle, instance_id=instance_id,
-                           command=req.command, note=req.note,
-                           created_by=current_principal(), pid=pid)
+        except det.DetachedStartRejected as exc:
+            raise HTTPException(exc.status, exc.message)
+        handle, pid = started["handle"], started["pid"]
         dispatcher.touch_activity(instance_id)
         db.record_audit(
             current_principal(), "detached_started",
@@ -1705,6 +1806,16 @@ def create_app(
         elif state in ("exited", "vanished") and row["exited_at"] is None:
             db.finish_detached(handle,
                                exit_code if state == "exited" else None)
+            # This poll may be the FIRST place a bootstrap's failure is
+            # seen - the telemetry probe is the other, and which one wins
+            # depends on whether anybody happened to be looking. Both call
+            # the same helper; notify_once keyed on the handle means one
+            # ping either way (see bootstrap.announce_exit).
+            from . import bootstrap as boot
+            boot.announce_exit(
+                notifier, instance_id=instance_id, handle=handle,
+                note=row["note"],
+                exit_code=exit_code if state == "exited" else None)
         # A settled registry row is the tie-breaker for a probe that could
         # not read the exit file (e.g. cleaned up on the box).
         if state == "unknown" and row["exited_at"] is not None:

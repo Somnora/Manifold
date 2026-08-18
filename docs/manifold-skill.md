@@ -107,16 +107,54 @@ desktop app or a dev backend must be running). GET /health confirms it.
 2. `launch_gpu` with a target copied from that list, a `purpose`
    (required - say what the box is for), and optionally a `name` (the
    label humans see) and a ceiling sized to the run (`max_active_seconds`
-   - boot does not spend it).
+   - boot does not spend it). If the run needs data from a second
+   filesystem, pass it in `extra_filesystems` (same region, up to 4): it
+   gets mounted at /lambda/nfs/<name> for your commands and file access,
+   while jobs keep using the primary `filesystem`. Filesystems attach only
+   at launch, so a name left out here means relaunching.
 3. `wait_for_launch` with the returned launch id. One blocking call; do
+   - boot does not spend it).
+3. Hand the box its setup in the same call with `bootstrap`: a bash
+   script it runs ONCE when it comes up, so the clone and the pip install
+   happen while nobody is watching for the right moment. It runs
+   detached, so it survives a backend restart; its exit code is recorded;
+   and a nonzero exit does NOT terminate the box. Find it in
+   `list_detached_commands` (its note is `bootstrap:<launch id>`) and read
+   it with `detached_status`, or read the `bootstrap` field on the box in
+   `list_instances`.
+   KNOW WHAT IT HOLDS. A running bootstrap counts as activity, which is
+   what stops the idle sweep reaping a box mid-install. That protection
+   is symmetrical: a bootstrap that HANGS (a prompt waiting on stdin, an
+   apt lock it never gets) holds the box as busy for as long as it hangs,
+   and the idle timeout will never fire on it. The ceilings you set at
+   launch are what stop that, and nothing else is: `max_active_seconds`
+   and `max_lifetime_seconds`. Set one. And note that a bootstrap does
+   not gate anything else - a job you queue can start while the bootstrap
+   is still installing, so if both touch apt or the same files, sequence
+   them yourself.
+4. `wait_for_launch` with the returned launch id. One blocking call; do
    not poll in a loop. Boots take 2 to 10 minutes for PCIe cards and
    15 to 40 minutes for SXM/multi-GPU boxes. That is Lambda, not a hang.
-4. Know that a box can legitimately GO AWAY AND COME BACK mid-setup: a
+5. Know that a box can legitimately GO AWAY AND COME BACK mid-setup: a
    driver upgrade reboots the instance, SSH drops, and both return on
    their own. A sequence that does not expect this will read a normal
    reboot as a dead box - the second most expensive misread on this
    platform after "idle". Wait for SSH to return before concluding
    anything.
+
+#### Which cloud?
+
+The account has a DEFAULT PROVIDER, and you do not need to know which one
+it is: leave `provider` empty on `launch_gpu` and you follow it, so the
+human can move this project from one cloud to another without telling you.
+`list_launch_options` returns targets from that same default and names the
+cloud on every row, which is why copying one of its targets always lines
+up. Pass a `provider` only when you mean to override the default for one
+launch, and then take the instance type and region from
+`list_launch_options(provider=...)` for that same cloud: types and regions
+do not carry across providers. If a response carries
+`unavailable_reason`, that cloud is not set up yet - report the sentence
+instead of reading the empty target list as "no capacity".
 
 ### Serve a model (vLLM)
 

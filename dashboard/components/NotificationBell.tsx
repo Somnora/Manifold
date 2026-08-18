@@ -22,6 +22,9 @@ const TONE: Record<NotificationKind, string> = {
   // A shell was ended with whatever was inside it. Amber, not red: it is
   // the grace period doing its job, but it is never good news.
   terminal_reaped: "text-amber-400",
+  // The setup script failed. Red, but the box is still there: nothing was
+  // destroyed over it.
+  bootstrap_failed: "text-red-400",
 };
 
 const LABEL: Record<NotificationKind, string> = {
@@ -35,6 +38,7 @@ const LABEL: Record<NotificationKind, string> = {
   instance_ceiling: "max lifetime",
   budget_threshold: "budget",
   terminal_reaped: "terminal",
+  bootstrap_failed: "bootstrap",
 };
 
 export function NotificationBell() {

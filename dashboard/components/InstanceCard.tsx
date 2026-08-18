@@ -432,6 +432,31 @@ export function InstanceCard({
         </div>
       )}
 
+      {/* The launch's bootstrap script, and ONLY when the field is there:
+          absent means either no script or one that has not started, and a
+          line reading "no bootstrap" for both would be a guess. Four states,
+          rendered as literally as the backend reports them. */}
+      {instance.bootstrap ? (
+        <p
+          className={`mt-2 text-xs ${
+            instance.bootstrap.state === "exited" &&
+            instance.bootstrap.exit_code !== 0
+              ? "font-medium text-red-700"
+              : "text-zinc-500"
+          }`}
+        >
+          {instance.bootstrap.state === "running"
+            ? "Bootstrap script is still running. The instance counts as busy while it works, so the idle timeout will not reap it."
+            : instance.bootstrap.state === "exited"
+              ? instance.bootstrap.exit_code === 0
+                ? "Bootstrap script finished successfully."
+                : `Bootstrap script failed (exit ${instance.bootstrap.exit_code}). The instance was left running and nothing was destroyed; the log is at ~/.manifold/detached/ on the box.`
+              : instance.bootstrap.state === "vanished"
+                ? "Bootstrap script ended without recording a result, so how it ended is not knowable. A reboot or something stopping it would both look like this."
+                : "Bootstrap script state unknown: this instance cannot be reached right now, which says nothing about whether the script is still running."}
+        </p>
+      ) : null}
+
       {/* The ceiling sits OUTSIDE the connected/idle block on purpose: a box
           that has dropped off SSH past its ceiling is the one whose limit the
           user most needs to see, and `idle` is null for exactly that box. */}

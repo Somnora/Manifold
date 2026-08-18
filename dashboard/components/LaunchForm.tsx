@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   api,
   ApiError,
@@ -21,12 +21,20 @@ import { HardwareGuide } from "@/components/HardwareGuide";
 //      with capacity. Everything on a scratch-only instance dies with it,
 //      so the form says so in amber before the click, and the data-safety
 //      rescue is the only net (download-to-this-machine, Settings).
+//      A launch may ALSO attach extra filesystems from the same region.
+//      That stays deliberately subordinate: one filesystem is the common
+//      case, and the extras row only appears once a primary is chosen.
 // The form only collects input; every rule (region match, budget,
 // concurrency) is still enforced by the backend and its rejection shown
 // verbatim.
 
 // Sentinel for "launch without a filesystem" ("" = nothing chosen yet).
 const SCRATCH_ONLY = "__scratch_only__";
+
+// How many filesystems may ride along beside the primary. The backend owns
+// the real cap and refuses past it; this only keeps the form from offering
+// a fifth pick that would be rejected on submit.
+const MAX_EXTRA_FILESYSTEMS = 4;
 
 export function LaunchForm({ onLaunched }: { onLaunched: () => void }) {
   const [types, setTypes] = useState<Record<string, InstanceTypeInfo>>({});
@@ -36,15 +44,22 @@ export function LaunchForm({ onLaunched }: { onLaunched: () => void }) {
   const [instanceType, setInstanceType] = useState("");
   const [region, setRegion] = useState("");
   const [filesystem, setFilesystem] = useState("");
+  const [extraFilesystems, setExtraFilesystems] = useState<string[]>([]);
   const [sshKey, setSshKey] = useState("");
   const [mode, setMode] = useState("direct-ssh");
   const [idleTimeout, setIdleTimeout] = useState("");
   const [maxLifetime, setMaxLifetime] = useState("");
   const [maxActive, setMaxActive] = useState("");
   const [purpose, setPurpose] = useState("");
+  const [bootstrap, setBootstrap] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState("");
   const [provider, setProvider] = useState("lambda");
+  // Whether a human has picked a provider on this form. A click always
+  // wins: the account default below only SEEDS the tab, and it arrives
+  // asynchronously, so without this a preference landing a moment after
+  // the click would silently move the launch to another cloud.
+  const providerPicked = useRef(false);
   const [gcpQuota, setGcpQuota] = useState<{
     quotas: { metric: string; limit: number; usage: number; scope: string }[];
     request_url: string;
@@ -76,6 +91,29 @@ export function LaunchForm({ onLaunched }: { onLaunched: () => void }) {
       })
       .catch((e) => setLoadError(e.message));
   }, [provider]);
+
+  // The tab opens on the account's default provider (Settings -> Default
+  // provider), so the form agrees with what an agent launching right now
+  // would get. The form always SENDS the provider explicitly, so what is
+  // on screen is what launches, whatever the default does later.
+  useEffect(() => {
+    let cancelled = false;
+    api
+      .preferences()
+      .then((r) => {
+        const preferred = r.preferences.providers.default_provider;
+        if (cancelled || providerPicked.current || !preferred) return;
+        setProvider(preferred);
+      })
+      .catch(() => {
+        // A preferences read that fails leaves the tab where it is. The
+        // launch still carries whatever the tab shows, so nothing is
+        // silently redirected.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   // The GCP quota read is separate from the catalog load: it can be slow or
   // 503 (no ADC yet) without taking the form down, and it only matters
@@ -154,6 +192,26 @@ export function LaunchForm({ onLaunched }: { onLaunched: () => void }) {
     setFilesystem(filesystemsInRegion[0]?.name ?? SCRATCH_ONLY);
   }, [region, filesystemsInRegion]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // Extras are region-locked too, and an extra can never be the primary.
+  // Whenever either changes, drop the ones that no longer make sense rather
+  // than sending a name the backend will refuse.
+  useEffect(() => {
+    setExtraFilesystems((current) =>
+      current.filter(
+        (n) =>
+          n !== filesystem && filesystemsInRegion.some((f) => f.name === n),
+      ),
+    );
+  }, [filesystem, filesystemsInRegion]);
+
+  const attachableFilesystems = useMemo(
+    () =>
+      filesystemsInRegion.filter(
+        (f) => f.name !== filesystem && !extraFilesystems.includes(f.name),
+      ),
+    [filesystemsInRegion, filesystem, extraFilesystems],
+  );
+
   const outOfCapacity =
     !!selectedType && selectedType.regions_with_capacity.length === 0;
   const scratchOnly = filesystem === SCRATCH_ONLY;
@@ -170,12 +228,20 @@ export function LaunchForm({ onLaunched }: { onLaunched: () => void }) {
         instance_type: instanceType,
         region,
         filesystem: scratchOnly ? "" : filesystem,
+        // Extras only travel with a primary; the backend refuses them
+        // without one, so the form never sends that combination.
+        extra_filesystems:
+          scratchOnly || extraFilesystems.length === 0
+            ? undefined
+            : extraFilesystems,
         connection_mode: mode,
         ssh_key_name: sshKey || undefined,
         idle_timeout_seconds: idleTimeout ? parseFloat(idleTimeout) : undefined,
         max_lifetime_seconds: maxLifetime ? parseFloat(maxLifetime) : undefined,
         max_active_seconds: maxActive ? parseFloat(maxActive) : undefined,
         purpose: purpose.trim() || undefined,
+        // Sent verbatim (it is code), but a blank one is not sent at all.
+        bootstrap: bootstrap.trim() ? bootstrap : undefined,
       });
       onLaunched();
     } catch (err) {
@@ -207,14 +273,20 @@ export function LaunchForm({ onLaunched }: { onLaunched: () => void }) {
           <button
             type="button"
             className={`px-3 py-1 text-xs font-medium rounded-sm ${provider === "lambda" ? "bg-white shadow-sm text-zinc-900" : "text-zinc-500 hover:text-zinc-700"}`}
-            onClick={() => setProvider("lambda")}
+            onClick={() => {
+              providerPicked.current = true;
+              setProvider("lambda");
+            }}
           >
             Lambda AI
           </button>
           <button
             type="button"
             className={`px-3 py-1 text-xs font-medium rounded-sm ${provider === "gcp" ? "bg-white shadow-sm text-zinc-900" : "text-zinc-500 hover:text-zinc-700"}`}
-            onClick={() => setProvider("gcp")}
+            onClick={() => {
+              providerPicked.current = true;
+              setProvider("gcp");
+            }}
           >
             Google Cloud
           </button>
@@ -425,6 +497,98 @@ export function LaunchForm({ onLaunched }: { onLaunched: () => void }) {
           </span>
         </label>
       </div>
+
+      {/* Extra filesystems: deliberately quiet and below the main grid. One
+          filesystem is the normal launch; this row exists for the run that
+          reads one dataset and writes another. */}
+      {filesystem &&
+      !scratchOnly &&
+      (extraFilesystems.length > 0 || attachableFilesystems.length > 0) ? (
+        <div className="mt-3 border-t border-zinc-100 pt-3">
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="text-xs font-medium text-zinc-600">
+              Also mounted
+            </span>
+            {extraFilesystems.map((name) => (
+              <span
+                key={name}
+                className="flex items-center gap-1 rounded-full border border-zinc-200 bg-zinc-100 px-2 py-0.5 text-[11px] text-zinc-700"
+              >
+                {name}
+                <button
+                  type="button"
+                  className="text-zinc-400 hover:text-zinc-700"
+                  aria-label={`Do not attach ${name}`}
+                  onClick={() =>
+                    setExtraFilesystems((current) =>
+                      current.filter((n) => n !== name),
+                    )
+                  }
+                >
+                  ×
+                </button>
+              </span>
+            ))}
+            {extraFilesystems.length === 0 && (
+              <span className="text-[11px] text-zinc-400">
+                just {filesystem}
+              </span>
+            )}
+            {attachableFilesystems.length > 0 &&
+            extraFilesystems.length < MAX_EXTRA_FILESYSTEMS ? (
+              <select
+                className="rounded border border-zinc-300 bg-white px-2 py-1 text-[11px] text-zinc-600"
+                value=""
+                onChange={(e) => {
+                  const picked = e.target.value;
+                  if (!picked) return;
+                  setExtraFilesystems((current) => [...current, picked]);
+                }}
+              >
+                <option value="">+ attach another filesystem</option>
+                {attachableFilesystems.map((f) => (
+                  <option key={f.name} value={f.name}>
+                    {f.name}
+                  </option>
+                ))}
+              </select>
+            ) : null}
+          </div>
+          <p className="mt-1 text-[11px] text-zinc-400">
+            {extraFilesystems.length >= MAX_EXTRA_FILESYSTEMS
+              ? `${MAX_EXTRA_FILESYSTEMS} extra filesystems is the limit. `
+              : ""}
+            Extras mount at /lambda/nfs/&lt;name&gt; and are yours to read and
+            write from the terminal, a command, or the Files browser. Jobs
+            still use {filesystem}, the filesystem chosen above. Filesystems
+            attach only at launch, so pick them now.
+          </p>
+        </div>
+      ) : null}
+      {/* Collapsed by default: an empty bootstrap is the normal case, and a
+          textarea sitting open above the Launch button would read as
+          something you are meant to fill in. */}
+      <details className="mt-3" open={!!bootstrap}>
+        <summary className="cursor-pointer text-xs font-medium text-zinc-600">
+          Bootstrap script (optional)
+        </summary>
+        <textarea
+          className={`${field} mt-2 font-mono`}
+          rows={6}
+          maxLength={16384}
+          placeholder={"git clone https://github.com/me/project ~/project\ncd ~/project && pip install -r requirements.txt"}
+          value={bootstrap}
+          onChange={(e) => setBootstrap(e.target.value)}
+        />
+        <p className="mt-1 text-[11px] text-zinc-500">
+          Bash, run once on the instance when it comes up. It keeps running
+          if you close this page or restart Manifold, and the instance
+          counts as busy while it works, so the idle timeout will not reap
+          it mid-install. If the script fails, the instance is left running
+          and you get a notification - nothing is destroyed over a bad setup
+          line. Up to 16 KiB.
+        </p>
+      </details>
 
       {maxLifetime ? (
         <p className="mt-2 text-xs text-zinc-500">

@@ -257,12 +257,20 @@ async def get_work_log(limit: int = 20, note: str = "") -> dict:
 
 
 @mcp.tool()
-async def list_launch_options(note: str = "") -> dict:
-    """Launchable {instance_type, region, filesystem} targets Lambda can
+async def list_launch_options(provider: str = "", note: str = "") -> dict:
+    """Launchable {instance_type, region, filesystem} targets your cloud can
     satisfy RIGHT NOW, ranked best-first. CALL THIS BEFORE launch_gpu: it is
     the only way to see which instance types have capacity in which regions,
     and it keeps you from guessing a region that has no capacity or no
     filesystem.
+
+    The account has a DEFAULT PROVIDER and these targets come from it; the
+    response and every target say which one (`provider`). Leave `provider`
+    empty unless you are also passing that same name to launch_gpu - a
+    target is only launchable on the cloud it came from. If the response
+    carries `unavailable_reason`, that cloud is not set up yet and the
+    field says what would fix it: report it rather than reading the empty
+    target list as "no capacity".
 
     A launch needs the three to line up — the type must have capacity in the
     region, and a persistent filesystem is region-locked, so it can only be
@@ -276,8 +284,10 @@ async def list_launch_options(note: str = "") -> dict:
     each band. A target's `filesystem` is null for a scratch-only launch; pass
     "" as launch_gpu's filesystem for those. `unavailable` lists types with no
     capacity anywhere right now (retry later or pick another from `targets`)."""
+    params = {"provider": provider} if provider else {}
     return await _call(
         "list_launch_options", "GET", "/launch-options", note=note,
+        args=params, params=params,
     )
 
 
@@ -292,6 +302,9 @@ async def launch_gpu(
     idle_timeout_seconds: float | None = None,
     max_lifetime_seconds: float | None = None,
     max_active_seconds: float | None = None,
+    provider: str = "",
+    extra_filesystems: list[str] | None = None,
+    bootstrap: str = "",
     note: str = "",
 ) -> dict:
     """Launch a GPU instance. Flows through ALL backend guards (budget,
@@ -303,6 +316,13 @@ async def launch_gpu(
     only {type, region, filesystem} combinations that have capacity right now
     and are co-located with your data, which avoids a blind region guess that
     fails on capacity or a region-filesystem mismatch.
+
+    `provider` is normally left empty: the ACCOUNT HAS A DEFAULT PROVIDER
+    and an empty value follows it, so the human can move this project to
+    another cloud without you changing anything. Name one (e.g. "gcp")
+    only to override that default for this single launch, and then take
+    the instance type and region from list_launch_options for that same
+    cloud - types and regions do not carry across providers.
 
     `max_lifetime_seconds` is an optional hard ceiling on the instance's TOTAL
     lifetime, timed from the moment the provider accepts the launch, so it
@@ -319,6 +339,26 @@ async def launch_gpu(
     Use it alongside (or instead of) max_lifetime_seconds; the absolute
     ceiling remains the outer bound and either firing terminates through
     the same save-files-first flow.
+
+    `extra_filesystems` mounts MORE filesystems next to `filesystem`, for a
+    run that reads one dataset and writes another. It is attach-only: template
+    jobs mount the PRIMARY filesystem, and extras are for your own commands
+    and file access - reach them by absolute path, /lambda/nfs/<name>, from
+    run_command, run_detached, browse_files and upload_file. Every name must
+    exist and live in the launch region (they are region-locked), and the cap
+    is 4 beyond the primary. Filesystems attach only at launch, so a name you
+    leave out here cannot be added later without relaunching.
+    `bootstrap` is an optional shell script (bash) the box runs ONCE when it
+    comes up - the clone, the pip install, the model pull you would
+    otherwise have to come back and start by hand. It runs detached, so it
+    survives a backend restart; its exit code is recorded and while it runs
+    the box counts as busy, so the idle sweep leaves it alone. A NONZERO
+    EXIT DOES NOT TERMINATE THE BOX: nothing is destroyed because your
+    setup script failed. Check it with detached_status using the handle
+    from list_detached_commands (its note is "bootstrap:<launch id>"), or
+    read the `bootstrap` field on the instance in list_instances. If the
+    work is long and you want to watch it, run_detached after the box is up
+    is the same machinery with a handle in your hand from second zero.
 
     `purpose` is REQUIRED: a short phrase saying what this box is for, e.g.
     "Tally extraction+evaluation run" or "Red Hope mesh cleanup batch". You
@@ -337,11 +377,13 @@ async def launch_gpu(
         return {"error": "purpose is required: say what this box is for "
                          "(other agents decide whether to leave it alone "
                          "based on it)"}
-    body = {
+    body: dict = {
         "instance_type": instance_type,
         "region": region,
         "filesystem": filesystem,
     }
+    if extra_filesystems:
+        body["extra_filesystems"] = extra_filesystems
     if purpose:
         body["purpose"] = purpose
     if name:
@@ -358,9 +400,23 @@ async def launch_gpu(
         body["max_lifetime_seconds"] = max_lifetime_seconds
     if max_active_seconds is not None:
         body["max_active_seconds"] = max_active_seconds
+    if provider:
+        # Omitted, not sent as "": the backend reads an absent provider as
+        # "use the account default", which is the whole point of leaving
+        # this empty. Naming one here overrides that for this launch only.
+        body["provider"] = provider
+    if bootstrap:
+        body["bootstrap"] = bootstrap
+    # The audit copy is the body MINUS the script. `args` is written to the
+    # audit log verbatim, and a bootstrap is exactly where an agent puts an
+    # `export HF_TOKEN=...` line; its length is enough for a reader to know
+    # one was sent (the backend records size and hash when it starts).
+    args = {k: v for k, v in body.items() if k != "bootstrap"}
+    if bootstrap:
+        args["bootstrap_bytes"] = len(bootstrap.encode())
     return await _call(
         "launch_gpu", "POST", "/instances",
-        note=note, args=body, body=body,
+        note=note, args=args, body=body,
     )
 
 
