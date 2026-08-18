@@ -111,6 +111,11 @@ def client(settings, mock_client, mock_storage, mock_sidecar, mock_model,
         # developer's real data dir.
         research_keys_path=__import__("pathlib").Path(
             settings.db_path).parent / "research-keys.env",
+        # Settings routes write secrets to env_path; without this they
+        # default to the REPO's real .env (DATA_ROOT is the repo in dev).
+        # Found the hard way when gcp-config tests appended junk to it.
+        env_path=__import__("pathlib").Path(
+            settings.db_path).parent / ".env",
     )
     with TestClient(app) as test_client:
         yield test_client

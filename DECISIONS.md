@@ -6381,3 +6381,22 @@ window (up to one telemetry interval) before the sweep starts it. A fifth
 "pending" state was considered and dropped: the four states are read
 verbatim off the detached machinery, and "we have nothing yet" is exactly
 what absence means everywhere else in this codebase.
+
+## 2026-08-18 — Phase 105: the GCP form works for the auth path the docs teach
+
+Found live, the first time a real project was configured: GCPConfigRequest
+required `credentials_file` (min 8 chars), but the PRIMARY documented path
+is ADC with no file at all - so Settings 422'd on exactly the setup it
+exists for, and had the empty string saved instead, an empty
+GOOGLE_APPLICATION_CREDENTIALS would have OVERRIDDEN working ADC (the SDK
+treats the variable's presence as an instruction). Now: only project_id is
+required; zone/credentials are written to .env only when non-empty; a
+named credentials file must exist AT SAVE TIME (a typo'd path otherwise
+surfaces as an inscrutable SDK error at next boot, long after anyone
+remembers typing it) and the refusal teaches the ADC alternative.
+
+Also closed the landmine that this fix's own tests stepped on: the test
+suite's shared `client` fixture now isolates env_path (like db and
+research-keys before it) - without that, settings-route tests write into
+the developer's REAL repo .env, which is exactly what happened while
+testing this fix (three junk lines, removed).
