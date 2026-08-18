@@ -6161,3 +6161,36 @@ content instead; rejected - any fixed sibling recreates the same hole one
 level up the moment a box has 2+ GPUs, and the sparklines are the part
 that genuinely benefits from width. Same bug class as the Settings page
 (fixed grid + auto-placement), same philosophy as its fix.
+
+## 2026-08-18 — GCP persistence: designed, professor-cleared, deliberately not built
+
+The owner asked whether GCP launches can have persistent storage. Answer
+today: no (scratch-only, enforced at BOTH orchestrator.py ~513-518 and
+gcp_provider.py ~358-361). The path forward was designed and passed
+adversarial review, and implementation is DEFERRED until GCP ADC is
+re-authed and GCP is in real use - building provider code nobody can
+exercise is how drift ships.
+
+The cleared shape, so the future implementer does not re-derive it:
+Persistent Disk data volumes as a SEPARATE `volumes` concept (never a
+"filesystem kind": list_filesystems carries bytes_used and backs the
+S3-adapter Storage page, neither of which PD can honor, and a PD attaches
+to ONE instance at a time - a docstring that says so fails a two-instance
+plan at plan time instead of after the first box is billing). Mounted at
+/lambda/nfs/<name> so the mount jail, {persistent} substitution, sidecar
+browsing, and ephemeral-only rescue work unchanged. Format happens
+POST-BOOT over the managed SSH connection, never cloud-init (cloud-init
+cannot refuse-and-report; a failed mount leaves jobs writing to an
+auto-delete boot disk believing it persistent). SQLite carries
+formatted_at: NULL on a Manifold-created volume permits exactly one
+format; formatted_at set with a blank blkid is a loud refusal, because
+blkid-empty is the AMBIGUOUS case (never-formatted vs interrupted mkfs),
+not the safe one. One-attachment enforced in the orchestrator naming the
+holder; volumes are ZONAL and pin future launches to their zone (GPU
+capacity is spotty per zone - the docs must say your data can be stuck in
+a GPU-less zone; snapshot-restore is the named non-goal escape hatch).
+
+Before building, re-verify the three seams above plus the /filesystems
+payload shape - if any moved, re-derive; do not patch the design to fit.
+The full amended design doc from the review session is not committed
+(scratchpads die); this entry is the durable record.
