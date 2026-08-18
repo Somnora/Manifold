@@ -469,9 +469,15 @@ class LambdaKeyRequest(BaseModel):
     api_key: str
 
 class GCPConfigRequest(BaseModel):
-    project_id: str
-    default_zone: str
-    credentials_file: str = Field(min_length=8)
+    # Only the project id is required. ADC (`gcloud auth application-default
+    # login`) is the PRIMARY auth path and involves no credentials file, so
+    # zone and file are optional - the original required-with-min-length
+    # fields made the Settings form unusable for exactly the setup the docs
+    # recommend, caught the first time a real GCP project was configured
+    # (2026-08-18).
+    project_id: str = Field(min_length=4)
+    default_zone: str = ""
+    credentials_file: str = ""
 
 
 class S3KeysRequest(BaseModel):
@@ -1155,19 +1161,32 @@ def create_app(
 
     @app.post("/settings/gcp-config")
     async def set_gcp_config(req: GCPConfigRequest):
-        update_env_file(
-            env_file,
-            {
-                "GCP_PROJECT_ID": req.project_id,
-                "GCP_DEFAULT_ZONE": req.default_zone,
-                "GOOGLE_APPLICATION_CREDENTIALS": req.credentials_file,
-            },
-        )
-        # Assuming providers.register handles hot-swapping if we implemented it,
-        # but for now we just save to .env
+        creds = req.credentials_file.strip()
+        if creds:
+            # A credentials file is the exception (headless installs). If
+            # one is named, it must exist NOW: a typo'd path would
+            # otherwise surface as an inscrutable SDK error at next boot,
+            # long after anyone remembers typing it.
+            from pathlib import Path as _Path
+            if not _Path(creds).expanduser().is_file():
+                raise HTTPException(
+                    422, f"credentials file not found: {creds}. Leave it "
+                         f"empty to use ADC (gcloud auth "
+                         f"application-default login), the normal path.")
+        # Only the keys actually provided are written. Writing an empty
+        # GOOGLE_APPLICATION_CREDENTIALS would OVERRIDE working ADC with a
+        # broken pointer - the SDK treats the variable's presence as an
+        # instruction.
+        updates = {"GCP_PROJECT_ID": req.project_id.strip()}
+        if req.default_zone.strip():
+            updates["GCP_DEFAULT_ZONE"] = req.default_zone.strip()
+        if creds:
+            updates["GOOGLE_APPLICATION_CREDENTIALS"] = creds
+        update_env_file(env_file, updates)
         db.record_audit(
             current_principal(), "settings_gcp_config",
-            "GCP configuration saved to .env",
+            f"GCP configuration saved to .env (project "
+            f"{req.project_id.strip()}); takes effect on next backend start",
         )
         return {"valid": True, "applied_live": False}
 
