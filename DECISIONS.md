@@ -6477,3 +6477,31 @@ Off-repo, same session: the Gemini CLI is retired in favor of the AGY
 (antigravity) CLI; manifold is now registered in BOTH of its twin
 mcp_config.json files (they are byte-identical copies and the binary's
 reader is unknown - editing one risks the other being the live one).
+
+## 2026-08-18 — Provider expansion: surveyed, one candidate, deliberately not built
+
+The owner asked whether Manifold should cover VM providers beyond Lambda
+and GCP. A five-family survey (verified against primary docs, grades and
+unverifieds recorded in docs/provider-survey-2026-08.md) says: the single
+integration worth building is SHADEFORM, an aggregator whose one REST API
+fronts ~20-30 clouds of real SSH-able VMs with startup scripts - it
+satisfies the whole provider contract, claims zero markup in its own
+docs, and SkyPilot already ships it as a target, which proves the
+one-integration-many-clouds pattern under the same requirements. Direct
+integrations that also graded well (Crusoe A, DigitalOcean A-,
+TensorDock A-) become largely redundant behind it. RunPod, despite the
+biggest indie mindshare, is a container platform whose pods cannot run
+Docker - our template/sidecar spine breaks there - and the serverless
+tier (Modal, Together, Replicate, Baseten) stays ruled out for the same
+reason TPUs were.
+
+NOT built now, on the drift rule: provider code nobody exercises is
+where bugs live (the GCP config form proved it), and the owner currently
+holds credits only for Lambda and GCP. The gate for building Shadeform:
+the owner opens an account and puts ~$10 through it, and the phase lands
+with a live cheap-SKU validation launch like GCP's. The survey also
+surfaced the real strategic frame: SkyPilot's March 2026 Agent Skill
+makes agent-launches-GPU table stakes; Manifold's moat is the guardrail
+layer (unbypassable-by-construction guards, approval gates, audit,
+save-before-destroy), so breadth should come cheap (the aggregator),
+never as the product's main bet.
