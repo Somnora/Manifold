@@ -345,6 +345,8 @@ export type Template = {
   // User-authored template (editable/deletable); yaml is its raw source.
   custom?: boolean;
   yaml?: string;
+  // Pinned by the user; the backend already sorts favorites first.
+  favorite?: boolean;
 };
 
 export type Lifecycle =
@@ -692,6 +694,7 @@ export type Preferences = {
     completed: boolean;
     dismissed_at: string;
   };
+  templates: { favorites: string[] };
 };
 
 export type PreferencesPatch = {
@@ -700,6 +703,7 @@ export type PreferencesPatch = {
   data_safety?: Partial<Preferences["data_safety"]>;
   guardrails?: Partial<Preferences["guardrails"]>;
   providers?: Partial<Preferences["providers"]>;
+  templates?: { favorites?: string[] };
   worklog?: Partial<Preferences["worklog"]>;
   onboarding?: Partial<Preferences["onboarding"]>;
 };

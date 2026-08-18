@@ -736,7 +736,10 @@ async def get_spend(note: str = "") -> dict:
 @mcp.tool()
 async def list_templates(note: str = "") -> dict:
     """Job templates with parameter schemas (name, type, default, required).
-    Templates run as Docker containers on the instance with the GPU attached."""
+    Templates run as Docker containers on the instance with the GPU attached.
+    The user's favorite templates come FIRST, each flagged favorite: true -
+    when several templates could do the job, prefer a favorite: it is the
+    one the user actually reaches for."""
     return await _call("list_templates", "GET", "/templates", note=note)
 
 

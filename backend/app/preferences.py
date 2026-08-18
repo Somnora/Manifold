@@ -206,6 +206,19 @@ class ProviderPrefs:
 
 
 @dataclass(frozen=True)
+class TemplatePrefs:
+    """Favorite job templates, pinned to the top of every template list.
+
+    The quick-jobs picker passed twenty entries and finding YOUR job in it
+    became a scan (owner report, with screenshot). Favorites are names, not
+    validated against the registry on purpose: a favorite may reference a
+    custom template that is deleted and later restored, and deleting a
+    template must not silently edit the user's preferences. A favorite
+    with no matching template simply does not render anywhere."""
+    favorites: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class WorklogPrefs:
     """Where the worklog is mirrored, beyond the always-on copy in the data
     dir. Point mirror_dir at an Obsidian vault or a repo and every agent
@@ -232,6 +245,7 @@ class Preferences:
     data_safety: DataSafetyPrefs = DataSafetyPrefs()
     guardrails: GuardrailPrefs = GuardrailPrefs()
     providers: ProviderPrefs = ProviderPrefs()
+    templates: TemplatePrefs = TemplatePrefs()
     worklog: WorklogPrefs = WorklogPrefs()
     onboarding: OnboardingPrefs = OnboardingPrefs()
 
@@ -258,6 +272,12 @@ def _coerce(section, raw: dict):
                 updates[key] = float(value)
             elif isinstance(current, str):
                 updates[key] = str(value)
+            elif isinstance(current, tuple):
+                # A tuple field takes a list/tuple of strings; junk entries
+                # are dropped item-by-item, same contract as the scalars.
+                if isinstance(value, (list, tuple)):
+                    updates[key] = tuple(
+                        str(v) for v in value if isinstance(v, str))
         except (TypeError, ValueError):
             continue
     section = replace(section, **updates)
@@ -276,6 +296,14 @@ def _validate(section):
             fixes["max_local_gib"] = 0.0
         if fixes:
             section = replace(section, **fixes)
+    if isinstance(section, TemplatePrefs):
+        seen: list[str] = []
+        for name in section.favorites:
+            trimmed = name.strip()
+            if trimmed and trimmed not in seen:
+                seen.append(trimmed)
+        if tuple(seen) != section.favorites or len(seen) > 50:
+            section = replace(section, favorites=tuple(seen[:50]))
     if isinstance(section, GuardrailPrefs):
         fixes = {}
         if section.max_concurrent_instances < 0:
@@ -298,6 +326,7 @@ def preferences_from_dict(base: Preferences, raw: dict) -> Preferences:
         data_safety=_coerce(base.data_safety, raw.get("data_safety", {})),
         guardrails=_coerce(base.guardrails, raw.get("guardrails", {})),
         providers=_coerce(base.providers, raw.get("providers", {})),
+        templates=_coerce(base.templates, raw.get("templates", {})),
         worklog=_coerce(base.worklog, raw.get("worklog", {})),
         onboarding=_coerce(base.onboarding, raw.get("onboarding", {})),
     )
