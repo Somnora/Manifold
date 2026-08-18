@@ -25,9 +25,13 @@ import os
 import sys
 import threading
 
-import uvicorn
-
-from app.main import create_default_app
+# DELIBERATELY NOT IMPORTED HERE: uvicorn and app.main. The --mcp bridge
+# and --doctor pay for every module-scope import in this file, and the
+# server graph (fastapi, asyncssh, boto3: ~2.5s and ~76 dylib loads) is
+# exactly the workload macOS re-assesses on every fresh onefile
+# extraction - the leading suspect in a 57s initialize stall that made
+# Claude Desktop declare the server dead (2026-08-18). The server path
+# imports them inside main().
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("MANIFOLD_PORT", "8000"))
@@ -66,6 +70,32 @@ def _watch_parent() -> None:
     threading.Thread(target=watch, daemon=True).start()
 
 
+def _watch_bridge_parent(parent_alive=None, exit_fn=None,
+                         poll_seconds: float = 2.0) -> None:
+    """Exit the bridge when whatever spawned it is gone.
+
+    The stdin-EOF watchdog above cannot be used here (stdin IS the
+    protocol channel), and this covers the case EOF misses: an MCP client
+    that SIGKILLs the onefile bootloader cannot reach this child process
+    (the bootloader forwards SIGTERM, but SIGKILL is unforwardable), which
+    then survives holding its pipes - observed as manifold-backend --mcp
+    processes nobody owned. Reparenting to pid 1 is the reliable signal
+    that the chain above us died; polling it touches nothing the protocol
+    uses. The injectable hooks exist for tests only.
+    """
+    import time
+
+    parent_alive = parent_alive or (lambda: os.getppid() != 1)
+    exit_fn = exit_fn or (lambda: os._exit(0))
+
+    def watch() -> None:
+        while parent_alive():
+            time.sleep(poll_seconds)
+        exit_fn()
+
+    threading.Thread(target=watch, daemon=True).start()
+
+
 def run_mcp() -> None:
     """Run the MCP stdio bridge in place of the server.
 
@@ -75,6 +105,7 @@ def run_mcp() -> None:
     the client's JSON-RPC parse). The bridge talks to whatever backend is
     listening on MANIFOLD_PORT - normally the running desktop app.
     """
+    _watch_bridge_parent()
     os.environ.setdefault("MANIFOLD_API_URL", f"http://{HOST}:{PORT}")
     # The bridge authenticates like every other client (Phase 78). MCP
     # clients spawn this binary with a clean env, so when the token is not
@@ -103,6 +134,9 @@ def main() -> None:
         return
     if os.environ.get("MANIFOLD_PARENT_WATCHDOG") == "1":
         _watch_parent()
+    import uvicorn
+
+    from app.main import create_default_app
     app = create_default_app()
     print(f"manifold: serving on http://{HOST}:{PORT}", flush=True)
     try:
