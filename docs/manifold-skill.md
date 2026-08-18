@@ -22,6 +22,26 @@ session: an agent drove the raw Lambda API, its instance looked orphaned,
 its own retry harness silently terminated two boots mid-setup, and hours
 were lost. Every one of those failures is impossible through Manifold.
 
+## You are probably not the only agent on this account
+
+Several agents and projects may share this Manifold. The rules that keep
+that safe, each learned from a real incident:
+
+- **Pass `purpose` on every launch.** It is required, and it is what every
+  other agent sees in `list_instances`. A box with no purpose reads as
+  unexplained, and an unexplained box once got terminated by an agent
+  trying to be helpful - it was another project's model, mid-load.
+- **Never terminate an instance you did not launch.** `list_instances`
+  shows `created_by` and `purpose` for every box; termination refuses
+  another principal's instance unless you pass `confirm_owner`, and the
+  right move is to ask the human instead.
+- **A box that looks idle is the case to be MOST careful about.** Read
+  `activity` in `list_instances` before concluding anything: `state`
+  (loading | serving | gpu_busy | detached_running | booting | ...) and
+  `busy` carry the idle sweep's own verdict, in words. `busy: null` means
+  "could not tell" - never treat it as false. A model loading weights has
+  no visible processes, writes nothing, and is sixty seconds from serving.
+
 ## How to connect
 
 MCP (preferred): the `manifold` MCP server exposes every tool named below.
@@ -65,9 +85,17 @@ desktop app or a dev backend must be running). GET /health confirms it.
 - **Guards**: max hourly spend and max concurrent instances live in the
   backend. If a launch is rejected, tell the user what the guard said; do
   not look for a way around it.
-- **Idle protection**: instances with no Manifold-visible activity for 30
-  minutes are terminated (after data rescue) unless keep-alive is on.
+- **Idle protection**: instances with no visible activity for 30 minutes
+  are terminated (after data rescue) unless keep-alive is on. "Visible"
+  is broad: jobs, terminal traffic, the proxy, a GPU above ~10%
+  utilization in the window, or a running detached command all count as
+  activity. What it cannot see is CPU/IO-only work started outside
+  Manifold - for that, `set_keep_alive` or a per-launch idle timeout.
   Externally launched boxes that Manifold adopted default to keep-alive.
+- **Two ceilings**: `max_lifetime_seconds` (from launch acceptance, boot
+  included - the absolute outer bound) and `max_active_seconds` (from
+  health-check pass - budget the run you control; boot never spends it).
+  Either firing terminates with rescue first.
 
 ## Recipes
 
@@ -76,7 +104,10 @@ desktop app or a dev backend must be running). GET /health confirms it.
 1. `list_launch_options` FIRST. It returns only {type, region, filesystem}
    combinations with capacity right now, ranked best first (co-located
    with existing data beats empty beats scratch). Never guess a region.
-2. `launch_gpu` with a target copied from that list.
+2. `launch_gpu` with a target copied from that list, a `purpose`
+   (required - say what the box is for), and optionally a `name` (the
+   label humans see) and a ceiling sized to the run (`max_active_seconds`
+   - boot does not spend it).
 3. `wait_for_launch` with the returned launch id. One blocking call; do
    not poll in a loop. Boots take 2 to 10 minutes for PCIe cards and
    15 to 40 minutes for SXM/multi-GPU boxes. That is Lambda, not a hang.
@@ -89,7 +120,12 @@ desktop app or a dev backend must be running). GET /health confirms it.
    room to breathe. A 27B model, even 4-bit, wants an A100 40 GB.
 2. `run_job` with template `vllm-serve` and the model id. The template
    handles CUDA, drivers, and loopback binding; do not hand-roll a venv
-   or install drivers. Tool calling / structured output works out of the
+   or install drivers - and if the model needs tuning flags, pass
+   `extra_args` (e.g. "--max-num-seqs 8 --gpu-memory-utilization 0.90").
+   Flags come from an allowlist the template API publishes; anything
+   outside it is refused with the list in the error. One inexpressible
+   flag once forced a hand-rolled server that lost proxy routing,
+   activity visibility, and log streaming in a single move. Tool calling / structured output works out of the
    box (the template passes --enable-auto-tool-choice with the hermes
    parser, which fits Qwen and Hermes models; set the tool_call_parser
    parameter to mistral or llama3_json for those families).
@@ -111,7 +147,10 @@ desktop app or a dev backend must be running). GET /health confirms it.
 - `upload_file` puts local files on the instance (relative paths land on
   the persistent filesystem). `download_file` brings results back.
 - Outputs you care about belong on the persistent filesystem. Check
-  `sync_outputs` before terminating if anything lives in scratch.
+  `sync_outputs` before terminating if anything lives in scratch. The
+  rescue scope is `/workspace/ephemeral` - NOT the home directory. State
+  in $HOME dies with the box, and "files_found: 0" means nothing in
+  scope, not that nothing was lost.
 
 ### Train a model from scratch (the Foundry)
 
@@ -142,6 +181,18 @@ for the axolotl YAML and validates it, but returns it for the user to
 review: it saves nothing and starts nothing. Teacher/judge API keys ride
 a `.env` on the persistent filesystem named in `env_file`, never a
 parameter (parameters are logged verbatim).
+
+### Run a long command (not a job)
+
+`run_command` is capped at 50 seconds. For anything longer that does not
+fit a template - an rsync, a compile, a bootstrap - use `run_detached`:
+it returns immediately with a handle, records the exit code, and the
+running pid COUNTS AS ACTIVITY, so the box protects itself from the idle
+sweep with no polling and no keep-alive. `detached_status(handle)` gives
+state and the log tail. Read the states literally: `vanished` means it
+ended and how is unknowable; `unreachable` is a state of the connection,
+not the command - retry rather than concluding it stopped. Do not
+hand-roll `nohup ... &`; that dance is exactly what this replaces.
 
 ### Browse files
 
@@ -183,4 +234,14 @@ accepts losing the listed files.
   is an upper bound, since the clock starts when the cloud accepted the
   launch rather than when billing did. Costs it cannot know come back as
   `unresolved` (a range) or `rate_unknown`; report those as unknown, never
-  as $0.
+  as $0. `get_spend_breakdown` splits spend by principal or by purpose
+  ("what did MY project cost" on a shared account), and the summary
+  carries a `storage_estimate` block - filesystems bill per GB-month
+  outside the launch totals, at a rate the user configures.
+- A sub-minute backend restart (an app upgrade) is absorbed: refused
+  connections retry for ~40s, and in-flight instance work is untouched -
+  observed mid-boot and mid-transfer. A parked `wait_for_launch` that
+  errors during one should be retried, not read as a failed launch.
+- If results carry a `bridge_version_note`, your MCP bridge predates the
+  backend: tools exist that you cannot see. Finish what is in flight,
+  then restart your session to refresh the tool schema.

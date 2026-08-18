@@ -248,6 +248,12 @@ class TelemetrySettings:
     # How often the dispatcher records a GPU telemetry sample per connected
     # instance. Backs the post-run utilization verdict; advisory only.
     sample_seconds: float = 30.0
+    # Phase 98: how long samples are kept. 30 days and not shorter because
+    # max_lifetime_max_seconds is 30 days - no live launch may outlive its
+    # own telemetry (idle-spend accounting reads samples across a launch's
+    # whole window). 0 = keep forever. audit_log is NEVER pruned: it is the
+    # forensic record, and one night already depended on it.
+    retain_days: float = 30.0
 
 
 @dataclass(frozen=True)
@@ -539,6 +545,7 @@ def load_settings(
         ),
         telemetry=TelemetrySettings(
             sample_seconds=float(telemetry.get("sample_seconds", 30)),
+            retain_days=float(telemetry.get("retain_days", 30)),
         ),
         # Named in the loader or unreadable: this loader lists every field
         # explicitly, and busy_util_pct shipped documented-but-inert for
