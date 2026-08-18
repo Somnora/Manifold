@@ -255,6 +255,22 @@ CREATE TABLE IF NOT EXISTS project_brief (
     updated_at  TEXT
 );
 
+-- Phase 99: hand-started model servers, adopted. A server the templates
+-- cannot express (or that predates them) gets registered here and becomes
+-- a first-class citizen of the OpenAI proxy: routed at localhost:8000/v1,
+-- its traffic counted as activity. The port is a LOOPBACK port on the
+-- instance, reached only over the managed SSH connection - the
+-- nothing-listens-on-the-network rule is untouched.
+CREATE TABLE IF NOT EXISTS registered_endpoints (
+    instance_id  TEXT NOT NULL,
+    port         INTEGER NOT NULL,
+    model_id     TEXT NOT NULL,
+    note         TEXT,
+    created_by   TEXT,
+    created_at   TEXT NOT NULL,
+    PRIMARY KEY (instance_id, port)
+);
+
 -- Phase 95: detached commands - long work started through Manifold that
 -- outlives the request (and the backend: all live state is ON the box,
 -- this row is the registry and the history). exit_code NULL with
@@ -840,6 +856,57 @@ class Database:
             (instance_id, limit),
         ).fetchall()
         return [dict(r) for r in rows]
+
+    # -- registered endpoints (Phase 99) ------------------------------------
+
+    def register_endpoint(self, *, instance_id: str, port: int,
+                          model_id: str, note: str,
+                          created_by: str | None) -> None:
+        """Upsert: re-registering a port updates the model id and note,
+        because restarting a server on the same port is the normal case."""
+        self._execute(
+            """INSERT INTO registered_endpoints
+                   (instance_id, port, model_id, note, created_by, created_at)
+               VALUES (?, ?, ?, ?, ?, ?)
+               ON CONFLICT(instance_id, port) DO UPDATE SET
+                   model_id = excluded.model_id,
+                   note = excluded.note,
+                   created_by = excluded.created_by""",
+            (instance_id, port, model_id, note, created_by, utcnow()),
+        )
+
+    def list_registered_endpoints(self,
+                                  instance_id: str | None = None) -> list[dict]:
+        if instance_id is None:
+            rows = self._execute(
+                "SELECT * FROM registered_endpoints ORDER BY created_at"
+            ).fetchall()
+        else:
+            rows = self._execute(
+                """SELECT * FROM registered_endpoints
+                    WHERE instance_id = ? ORDER BY created_at""",
+                (instance_id,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def delete_registered_endpoint(self, instance_id: str,
+                                   port: int) -> bool:
+        cur = self._execute(
+            """DELETE FROM registered_endpoints
+                WHERE instance_id = ? AND port = ?""",
+            (instance_id, port),
+        )
+        return cur.rowcount > 0
+
+    def delete_endpoints_for_instance(self, instance_id: str) -> int:
+        """A terminated box's endpoints die with it - a registration that
+        outlives its instance would be a route to nowhere that still looks
+        like a served model."""
+        cur = self._execute(
+            "DELETE FROM registered_endpoints WHERE instance_id = ?",
+            (instance_id,),
+        )
+        return cur.rowcount
 
     def prune_telemetry(self, before_iso: str) -> int:
         """Delete samples older than the cutoff; returns how many went.

@@ -389,6 +389,14 @@ class RunCommandRequest(BaseModel):
     timeout: float = Field(default=120.0, gt=0, le=600)
 
 
+class RegisterEndpointRequest(BaseModel):
+    port: int = Field(ge=1, le=65535)
+    model_id: str = Field(min_length=1, max_length=200)
+    # Why this server exists - shown beside the endpoint, lands in the
+    # audit row. Same job as a launch purpose.
+    note: str = Field(default="", max_length=200)
+
+
 class RunDetachedRequest(BaseModel):
     command: str = Field(min_length=1, max_length=16384)
     # What this work is, in words. Lands in the activity verdict that keeps
@@ -1686,6 +1694,44 @@ def create_app(
     async def list_detached_commands(instance_id: str):
         return {"detached": db.list_detached(instance_id)}
 
+    @app.post("/instances/{instance_id}/endpoints", status_code=201)
+    async def register_model_endpoint(instance_id: str,
+                                      req: RegisterEndpointRequest):
+        """Adopt a hand-started model server into the OpenAI proxy.
+
+        The port is a LOOPBACK port on the instance, reached only over the
+        managed SSH connection; nothing new listens anywhere. Once
+        registered, the model is routed at localhost:8000/v1 like any
+        template-served one, appears in /v1/models when it answers, and its
+        proxy traffic counts as activity for the idle sweep."""
+        conn = orchestrator.connections.get(instance_id)
+        if conn is None or conn.ssh_connection() is None:
+            raise HTTPException(409, f"no connected instance {instance_id}")
+        db.register_endpoint(instance_id=instance_id, port=req.port,
+                             model_id=req.model_id, note=req.note,
+                             created_by=current_principal())
+        dispatcher.touch_activity(instance_id)
+        db.record_audit(
+            current_principal(), "endpoint_registered",
+            f"{instance_id}: {req.model_id!r} on loopback:{req.port}"
+            + (f" ({req.note})" if req.note else ""))
+        return {"instance_id": instance_id, "port": req.port,
+                "model_id": req.model_id}
+
+    @app.get("/instances/{instance_id}/endpoints")
+    async def list_model_endpoints(instance_id: str):
+        return {"endpoints": db.list_registered_endpoints(instance_id)}
+
+    @app.delete("/instances/{instance_id}/endpoints/{port}")
+    async def deregister_model_endpoint(instance_id: str, port: int):
+        if not db.delete_registered_endpoint(instance_id, port):
+            raise HTTPException(
+                404, f"no registered endpoint on {instance_id}:{port}")
+        db.record_audit(
+            current_principal(), "endpoint_deregistered",
+            f"{instance_id}: loopback:{port}")
+        return {"instance_id": instance_id, "port": port, "removed": True}
+
     @app.get("/instances/{instance_id}/metrics")
     async def instance_metrics(instance_id: str):
         sidecar = orchestrator.sidecar_for(instance_id)
@@ -2246,7 +2292,15 @@ def create_app(
             "invalid_api_key", "authentication_error")
 
     def _serving_endpoints() -> list[dict]:
-        """Every running model server on a CONNECTED instance."""
+        """Every model server on a CONNECTED instance: template jobs, plus
+        hand-started servers adopted via register_endpoint (Phase 99).
+
+        Registered endpoints ride a synthetic task id ("ep:<box>:<port>") so
+        the readiness cache keys them like any served model. A hand-started
+        server used to be invisible here, which cost its owner proxy
+        routing AND activity tracking in one move - the 07:42 reap was a
+        box this function could not see.
+        """
         eps = []
         for task in queue.list():
             if task["status"] != "running":
@@ -2262,6 +2316,17 @@ def create_app(
                 "task_id": task["id"],
                 "model_id": task["parameters"].get("model_id") or task["template"],
                 "port": template.ports[0].host,
+            })
+        for row in db.list_registered_endpoints():
+            conn = orchestrator.connections.get(row["instance_id"])
+            if conn is None or conn.ssh_connection() is None:
+                continue
+            eps.append({
+                "instance_id": row["instance_id"],
+                "task_id": f"ep:{row['instance_id']}:{row['port']}",
+                "model_id": row["model_id"],
+                "port": row["port"],
+                "registered": True,
             })
         return eps
 

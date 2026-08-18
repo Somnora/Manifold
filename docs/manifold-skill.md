@@ -140,6 +140,12 @@ desktop app or a dev backend must be running). GET /health confirms it.
 4. Talk to it at http://localhost:8000/v1 (OpenAI-compatible proxy on the
    user's machine, riding the managed SSH tunnel). Never expose a port on
    the instance itself; nothing on an instance may listen non-loopback.
+5. If no template can express your serve command, start the server by
+   hand (loopback only) and `register_endpoint(instance_id, port,
+   model_id)`. It becomes a first-class citizen: proxied, listed, and its
+   traffic counts as activity. A hand-started server that is NOT
+   registered is invisible to the proxy and the idle sweep alike - the
+   most expensive misread this platform has had.
 
 ### Run batch work or custom code
 

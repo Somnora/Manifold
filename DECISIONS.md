@@ -6047,3 +6047,42 @@ committed BEFORE the source is deleted. If Manifold ever grows a sync or
 migration helper, it emits the excluded-file manifest by default — making that
 failure structurally hard to repeat, rather than dependent on someone
 remembering to look at what they chose not to copy.
+
+## 2026-08-17 — Phase 99: registered endpoints, the other half of "hand-started"
+
+The heaviest agent user's #2: they hand-started a server over SSH (a flag the
+template could not express at the time), and the fallback silently cost them
+everything the product does — proxy routing said `no_model_served`, the idle
+sweep saw nothing Manifold-visible using the box (the 07:42 reap terminated it
+at 100% util), no restart supervision. `extra_args` (Phase 96) removed the most
+common REASON to hand-start; `register_endpoint` makes the remaining cases
+first-class instead of invisible. Both halves shipped, "invisible busy server"
+stops being a construct that can exist.
+
+**One integration seam.** `_serving_endpoints()` in main.py already feeds
+`/v1/models`, model resolution, completions, and readiness. Registered rows
+merge there with a synthetic task id (`ep:{instance}:{port}`) — the readiness
+cache keys on the task-id string, so registered endpoints get the same
+model-loading probe as job-started ones with zero new code paths. Alternative
+considered: a parallel routing table consulted by each proxy route. Rejected:
+two lookup paths is how one of them goes stale.
+
+**Activity for free, by design.** Proxy completions already call
+`touch_activity`; anything routable is therefore idle-protected. The feature is
+mostly the ROUTE, not a new activity source.
+
+**A row is served only while the instance has a live managed connection.**
+The row may exist while the box reboots, but offering an unreachable box in
+`/v1/models` hands a client a route to a timeout dressed as a model.
+
+**Registration dies with the instance.** Both settle sites (terminate and the
+external-termination reconcile) drop the instance's rows right after the
+worklog write. A route to a gone box that still looks like a served model is
+exactly the stale-fact class this codebase exists to not have.
+
+**Re-register upserts.** Restarting a server on the same port is the normal
+case, not a conflict; PRIMARY KEY (instance_id, port) + ON CONFLICT UPDATE.
+
+**Deregister touches nothing on the box** — it stops routing, it does not kill
+the process. Killing something we did not start would be the mirror image of
+the incident that built this product. A test pins that no SSH command runs.

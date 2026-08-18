@@ -1213,6 +1213,10 @@ class Orchestrator:
             self._worklog_instance(launch, instance_id,
                                    reason or (f"requested by {caller}"
                                               if caller else "requested"))
+        # A terminated box's registered endpoints die with it: a route to a
+        # gone instance that still looks like a served model is exactly the
+        # kind of stale fact this codebase exists to not have.
+        self.db.delete_endpoints_for_instance(instance_id)
         remove_ssh_config_block(instance_id)
         # The box is gone: forget its blocked-notification state so a future
         # instance id collision (or a re-adopted box) can ping again.
@@ -1638,6 +1642,7 @@ class Orchestrator:
                     launch, instance_id,
                     "terminated outside Manifold (vanished from the "
                     "provider's list)")
+                self.db.delete_endpoints_for_instance(instance_id)
                 self.db.record_audit(
                     "backend", "external_termination_detected",
                     f"launch {launch['id']}: instance {instance_id} is no "
