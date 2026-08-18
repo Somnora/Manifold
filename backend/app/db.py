@@ -366,6 +366,30 @@ def _interval(start_iso: str | None, end_iso: str | None) -> float | None:
         return None
 
 
+class _Rows:
+    """A cursor stand-in whose rows were fetched inside the DB lock."""
+
+    def __init__(self, rows: list, rowcount: int):
+        self._rows = rows
+        self._i = 0
+        self.rowcount = rowcount
+
+    def fetchone(self):
+        if self._i >= len(self._rows):
+            return None
+        row = self._rows[self._i]
+        self._i += 1
+        return row
+
+    def fetchall(self):
+        rest = self._rows[self._i:]
+        self._i = len(self._rows)
+        return rest
+
+    def __iter__(self):
+        return iter(self.fetchall())
+
+
 class Database:
     def __init__(self, path: str):
         self._path = path
@@ -494,11 +518,25 @@ class Database:
     def close(self) -> None:
         self._conn.close()
 
-    def _execute(self, sql: str, params: tuple = ()) -> sqlite3.Cursor:
+    def _execute(self, sql: str, params: tuple = ()) -> "_Rows":
+        """Execute one statement and return its MATERIALIZED result.
+
+        The lock used to cover execute+commit but the returned cursor was
+        consumed at the call site, OUTSIDE the lock - and cursors on a
+        shared sqlite3 connection are reset by the next statement from any
+        thread. The app itself is single-threaded asyncio, but tests drive
+        the queue and db directly from the pytest thread while the app
+        loop runs, and on loaded CI runners the fetch lost that race twice
+        in one day (a task row read back as None / NULL-parameters).
+        Fetching inside the lock closes the window; _Rows keeps the
+        cursor-shaped surface (fetchone/fetchall/rowcount) so none of the
+        ~100 call sites change.
+        """
         with self._lock:
             cur = self._conn.execute(sql, params)
+            rows = cur.fetchall() if cur.description is not None else []
             self._conn.commit()
-            return cur
+            return _Rows(rows, cur.rowcount)
 
     # -- launches ------------------------------------------------------------
 

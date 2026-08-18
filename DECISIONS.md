@@ -6505,3 +6505,23 @@ makes agent-launches-GPU table stakes; Manifold's moat is the guardrail
 layer (unbypassable-by-construction guards, approval gates, audit,
 save-before-destroy), so breadth should come cheap (the aggregator),
 never as the product's main bet.
+
+## 2026-08-18 — Phase 108: the cursor left the lock, and CI cried wolf twice
+
+The same test failed two GREEN trees in one day on CI (once on a
+docs-only commit), each time with a just-written task row reading back as
+None or with NULL parameters. The mechanism: `Database._execute` locked
+execute+commit but RETURNED THE LIVE CURSOR, which call sites consumed
+outside the lock - and a cursor on a shared sqlite3 connection is reset
+by the next statement from any thread. The app itself is single-threaded
+asyncio; the exposure is tests driving the queue/db directly from the
+pytest thread while the app loop queries concurrently, which only
+collides on loaded runners - which is why it never reproduced locally.
+
+Fix: _execute now MATERIALIZES rows inside the lock and returns a
+cursor-shaped stand-in (fetchone/fetchall/rowcount), so all ~100 call
+sites keep working unchanged. Every query in the codebase is small and
+bounded, so full materialization costs nothing measurable. A hammer test
+(300 cross-thread write-then-read cycles against a competing query loop)
+pins the fix. A flaky red is worse than a red: two more of these and
+nobody believes CI at all - that is why this jumped the queue.
