@@ -957,6 +957,20 @@ export const api = {
       boot_timeout_seconds: number;
     }>("/settings/status"),
 
+  listResearchKeys: () =>
+    request<{ keys: ResearchKey[] }>("/research-keys"),
+
+  setResearchKey: (name: string, value: string, note: string) =>
+    request<ResearchKey>(`/research-keys/${encodeURIComponent(name)}`, {
+      method: "PUT",
+      body: JSON.stringify({ value, note }),
+    }),
+
+  deleteResearchKey: (name: string) =>
+    request<{ deleted: string }>(`/research-keys/${encodeURIComponent(name)}`, {
+      method: "DELETE",
+    }),
+
   setLambdaKey: (apiKey: string) =>
     request<{ valid: boolean; instance_types_visible: number; applied_live: boolean }>(
       "/settings/lambda-key",
@@ -1375,3 +1389,17 @@ export type ClusterLaunchRequest = {
   provider?: string;
 };
 
+
+// Phase 100: research-key vault metadata. The value itself never reaches
+// the dashboard; `length` is null (not 0) when the value is absent.
+export type ResearchKey = {
+  name: string;
+  present: boolean;
+  length: number | null;
+  note: string;
+  created_by: string | null;
+  created_at: string | null;
+  updated_at: string | null;
+  last_used_at: string | null;
+  last_used_by: string | null;
+};

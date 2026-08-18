@@ -8,6 +8,7 @@ import { ConnectAgentPanel } from "@/components/ConnectAgentPanel";
 import { PolicyCard } from "@/components/PolicyCard";
 import { PolicySettings } from "@/components/PolicySettings";
 import { PrincipalsPanel } from "@/components/PrincipalsPanel";
+import { ResearchKeysPanel } from "@/components/ResearchKeysPanel";
 
 // First-run setup. Secrets are pasted here once, validated against Lambda,
 // and written to .env on the machine running the backend. They are never
@@ -99,6 +100,7 @@ export default function SettingsPage() {
       <div className="space-y-6">
         <LambdaKeyForm onSaved={refresh} />
         <S3KeysForm onSaved={refresh} />
+        <ResearchKeysPanel />
         <PrincipalsPanel />
         <PolicySettings />
         <section className="rounded-lg border border-zinc-200 bg-white p-4 text-sm text-zinc-600">

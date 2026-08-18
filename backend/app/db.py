@@ -271,6 +271,21 @@ CREATE TABLE IF NOT EXISTS registered_endpoints (
     PRIMARY KEY (instance_id, port)
 );
 
+-- Phase 100: research-key ANNOTATION only. The key VALUES live in
+-- research-keys.env in the data dir and are never written to SQLite, a
+-- log, or an audit row (see research_keys.py for the two-files/two-blast-
+-- radii design). This table carries what a list view needs beyond
+-- presence: who deposited a key, why, and when it was last handed out.
+CREATE TABLE IF NOT EXISTS research_keys (
+    name         TEXT PRIMARY KEY,
+    note         TEXT,
+    created_by   TEXT,
+    created_at   TEXT NOT NULL,
+    updated_at   TEXT,
+    last_used_at TEXT,
+    last_used_by TEXT
+);
+
 -- Phase 95: detached commands - long work started through Manifold that
 -- outlives the request (and the backend: all live state is ON the box,
 -- this row is the registry and the history). exit_code NULL with
@@ -907,6 +922,46 @@ class Database:
             (instance_id,),
         )
         return cur.rowcount
+
+    # -- research keys (Phase 100): metadata only, never values ------------
+
+    def upsert_research_key_meta(self, *, name: str, note: str,
+                                 created_by: str | None,
+                                 replaced: bool) -> None:
+        """Annotation for a key that was just set. A replace keeps the
+        original provenance (who FIRST deposited it) and stamps updated_at;
+        a create records the depositor. Values never come through here."""
+        if replaced:
+            self._execute(
+                """UPDATE research_keys SET note = ?, updated_at = ?
+                    WHERE name = ?""",
+                (note, utcnow(), name),
+            )
+            if self._execute("SELECT 1 FROM research_keys WHERE name = ?",
+                             (name,)).fetchone():
+                return
+        self._execute(
+            """INSERT INTO research_keys
+                   (name, note, created_by, created_at)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT(name) DO UPDATE SET
+                   note = excluded.note, updated_at = excluded.created_at""",
+            (name, note, created_by, utcnow()),
+        )
+
+    def list_research_key_meta(self) -> dict[str, dict]:
+        rows = self._execute("SELECT * FROM research_keys").fetchall()
+        return {r["name"]: dict(r) for r in rows}
+
+    def touch_research_key(self, name: str, used_by: str | None) -> None:
+        self._execute(
+            """UPDATE research_keys SET last_used_at = ?, last_used_by = ?
+                WHERE name = ?""",
+            (utcnow(), used_by, name),
+        )
+
+    def delete_research_key_meta(self, name: str) -> None:
+        self._execute("DELETE FROM research_keys WHERE name = ?", (name,))
 
     def prune_telemetry(self, before_iso: str) -> int:
         """Delete samples older than the cutoff; returns how many went.

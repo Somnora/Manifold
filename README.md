@@ -104,7 +104,7 @@ new filebases in any region from the Storage page.
 
 ## Built for AI agents
 
-Any MCP client (Claude Code, Claude Desktop, Codex, Gemini CLI) gets 41
+Any MCP client (Claude Code, Claude Desktop, Codex, Gemini CLI) gets 46
 tools that flow through the same guarded backend, so an agent hits the same
 budget walls you do. Several agents can share one account safely: every
 launch carries a required `purpose` and a `created_by`, every instance
@@ -130,6 +130,10 @@ looks in the wrong place.
 
 The agent's first call, `get_skill`, returns a playbook of recipes (launch,
 serve, batch, fine-tune, teardown) and the rules that keep GPU work safe.
+Research API keys (YouTube, X, congress.gov) live in one audited vault
+behind the same backend: any agent can deposit or fetch them, every fetch
+records who and what for, and a brand-new agent CLI inherits every key the
+moment it connects instead of needing its own dotfiles married over.
 Full setup for every client: `docs/mcp-setup.md`.
 
 To check the wiring instead of guessing, ask the app:

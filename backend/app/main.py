@@ -397,6 +397,19 @@ class RegisterEndpointRequest(BaseModel):
     note: str = Field(default="", max_length=200)
 
 
+class SetResearchKeyRequest(BaseModel):
+    value: str = Field(min_length=1, max_length=4096)
+    note: str = Field(default="", max_length=200)
+
+
+class RevealResearchKeyRequest(BaseModel):
+    # Required at the BACKEND, unlike launch purpose (which stayed
+    # backend-optional for old bridges): this endpoint is born with the
+    # requirement and has no legacy callers to indulge. A secret handout
+    # with an unexplained purpose should not be possible to express.
+    purpose: str = Field(min_length=1, max_length=200)
+
+
 class RunDetachedRequest(BaseModel):
     command: str = Field(min_length=1, max_length=16384)
     # What this work is, in words. Lands in the activity verdict that keeps
@@ -505,6 +518,7 @@ def create_app(
     lambda_client_factory=None,    # (api_key) -> LambdaClient, for key validation
     notification_sender=None,      # (title, body) -> None; tests record, mock no-ops
     env_path=None,                 # where /settings writes secrets (.env)
+    research_keys_path=None,       # research-key vault file (DATA_ROOT/research-keys.env)
     templates_dir=None,
     custom_templates_dir=None,     # user-authored templates (DATA_ROOT/custom-templates)
     mock: bool = False,
@@ -517,6 +531,13 @@ def create_app(
     lambda_client_factory = lambda_client_factory or RealLambdaClient
     from .config import DATA_ROOT, RESOURCE_ROOT
     env_file = env_path if env_path is not None else DATA_ROOT / ".env"
+    # Phase 100: the research-key vault. Its OWN file, deliberately not
+    # env_file: the handout endpoint reads only this store, so Manifold's
+    # own credentials are structurally unreachable through it.
+    from .research_keys import ResearchKeyStore, validate_name, validate_value
+    research_keys = ResearchKeyStore(
+        research_keys_path if research_keys_path is not None
+        else DATA_ROOT / "research-keys.env")
 
     # Image preflight wiring. Mock mode gets the offline approve-everything
     # checker; production (no injected client) verifies against registries.
@@ -866,6 +887,7 @@ def create_app(
     app.state.terminal_sessions = term_sessions
     app.state.queue = queue
     app.state.brains = brains
+    app.state.research_keys = research_keys
     app.state.autopilot = autopilot
 
     # Single-use download credentials (auth.NonceStore): browser <a>
@@ -3726,15 +3748,109 @@ def create_app(
 
     # -- audit (agent activity) -----------------------------------------------------
 
+    # -- research keys (Phase 100) ------------------------------------------
+
+    def _research_key_entry(name: str, present: dict[str, int],
+                            meta: dict[str, dict]) -> dict:
+        m = meta.get(name, {})
+        return {
+            "name": name,
+            "present": name in present,
+            # None when the value is gone - never 0, which would claim a
+            # measured length for a key that does not exist.
+            "length": present.get(name),
+            "note": m.get("note") or "",
+            "created_by": m.get("created_by"),
+            "created_at": m.get("created_at"),
+            "updated_at": m.get("updated_at"),
+            "last_used_at": m.get("last_used_at"),
+            "last_used_by": m.get("last_used_by"),
+        }
+
+    @app.get("/research-keys")
+    async def list_research_keys():
+        """Names, presence, length, and annotation. NEVER values: this is
+        the same presence/length/status tier the doctor reports secrets at.
+
+        The view is the UNION of the file and the metadata table, because
+        the file is hand-editable: a hand-added key appears (provenance
+        unknown), and a metadata row whose value was hand-deleted shows
+        present=false instead of vanishing - both discrepancies are shown
+        rather than smoothed over."""
+        present = research_keys.names()
+        meta = db.list_research_key_meta()
+        names = sorted(set(present) | set(meta))
+        return {"keys": [_research_key_entry(n, present, meta)
+                         for n in names]}
+
+    @app.put("/research-keys/{name}")
+    async def set_research_key(name: str, req: SetResearchKeyRequest):
+        """Deposit or rotate a key. Upsert: rotating overwrites in place
+        and keeps the original depositor's provenance."""
+        complaint = validate_name(name) or validate_value(req.value)
+        if complaint:
+            raise HTTPException(422, complaint)
+        replaced = research_keys.set(name, req.value)
+        db.upsert_research_key_meta(
+            name=name, note=req.note, created_by=current_principal(),
+            replaced=replaced)
+        db.record_audit(
+            current_principal(), "research_key_set",
+            f"{name}: {'replaced' if replaced else 'created'}, "
+            f"{len(req.value)} chars"
+            + (f" ({req.note})" if req.note else ""))
+        return _research_key_entry(name, research_keys.names(),
+                                   db.list_research_key_meta())
+
+    @app.post("/research-keys/{name}/value")
+    async def read_research_key(name: str, req: RevealResearchKeyRequest):
+        """Hand out one key value. POST, not GET, because it is honest
+        about its side effects: the fetch stamps last-used and writes an
+        audit row carrying the caller's required purpose.
+
+        This can only ever return keys from the research vault file;
+        Manifold's own .env is a different file this handler cannot read,
+        so asking for e.g. "lambda_api_key" is a 404, not a disclosure."""
+        value = research_keys.get(name)
+        if value is None:
+            available = ", ".join(sorted(research_keys.names()))
+            raise HTTPException(
+                404, f"no research key named {name!r}; available: "
+                     f"{available or 'none stored yet'}")
+        db.touch_research_key(name, current_principal())
+        db.record_audit(current_principal(), "research_key_read",
+                        f"{name}: {req.purpose}")
+        return {"name": name, "value": value}
+
+    @app.delete("/research-keys/{name}")
+    async def delete_research_key(name: str):
+        """Remove a key for every agent on the account. Deliberately not
+        exposed as an MCP tool: agents rotate by overwriting; deletion is
+        a human housekeeping action (Settings or this route directly)."""
+        if not research_keys.delete(name):
+            raise HTTPException(404, f"no research key named {name!r}")
+        db.delete_research_key_meta(name)
+        db.record_audit(current_principal(), "research_key_deleted", name)
+        return {"deleted": name}
+
     @app.post("/audit/agent", status_code=201)
     async def record_agent_call(req: AgentAuditRequest):
         """MCP tool-call audit: tool, args, session note, result. The MCP
         server posts one entry per tool invocation."""
         import json as json_module
+        args = req.args
+        # Phase 100 belt-and-suspenders: the research-key tools redact the
+        # value in their own audit args, but a version-drifted bridge might
+        # not. Exact tool+field match only - heuristic secret-sniffing
+        # would silently rewrite honest history, which is worse.
+        if (req.tool.endswith("research_key") and isinstance(args, dict)
+                and isinstance(args.get("value"), str)):
+            args = {**args,
+                    "value": f"<redacted, {len(args['value'])} chars>"}
         db.record_audit(
             "mcp", req.tool,
             json_module.dumps(
-                {"args": req.args, "note": req.note, "result": req.result}
+                {"args": args, "note": req.note, "result": req.result}
             ),
         )
         return {"recorded": True}

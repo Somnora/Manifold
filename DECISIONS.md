@@ -6086,3 +6086,53 @@ case, not a conflict; PRIMARY KEY (instance_id, port) + ON CONFLICT UPDATE.
 **Deregister touches nothing on the box** — it stops routing, it does not kill
 the process. Killing something we did not start would be the mirror image of
 the incident that built this product. A test pins that no SSH command runs.
+
+## 2026-08-18 — Phase 100: the research-key vault
+
+The owner's problem, verbatim in spirit: research API keys (YouTube, X, the
+congress.gov keys behind Tally's pipeline) live scattered across every agent
+CLI's own dotfolder. Every new agent means re-plumbing every key; every
+rotation means hunting the copies. Manifold is the one thing every agent
+already connects to, so the consolidated vault lives behind it.
+
+**Handout model, not broker.** The backend hands the value to the caller
+(audited, purpose required) rather than proxying the research API calls
+itself. A broker never exposes values to agent context, but it needs
+per-service request shapes for arbitrary APIs — not buildable in general.
+The handout is exactly what agents do today when they read a dotfile, minus
+the sprawl and plus a paper trail. Broker-only flagging per key is left as a
+future tier.
+
+**Two files, two blast radii — the load-bearing choice.** Values live in
+`research-keys.env` in the data dir (0600, hand-editable), deliberately NOT
+in `.env`. The handout endpoint reads exactly one file, so Manifold's own
+credentials are STRUCTURALLY unreachable through it: get_research_key
+("lambda_api_key") is a 404, not a disclosure, no matter who asks. Pinned by
+test.
+
+**Never in SQLite, never in an audit row.** The DB holds annotation only
+(note, provenance, last-used). Audit rows carry name + purpose + length.
+The MCP tools redact the value from their own audit args, AND /audit/agent
+scrubs the value field of research-key tools server-side (exact tool+field
+match — heuristic secret-sniffing would silently rewrite honest history, so
+a benign "value" arg on any other tool stays verbatim). Both pinned by test:
+the audit log is forever, so a secret must never enter it once.
+
+**Purpose required at the BACKEND**, unlike launch purpose (MCP-layer-only).
+Launch stayed backend-permissive for old bridges and the dashboard; this
+endpoint is born with the requirement and has no legacy callers to indulge.
+
+**Rejection over repair on values.** Leading/trailing whitespace and control
+characters are refused with the reason, never stripped: silently mutating a
+secret produces downstream auth failures that blame the wrong party.
+
+**No MCP delete tool; no dashboard reveal.** Agents rotate by overwriting;
+deletion is a human housekeeping action (Settings or the route). The
+dashboard shows presence/length/annotation only — a value round-trip through
+the browser puts secrets in DOM/devtools for no gain; the human's copy is
+the vault file itself.
+
+**The union view tells on discrepancies.** The list is file ∪ metadata: a
+hand-added key appears with "provenance unknown", a hand-deleted value shows
+present=false with its annotation intact. Neither is smoothed over — same
+truthful-or-absent rule, applied to the vault's own bookkeeping.
