@@ -398,6 +398,9 @@ class PreferencesPatch(BaseModel):
     # registered providers - preferences.py cannot see the registry, and
     # silently keeping the old value would look like a saved setting.
     providers: dict | None = None
+    # {"favorites": ["vllm-serve", ...]}: template names pinned to the top
+    # of every template list (Phase 107).
+    templates: dict | None = None
     # Every section of Preferences must be listed here. A section that is
     # missing is dropped by model_dump(exclude_none=True) before the handler
     # ever sees it, so PUT returns 200 with the value unchanged - a silent
@@ -2990,15 +2993,25 @@ def create_app(
     async def list_templates():
         """Valid templates with parameter schemas, plus load errors so a
         broken YAML file is visible instead of silently missing. Custom
-        (user-authored) templates carry their raw YAML for editing."""
+        (user-authored) templates carry their raw YAML for editing.
+
+        Favorites first (Phase 107): the picker passed twenty entries, so
+        favorited names lead the list in the user's stored order, each
+        flagged. The ORDER is decided here, once, so the dashboard select,
+        the MCP list_templates tool, and anything else that renders
+        templates agree without re-implementing the sort."""
+        favorites = list(prefs.get().templates.favorites)
         out = []
         for t in templates.values():
             entry = t.to_api()
             entry["custom"] = t.name in custom_names
+            entry["favorite"] = t.name in favorites
             if entry["custom"]:
                 path = custom_dir / f"{t.name}.yaml"
                 entry["yaml"] = path.read_text() if path.exists() else ""
             out.append(entry)
+        out.sort(key=lambda e: (0, favorites.index(e["name"]))
+                 if e["favorite"] else (1, 0))
         return {"templates": out, "errors": template_errors}
 
     @app.post("/templates/custom", status_code=201)

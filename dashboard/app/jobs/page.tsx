@@ -104,6 +104,20 @@ export default function JobsPage() {
 
   // Also called by the template editor after a save/delete, so a new custom
   // template appears in the picker immediately.
+  async function toggleFavorite(name: string) {
+    const current = templates.filter((t) => t.favorite).map((t) => t.name);
+    const next = current.includes(name)
+      ? current.filter((n) => n !== name)
+      : [...current, name];
+    try {
+      await api.updatePreferences({ templates: { favorites: next } });
+      loadTemplates();
+    } catch {
+      // A failed toggle keeps the list as it was; the star simply does
+      // not change, which is the truthful rendering of "not saved".
+    }
+  }
+
   function loadTemplates() {
     api
       .templates()
@@ -256,9 +270,33 @@ export default function JobsPage() {
           Queue a job
         </h2>
         <div className="space-y-4 rounded-lg border border-zinc-200 bg-white p-5">
-          <label className="block text-xs font-medium text-zinc-600">
-            Template
+          <div className="block text-xs font-medium text-zinc-600">
+            <div className="flex items-center justify-between">
+              <span>Template</span>
+              {/* One star, acting on the SELECTED template. The backend
+                  sorts favorites first, so the reward for starring is
+                  immediate: your job stops hiding in a 20-entry list. */}
+              {template && (
+                <button
+                  type="button"
+                  onClick={() => void toggleFavorite(template.name)}
+                  title={
+                    template.favorite
+                      ? "Remove from favorites"
+                      : "Pin to the top of this list"
+                  }
+                  className={
+                    template.favorite
+                      ? "text-amber-500 hover:text-amber-600"
+                      : "text-zinc-300 hover:text-amber-500"
+                  }
+                >
+                  {template.favorite ? "\u2605 favorite" : "\u2606 favorite"}
+                </button>
+              )}
+            </div>
             <select
+              aria-label="Template"
               className="mt-1 w-full rounded border border-zinc-300 bg-white px-2.5 py-1.5 text-sm"
               value={selected}
               onChange={(e) => {
@@ -266,13 +304,36 @@ export default function JobsPage() {
                 setSeed(null);
               }}
             >
-              {templates.map((t) => (
-                <option key={t.name} value={t.name}>
-                  {t.name}
-                </option>
-              ))}
+              {templates.some((t) => t.favorite) ? (
+                <>
+                  <optgroup label="Favorites">
+                    {templates
+                      .filter((t) => t.favorite)
+                      .map((t) => (
+                        <option key={t.name} value={t.name}>
+                          {t.name}
+                        </option>
+                      ))}
+                  </optgroup>
+                  <optgroup label="All templates">
+                    {templates
+                      .filter((t) => !t.favorite)
+                      .map((t) => (
+                        <option key={t.name} value={t.name}>
+                          {t.name}
+                        </option>
+                      ))}
+                  </optgroup>
+                </>
+              ) : (
+                templates.map((t) => (
+                  <option key={t.name} value={t.name}>
+                    {t.name}
+                  </option>
+                ))
+              )}
             </select>
-          </label>
+          </div>
           {template && (
             <>
               {/* The launch decision is made here: what this job does and

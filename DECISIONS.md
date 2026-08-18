@@ -6455,3 +6455,25 @@ Desktop's entry gained startupTimeout=120000, so even a worst-case
 assessed spawn connects. The permanent fix beyond all of this is code
 signing + notarization - signed binaries skip the assessment stalls -
 which costs an Apple Developer account and is the owner's call.
+
+## 2026-08-18 — Phase 107: favorite templates lead every list
+
+The quick-jobs picker passed twenty entries and finding YOUR job became a
+scan (owner report, with screenshot). Favorites are a TemplatePrefs
+preference (SQLite via the existing PUT /preferences flow; config.yaml
+ships none), and the ORDER is decided once, in the /templates route:
+favorites first in the user's stored order, remainder unchanged (stable
+sort). Every client inherits it - the dashboard select renders Favorites /
+All templates optgroups, and MCP list_templates tells agents to prefer a
+favorite: it is the one the user actually reaches for.
+
+Two deliberate edges: a favorite naming a missing template is KEPT in the
+preference but rendered nowhere (deleting a template must not silently
+edit the user's preferences - restore the template and the pin is back),
+and validation trims/dedupes/caps at 50 in preferences._validate, the
+module's documented clamping contract, not a route rejection.
+
+Off-repo, same session: the Gemini CLI is retired in favor of the AGY
+(antigravity) CLI; manifold is now registered in BOTH of its twin
+mcp_config.json files (they are byte-identical copies and the binary's
+reader is unknown - editing one risks the other being the live one).
