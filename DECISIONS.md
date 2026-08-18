@@ -6400,3 +6400,58 @@ suite's shared `client` fixture now isolates env_path (like db and
 research-keys before it) - without that, settings-route tests write into
 the developer's REAL repo .env, which is exactly what happened while
 testing this fix (three junk lines, removed).
+
+## 2026-08-18 — Phase 106: "connects cleanly to harness apps" becomes a checkable claim
+
+Claude Desktop declared manifold dead: its second bridge spawn took 57s to
+answer `initialize` and the client's deadline expired. Every existing
+doctor check said all clear, because registration, backend health and
+token status are all upstream of the failure the user actually hit. Three
+findings, three fixes:
+
+**The audit cleared our code and convicted the workload.** The bridge's
+cold path has no blocking I/O (no socket, no DNS, no retry before
+initialize - the tempting 40s ConnectError loop runs strictly after, per
+tool call). What every spawn DID do: extract 87MB / 2,206 files / 76
+dylibs to a FRESH temp dir (fresh paths = guaranteed macOS assessment
+cache miss), then import the entire server graph (fastapi, asyncssh,
+boto3) for a stdio bridge that uses none of it. desktop.py now imports
+uvicorn/app.main inside the server branch only, pinned by an AST test on
+module scope. Measured: bridge spawns dropped ~1.5s -> ~0.5s median in
+the onedir prototype with this change.
+
+**The doctor performs the real MCP handshake.** `--doctor` now spawns the
+bridge exactly as a client would, speaks JSON-RPC over its stdio
+(initialize, initialized, tools/list), and reports per-phase millisecond
+timings and the tool count FROM THE REPLY - one solo probe plus two
+concurrent (Claude Desktop runs a main copy and a shared-pool copy; the
+concurrent case is the one that failed). The only honest answer to "does
+Manifold connect cleanly to a harness app" is to BE the harness app.
+
+**Bridges die with their clients now.** A client that SIGKILLs the
+onefile bootloader cannot reach the python child (SIGKILL is
+unforwardable), which survived holding dead pipes; the stdin-EOF watchdog
+cannot run on the bridge (stdin IS the protocol). The bridge polls its
+parent and exits on reparent-to-1. Swept from this machine today: 58
+leaked extraction dirs, ~2.5GB.
+
+**Recorded for the gate - onedir, measured and waiting on a go.** A/B
+under load: onefile blew a 30s handshake deadline 3 times in 20 spawns
+(tails 12.5s, 19s, 23s+); ONEDIR NEVER MISSED in 40+ (worst 7.1s, median
+0.47s solo / 0.58s concurrent with the lazy imports). Extraction and its
+per-spawn assessment disappear entirely; dmg grows ~0.5MB (zlib eats the
+file-count difference). Integration verified in prototype: build script
+--onedir, tauri resources dir, a 51KB C shim at the old
+Contents/MacOS/manifold-backend path exec'ing the real binary so every
+existing client registration stays valid. Only CI and a real install can
+settle: the Windows msi layout, signing over the resource tree, and
+whether the 57s stall is truly gone. TRAP recorded: `mcp` unpinned
+resolves to 2.x and PyInstaller silently omits it (runtime
+ModuleNotFoundError); uv's lock protects CI today.
+
+Also fixed off-repo, on this machine: Codex and Gemini CLI had NO
+manifold registration at all (added, with startup timeouts); Claude
+Desktop's entry gained startupTimeout=120000, so even a worst-case
+assessed spawn connects. The permanent fix beyond all of this is code
+signing + notarization - signed binaries skip the assessment stalls -
+which costs an Apple Developer account and is the owner's call.

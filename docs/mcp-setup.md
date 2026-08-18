@@ -182,6 +182,90 @@ reaches the backend, the header carries a "no agent connected" chip
 linking to Settings → Connect an agent, which holds the copy-able
 registration commands and the live last-call status.
 
+## Troubleshooting: the client says the server timed out
+
+Claude Desktop shows it as a red toast: *"MCP manifold: Couldn't start
+this server ... Request timed out"*. Other clients word it differently,
+but it always means one thing: the client spawned the bridge, waited for
+its `initialize` reply until its own deadline, gave up, and killed the
+process. It does not mean the backend is down and it does not mean the
+registration is wrong. Every other check passes straight through this
+failure, which is why the doctor learned to reproduce the handshake
+itself.
+
+Run the self-test. It spawns exactly the command your client is
+configured to spawn, speaks real JSON-RPC over the same pipes, and times
+each phase:
+
+```bash
+"/Applications/Manifold.app/Contents/MacOS/manifold-backend" --doctor --handshake   # installed app
+uv run manifold-doctor --handshake                                                  # dev checkout, from backend/
+```
+
+A healthy machine answers in a couple of seconds:
+
+```
+manifold doctor: MCP handshake self-test (deadline 15s per spawn)
+  --    probing the command a client spawns: /Applications/Manifold.app/Contents/MacOS/manifold-backend --mcp
+  OK    mcp handshake: initialize 1180ms, tools/list 240ms (46 tools)
+  OK    mcp handshake, 2 clients at once: initialize 1240ms and 1310ms (46 tools each)
+  clean: a client that spawns this command gets the tools.
+```
+
+The tool count comes from the server's own `tools/list` reply, so it is
+the number your client will see. Two spawns at once is not paranoia:
+Claude Desktop starts a main copy of the server and a shared-pool copy
+within a couple of seconds of each other, and that pair is the case that
+timed out. Any FAIL exits nonzero, so the command works in a script.
+`--doctor` on its own runs this check last, after the wiring checks;
+`--doctor --no-handshake` skips it when you want the fast answer.
+
+**If the first run is slow and the next one is fast, that is the
+unsigned binary, not Manifold.** The app ships as a single unsigned
+one-file build of tens of megabytes: every spawn unpacks itself into a
+temporary directory, and macOS assesses that fresh copy before letting
+it run. The assessment is per extraction, so a second run right after is
+normally quick, and keeping the Manifold app open keeps the system warm
+(the app and the bridge are the same binary).
+
+If it stays slow, or the self-test FAILs outright, re-register the
+server and restart the client.
+
+Claude Code:
+
+```bash
+claude mcp add manifold --scope user -- "/Applications/Manifold.app/Contents/MacOS/manifold-backend" --mcp
+```
+
+Claude Desktop, in `~/Library/Application Support/Claude/claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "manifold": {
+      "command": "/Applications/Manifold.app/Contents/MacOS/manifold-backend",
+      "args": ["--mcp"]
+    }
+  }
+}
+```
+
+Then quit Claude Desktop completely (Cmd-Q, not just closing the window)
+and reopen it: it only reads that file at startup.
+
+Codex, in `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.manifold]
+command = "/Applications/Manifold.app/Contents/MacOS/manifold-backend"
+args = ["--mcp"]
+```
+
+Cursor and other clients take the same two fields (command plus
+`["--mcp"]`) in whatever config file they use; if the self-test passes
+and that client still times out, the deadline belongs to the client and
+its logs are the next place to look.
+
 ## The tools
 
 | Tool | What it does |
