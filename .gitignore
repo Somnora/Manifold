@@ -50,3 +50,6 @@ manifold-worklog.md
 # development DATA_ROOT is the repo root, so anything it drops would
 # otherwise show up as untracked churn in the user's clone.
 /hub-scratch/
+
+# Agent worktrees (created by orchestrated subagents; never repo content)
+.claude/worktrees/

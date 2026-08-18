@@ -6194,3 +6194,190 @@ Before building, re-verify the three seams above plus the /filesystems
 payload shape - if any moved, re-derive; do not patch the design to fit.
 The full amended design doc from the review session is not committed
 (scratchpads die); this entry is the durable record.
+
+## 2026-08-18 — One account-wide default provider, resolved in the orchestrator
+
+**Decided:** `preferences.providers.default_provider` (config.yaml ships
+`lambda`, the Settings page overrides it in SQLite) decides which cloud a
+launch lands on when the caller does not name one. `LaunchRequest.provider`
+and `request_launch(provider=...)` became `str | None`, where None means
+"the account default", and `Orchestrator.resolve_provider` is the single
+place that answers it. The launch row stores the RESOLVED name, never null.
+MCP `launch_gpu` gained `provider: str = ""` ("" = follow the default), and
+GET /launch-options follows the same default, accepts `?provider=`, and
+names the cloud on every target row. There is deliberately NO MCP tool to
+change the default.
+
+**Alternatives:** (a) resolve in each client (the bridge, the dashboard) -
+two places to answer one question, guaranteed to drift; (b) use the
+registry's existing `set_active_provider` as process state - lost on
+restart, invisible in the database, and untestable through the API;
+(c) let agents flip the default over MCP - an agent quietly redirecting
+where the money goes is not a setting, it is a footgun.
+
+**Why:** When Lambda credits run low the owner wants to say "this project
+runs on GCP" once and have every agent follow without any of them knowing
+anything changed. Reading the preference at launch time (not at startup)
+is what makes one flip reach agents already running. Three refusal paths
+had to be made honest for this to be safe: an unconfigured provider lists
+an EMPTY catalog, so a resolved-to-GCP launch would have died on "Unknown
+instance type ... Valid types: " - now `CloudProvider.unconfigured_reason()`
+answers with the gcloud command instead; a provider that cannot be read
+raises rather than returning [], so the launch path translates
+ProviderUnavailable/ProviderError into 503/502 LaunchRejected (same split
+as GET /gcp/quota) with the provider's own fix sentence intact; and an
+unknown provider name is refused at PUT /preferences (422 naming the
+registered ones) and again at launch time, since a provider can be
+de-registered after the choice was stored.
+
+**What the toggle may NOT move,** each pinned in
+tests/test_provider_toggle.py: an auto-managed job (queued against a Lambda
+gpu_type, region and filesystem), a capacity watch (it polls the Lambda
+catalog and fired on Lambda capacity), an autopilot launch (the brain chose
+from the Lambda ladder), and clusters (nodes have to reach each other, and
+only the Lambda path is proven multi-node). All four name their provider
+explicitly. Clusters therefore stay explicit-lambda until cross-provider
+clusters are designed; note there is a duplicate nested ClusterLaunchRequest
+inside create_app that must be kept in step with the module-level one.
+
+## 2026-08-18 — The concurrency/budget guard counts live instances per cloud, pending rows account-wide
+
+**Decided:** In `Orchestrator._guard_capacity`, the live half of the
+baseline comes from the LAUNCHING provider alone, while the pending half
+(`db.pending_launch_count()` / `pending_launch_spend_cents()`) is
+account-wide across every provider. So a running Lambda box does not hold
+the single concurrency slot against a GCP launch, but a Lambda launch
+admitted seconds ago does.
+
+**Alternatives:** (a) sum live instances across every registered provider -
+one unreadable or unconfigured cloud then vetoes launches on a working one,
+and the "could not read it" case would have to be turned into a number;
+(b) filter pending rows by provider too - symmetrical, but it drops the
+protection that pending rows exist for (sibling launches admitted in the
+same window all seeing the same baseline) for no gain, since a pending row
+is Manifold's own commitment to spend regardless of where it was made.
+
+**Why:** Both halves count something real and neither invents a number for
+a cloud it could not read, which is the rule that matters here. Under the
+default limit of one instance the asymmetry errs toward admitting a launch
+on a second cloud, which is the direction a human can see and undo (the
+box appears on the dashboard and bills visibly) rather than the direction
+that silently refuses work. This became reachable in practice with the
+Phase 102 default-provider toggle, so it is pinned by two tests as
+intended behaviour rather than left to be rediscovered as a bug.
+
+## 2026-08-18 — Phase 103: extra filesystems attach, but only the primary means anything
+
+**What:** A launch may name `extra_filesystems` (up to 4) alongside
+`filesystem`. All of them are passed to the provider, which mounts each at
+/lambda/nfs/<name>. The primary keeps every existing meaning: {persistent}
+in a template resolves to it, sync_outputs rsyncs to it, and a relative
+path in the file routes resolves under it. Extras are reachable only by
+absolute path, from run_command, detached commands, browse_files/
+upload_file, and a shell.
+
+**Alternatives considered:** (a) Change `filesystem` to a list. Rejected:
+it breaks every existing client, template auto-launch and test for no
+gain, and it leaves "which one is primary" undefined at exactly the
+moments that matter (dispatch, sync, rescue). (b) Widen the template mount
+jail to accept literal /lambda/nfs/* host paths so templates could mount
+any attached filesystem. Rejected as a data-integrity hazard:
+_validate_mount runs at template LOAD time and is instance-agnostic, so a
+template hardcoding a filesystem name would pass validation and then, on
+a box where that filesystem is not attached, make `docker run -v`
+silently create an empty directory. The job would "succeed" against
+nothing and write its output into a path that dies with the instance. The
+sanctioned future path is a dispatch-time {fs:name} token resolved
+against what the target instance actually has mounted, refusing the job
+when it does not; that is deliberately not built here.
+
+**Why the guards sit where they do:** Every rule (extras require a
+primary; cap of 4; no duplicates including against the primary; no blank
+names; each name exists and lives in the launch region; GCP is
+scratch-only including the attach list) is enforced in
+orchestrator.request_launch, not in the request model and not in a
+client. Half the callers of that function are background loops that never
+saw an HTTP request, and a rule in the pydantic model would not bind
+them. The cap is Manifold's, not Lambda's - Lambda does not publish its
+attach limit - so the refusal names the number instead of letting the
+launch fail minutes later at the API.
+
+**Storage:** a nullable launches.extra_filesystems TEXT column (JSON),
+added through _ensure_column. NULL reads as the key being ABSENT from the
+payload, never []. A pre-103 row and a single-filesystem row written
+today are indistinguishable at the column, so [] would assert "we checked
+this box and it has no extra mounts" - true for one, a guess for the
+other. Absent is the honest answer for both.
+
+## 2026-08-18 — Phase 104: the launch hands its own box the setup script
+
+**No hook at the active transition; a reconciling sweep instead.** The
+obvious design - fire the bootstrap when the launch flips to active - was
+designed and then rejected. Three separate sites make a launch active
+(the normal pipeline's _establish_connection, the resume-after-downtime
+path, and orphan repair), so a hook is either written three times or
+misses two cases. Worse, at every one of those points the SSH supervisor
+is still CONNECTING and conn.run/conn.sftp_write raise, so the hook would
+have to sleep-and-retry inside the launch path, where a crash loses the
+start with nothing recording that it was owed. So nothing fires at the
+transition. Dispatcher._sweep_bootstrap rides the telemetry tick beside
+the existing detached probe and asks four questions: active launch,
+script on the row, connection CONNECTED, and no detached row carrying
+bootstrap:<launch id>. Waiting for CONNECTED happens by itself, all three
+activation paths are covered by one piece of code, and adopted boxes (no
+launch row) and auto-manage launches (no script) no-op.
+
+**The detached row IS the exactly-once marker.** Not an in-memory flag,
+which a restart forgets, and not a column on the launch row, which would
+be a second thing to keep in sync with the work it describes. The check
+deliberately ignores exited_at: a finished bootstrap must stop the sweep
+as firmly as a running one, or every bootstrap would restart every tick
+after it completed, and a setup script is rarely safe to run twice.
+
+**The start sequence is shared, and its crash window is inherited, not
+introduced.** SFTP the script, setsid it, read the pid, insert the row -
+extracted out of the run-detached route into detached.start_detached and
+called by both. Between the setsid line landing and create_detached
+committing, a backend death leaves a live process with no row: nothing
+probes or settles it, and a later retry starts a second copy. That window
+is as old as Phase 95 and the extraction neither widens nor closes it;
+naming it here is the point, so nobody rediscovers it as a bootstrap bug.
+
+**A failed bootstrap does not touch the box.** Nonzero exit does not
+terminate and does not clear keep-alive. A typo in an apt line must not
+destroy work already on that disk - the guard-that-destroys-on-a-typo is
+the incident this codebase has already had. It reports instead: the
+bootstrap field on the instance, and one notification.
+
+**One ping, from whichever settle site wins.** Two independent places
+settle a detached row (_probe_detached and the status-poll route), and
+which one sees an exit first depends on whether anybody happened to be
+polling. Both call bootstrap.announce_exit; notify_once keyed on the
+handle makes the loser a no-op. Pinned by two tests, one per order. A
+vanished bootstrap (no exit code) deliberately does NOT ping: a Lambda
+driver-upgrade reboot looks exactly like that and is not a failure.
+
+**Audit gets size and a short sha256, never the script.** The run-detached
+route logs (note or command)[:160], which for a bootstrap would put an
+`export HF_TOKEN=...` into a table every viewer reads, so the bootstrap
+has its own action (bootstrap_started) and its own detail line. The MCP
+bridge does the same split: args (the audit copy) is the body minus the
+script, plus bootstrap_bytes. NOTE: the script IS still readable through
+GET /launches (viewer role) and the viewer-readable detached routes,
+which have always returned command verbatim - left as-is for consistency;
+if launch payloads should redact it, the detached routes need the same
+treatment in the same change.
+
+**Bootstrap does not gate job dispatch.** A queued job can start while
+the bootstrap is still installing; they do not wait for each other.
+Collisions of the dpkg-lock class are the user's to sequence, exactly as
+they were when the same commands were typed by hand after the box came
+up. A hung bootstrap holding an implicit barrier would block work that
+had nothing to do with it.
+
+**Absent until there is something real to say.** The instance payload's
+bootstrap field is absent both when no script was given and during the
+window (up to one telemetry interval) before the sweep starts it. A fifth
+"pending" state was considered and dropped: the four states are read
+verbatim off the detached machinery, and "we have nothing yet" is exactly
+what absence means everywhere else in this codebase.
