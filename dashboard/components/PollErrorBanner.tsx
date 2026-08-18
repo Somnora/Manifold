@@ -28,7 +28,7 @@ export function PollErrorBanner({
       {stale && lastSuccess ? (
         <span className="mt-1 block font-medium">
           The {what} below is a snapshot from{" "}
-          {lastSuccess.toLocaleTimeString()} — NOT live. Things may have
+          {lastSuccess.toLocaleTimeString()}. NOT live: things may have
           changed since; nothing here is interactive until the backend
           answers again.
         </span>

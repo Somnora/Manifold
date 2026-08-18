@@ -406,7 +406,7 @@ export function LaunchForm({ onLaunched }: { onLaunched: () => void }) {
             <option value="86400">24 hours</option>
           </select>
           <span className="mt-1 block text-[11px] font-normal text-zinc-400">
-            Counted from when the instance becomes active — boot never
+            Counted from when the instance becomes active; boot never
             spends it. Max lifetime above stays the outer bound.
           </span>
         </label>
@@ -420,7 +420,7 @@ export function LaunchForm({ onLaunched }: { onLaunched: () => void }) {
             onChange={(e) => setPurpose(e.target.value)}
           />
           <span className="mt-1 block text-[11px] font-normal text-zinc-400">
-            Shown wherever this instance is listed — it is how agents and
+            Shown wherever this instance is listed. It is how agents and
             other sessions know not to touch your box.
           </span>
         </label>

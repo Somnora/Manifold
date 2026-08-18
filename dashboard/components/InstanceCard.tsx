@@ -481,7 +481,7 @@ export function InstanceCard({
               : instance.active_seconds_remaining > 0
                 ? ` (${Math.ceil(instance.active_seconds_remaining / 60)}m left)`
                 : " (reached)"}
-            — counted from health-check pass, so boot never spent it.
+            {". Counted from health-check pass, so boot never spent it."}
           </span>
         ) : null}
         {editingCeiling ? (

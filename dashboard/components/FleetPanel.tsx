@@ -157,7 +157,7 @@ export function FleetPanel({ instances }: { instances: Instance[] }) {
 
                 {inst.telemetry == null ? (
                   <p className="mt-2 text-[11px] text-zinc-500">
-                    No GPU reading yet — not the same as idle.
+                    No GPU reading yet. Not the same as idle.
                   </p>
                 ) : (
                   <div className="mt-2 space-y-1.5">
