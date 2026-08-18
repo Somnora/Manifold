@@ -6033,3 +6033,17 @@ the db module for `DELETE FROM audit_log`. It is the forensic record:
 reconstructing one night of terminations depended on rows nobody knew they
 would need. Whoever adds a prune path someday argues with that test and that
 night, not with nobody.
+
+## 2026-08-18 — Design constraint recorded: a sync helper must emit what it excludes
+
+Not built (no sync/migration helper exists yet); written down for whoever builds
+one. A storage migration deliberately excluded a 14 GB directory as
+"rebuildable intermediates", then deleted the source — and the exclusion turned
+out to hold the only surviving sources for 8 game characters. The tooling did
+nothing wrong; the sync ran exactly as asked. The failure was that "probably
+rebuildable" was a judgement made in the abstract, checkable by nobody until it
+was too late. The migrating session's own repo rule now: the exclusion list is
+committed BEFORE the source is deleted. If Manifold ever grows a sync or
+migration helper, it emits the excluded-file manifest by default — making that
+failure structurally hard to repeat, rather than dependent on someone
+remembering to look at what they chose not to copy.
