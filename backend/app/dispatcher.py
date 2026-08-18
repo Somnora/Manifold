@@ -2664,12 +2664,32 @@ class Dispatcher:
         while True:
             await asyncio.sleep(self.settings.launch.adopt_poll_seconds)
             try:
-                await self.orchestrator.adopt_running_instances(startup=False)
-                self._protect_external_instances()
+                await self._adopt_tick()
             except asyncio.CancelledError:
                 raise
             except Exception:
                 logger.exception("adoption sweep iteration failed")
+
+    async def _adopt_tick(self) -> None:
+        """One sweep: reconcile first, then adopt.
+
+        Phase 101: instances_with_state() is ALSO the reconcile point -
+        it closes the launch rows of externally-terminated instances and
+        reaps their SSH supervisors. Until now it ran only when an authed
+        client polled /instances, so with no dashboard open and no agent
+        looking, a box terminated out-of-band left its row open and its
+        supervisor reconnect-looping indefinitely (observed 2026-08-18:
+        a row went unreconciled for as long as nobody polled). Riding the
+        existing adoption tick fixes that without a new poller - the
+        phase-93 lesson - and the client's list cache makes the paired
+        calls one network request.
+
+        Reconcile BEFORE adopt: close what is gone before connecting what
+        is new, so a recycled IP is forgotten before anything dials it.
+        """
+        await self.orchestrator.instances_with_state()
+        await self.orchestrator.adopt_running_instances(startup=False)
+        self._protect_external_instances()
 
     # -- capacity watch loop ----------------------------------------------------------
 
