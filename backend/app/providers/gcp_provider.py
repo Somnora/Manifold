@@ -156,6 +156,20 @@ class RealGCPProvider(GCPProvider):
         self._public_key_fn = public_key_fn
         self._warned = False
 
+    def unconfigured_reason(self) -> Optional[str]:
+        """No project id means nothing here can work, and the catalog says
+        so by being empty (list_instance_types returns [] rather than
+        guessing). Said in words instead, so a launch that resolves to GCP
+        before anyone has set it up refuses with the two steps that fix it
+        rather than with an empty list of valid instance types."""
+        if not self.project_id:
+            return ("Google Cloud is not configured yet: Manifold has no GCP "
+                    "project id, so it cannot list or launch anything there. "
+                    "Run `gcloud auth application-default login`, then add "
+                    "your project id under Settings -> Google Cloud "
+                    "Configuration.")
+        return None
+
     # -- SDK plumbing -------------------------------------------------------------
 
     def _compute(self):

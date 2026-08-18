@@ -2206,6 +2206,13 @@ class Dispatcher:
             launch = await self.orchestrator.request_launch(
                 instance_type=job["gpu_type"], region=job["region"],
                 filesystem=job["filesystem"],
+                # Named, never resolved from the account default (Phase
+                # 102). This job was queued against a LAMBDA gpu_type,
+                # region and filesystem; a default flipped after it was
+                # queued would send it to a cloud where none of those three
+                # exist, and the job would fail on an instance type its
+                # author never chose.
+                provider="lambda",
                 # Chain attribution (Phase 79): the loop launches, but the
                 # PERSON is whoever enqueued the job.
                 created_by=job.get("created_by"))
@@ -2751,6 +2758,12 @@ class Dispatcher:
                         instance_type=watch["instance_type"],
                         region=watch["region"],
                         filesystem=watch["filesystem"],
+                        # Named, never the account default (Phase 102):
+                        # this watch polls the LAMBDA catalog above, and it
+                        # fired because Lambda showed capacity. Launching
+                        # the result anywhere else would answer evidence
+                        # about one cloud by spending on another.
+                        provider="lambda",
                         # Phase 79: the watch fires, but the launch belongs
                         # to whoever set the watch.
                         created_by=watch.get("created_by"),

@@ -118,6 +118,20 @@ desktop app or a dev backend must be running). GET /health confirms it.
    platform after "idle". Wait for SSH to return before concluding
    anything.
 
+#### Which cloud?
+
+The account has a DEFAULT PROVIDER, and you do not need to know which one
+it is: leave `provider` empty on `launch_gpu` and you follow it, so the
+human can move this project from one cloud to another without telling you.
+`list_launch_options` returns targets from that same default and names the
+cloud on every row, which is why copying one of its targets always lines
+up. Pass a `provider` only when you mean to override the default for one
+launch, and then take the instance type and region from
+`list_launch_options(provider=...)` for that same cloud: types and regions
+do not carry across providers. If a response carries
+`unavailable_reason`, that cloud is not set up yet - report the sentence
+instead of reading the empty target list as "no capacity".
+
 ### Serve a model (vLLM)
 
 1. Check fit before paying the boot tax:

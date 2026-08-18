@@ -96,8 +96,11 @@ class LaunchRejected(Exception):
     reason_code labels WHICH check refused, so callers can classify the
     rejection without re-deriving the guard's math. The auto-manage lifecycle
     uses it to tell a transient refusal (concurrency: the single slot is busy,
-    wait and retry) from a permanent one (budget/validation/mode: fail the
-    job). Values: "validation" | "mode" | "concurrency" | "budget".
+    wait and retry) from a permanent one (budget/validation/mode/provider:
+    fail the job). Values: "validation" | "mode" | "concurrency" | "budget"
+    | "provider". "provider" covers a cloud that is unknown, not set up, or
+    could not be read at all - none of which a retry loop can fix, and all
+    of which carry the sentence that does.
     """
 
     def __init__(self, status_code: int, detail: str,
@@ -330,9 +333,16 @@ def validate_max_active(settings, value: float | None) -> float | None:
 def launch_options(
     instance_types: dict[str, InstanceTypeInfo],
     filesystems: list[FilesystemInfo],
+    provider: str = "lambda",
 ) -> dict:
     """Cross-reference the live catalog with the user's filesystems into a
     ranked list of launchable targets. Pure — no I/O.
+
+    `provider` names the cloud these targets belong to and is stamped on
+    every row. A target is only launchable on the cloud it came from, and
+    the account's default provider can be switched (Phase 102), so a row
+    that did not say which cloud it described was one toggle away from
+    being copied straight into a guaranteed rejection.
 
     A launch must name a (type, region, filesystem) that all line up: the type
     needs current capacity in that region, and Lambda filesystems are
@@ -368,6 +378,7 @@ def launch_options(
                 # Most-populated filesystem first, so "where my data is" wins.
                 for fs in sorted(here, key=lambda f: -f.bytes_used):
                     targets.append({
+                        "provider": provider,
                         "instance_type": name,
                         "gpu": t.gpu_description,
                         "price_usd_per_hour": price,
@@ -378,6 +389,7 @@ def launch_options(
                     })
             else:
                 targets.append({
+                    "provider": provider,
                     "instance_type": name,
                     "gpu": t.gpu_description,
                     "price_usd_per_hour": price,
@@ -476,6 +488,44 @@ class Orchestrator:
 
     # -- public API ------------------------------------------------------------
 
+    def resolve_provider(self, provider: str | None) -> str:
+        """Which cloud a launch lands on. None = the account's default.
+
+        The Phase 102 toggle lives here rather than in any client, for the
+        usual reason: a client that resolved it would be a second place
+        where "which cloud" is decided, and the two would drift. Reading
+        the preference at launch time (not at startup) is what lets one
+        flip on the Settings page reach every agent already running.
+
+        An explicit name always wins and is never overridden. A name that
+        no registered provider answers to is REFUSED here, with the list of
+        names that would work - including when it came from the stored
+        default, because a provider can be de-registered (or a config file
+        hand-edited) after the choice was made, and falling through would
+        surface as a 500 from deep inside the registry.
+        """
+        from_default = provider is None
+        if from_default:
+            stored = self.prefs.get().providers if self.prefs else None
+            provider = (stored.default_provider if stored else "") or "lambda"
+        registered = sorted(name for name, _ in self.providers.items())
+        if provider not in registered:
+            known = ", ".join(registered) or "(none)"
+            if from_default:
+                raise LaunchRejected(
+                    400,
+                    f"The account's default provider is '{provider}', which "
+                    f"this backend has not registered. Registered providers: "
+                    f"{known}. Pick one under Settings -> Default provider, "
+                    f"or name a provider on the launch itself.",
+                    reason_code="provider")
+            raise LaunchRejected(
+                400,
+                f"Unknown provider '{provider}'. Registered providers: "
+                f"{known}.",
+                reason_code="provider")
+        return provider
+
     async def request_launch(
         self,
         *,
@@ -488,7 +538,7 @@ class Orchestrator:
         idle_timeout_seconds: float | None = None,
         max_lifetime_seconds: float | None = None,
         max_active_seconds: float | None = None,
-        provider: str = 'lambda',
+        provider: str | None = None,
         created_by: str | None = None,
         purpose: str = "",
     ) -> dict:
@@ -504,9 +554,20 @@ class Orchestrator:
         (auto-manage, capacity watches, autopilot) that never saw a
         request and attribute through a chain: the job's creator, the
         watch's creator, the run's creator.
+
+        provider (Phase 102) is None for "whatever cloud this account
+        defaults to", which is what a client that never heard of the
+        toggle sends. Callers that must not move clouds under a toggle
+        name theirs; see resolve_provider. The RESOLVED name is what lands
+        on the launch row - a row saying null would leave every later
+        reader (boot poll, reconcile sweep, spend attribution) guessing.
         """
         mode = connection_mode or self.settings.default_connection_mode
         self._validate_mode(mode)
+
+        # Resolved before anything else reads it: every check below, and the
+        # row itself, must be about the cloud this launch will really use.
+        provider = self.resolve_provider(provider)
 
         # Checked before the catalog call: this refusal costs nothing, needs
         # no API, and is the more actionable message when both would apply.
@@ -518,7 +579,13 @@ class Orchestrator:
                 f"wired up). Launch without a filesystem.")
 
         cloud_provider = self.providers.get_provider(provider)
-        types = {t.name: t for t in await cloud_provider.list_instance_types()}
+        # A provider nobody has set up yet has an EMPTY catalog, and an empty
+        # catalog would refuse this launch with "Valid types: " - a dead end
+        # that reads like a bad instance type. Ask the provider why first.
+        unconfigured = cloud_provider.unconfigured_reason()
+        if unconfigured:
+            raise LaunchRejected(400, unconfigured, reason_code="provider")
+        types = {t.name: t for t in await self._catalog_of(cloud_provider)}
         if instance_type not in types:
             raise LaunchRejected(
                 400,
@@ -665,6 +732,26 @@ class Orchestrator:
         self._launch_tasks[launch_id] = asyncio.create_task(self._run_launch(plan))
         return self.db.get_launch(launch_id)
 
+    async def _catalog_of(self, cloud_provider: CloudProvider) -> list:
+        """The provider's instance types, with its own failures translated.
+
+        A provider that cannot be READ raises rather than returning an
+        empty catalog, and an exception loose on the launch path used to
+        leave POST /instances with a bare 500 - hiding a message like "run
+        `gcloud auth application-default login`" that would have fixed it
+        in one command. Re-raised as LaunchRejected so every caller (route,
+        auto-manage loop, capacity watch, autopilot) handles it the way it
+        already handles a refusal, and the provider's own sentence reaches
+        the human intact. Same status split as GET /gcp/quota: 503 for
+        "could not read it", 502 for "it answered with a problem".
+        """
+        try:
+            return await cloud_provider.list_instance_types()
+        except ProviderUnavailable as exc:
+            raise LaunchRejected(503, str(exc), reason_code="provider") from exc
+        except ProviderError as exc:
+            raise LaunchRejected(502, str(exc), reason_code="provider") from exc
+
     def _role_of(self, created_by: str | None) -> str | None:
         """The role a launch is policied under. Owner is admin by
         definition; minted principals carry their row's role; legacy
@@ -703,9 +790,37 @@ class Orchestrator:
         Returns (current_spend_cents, budget_cents) so request_launch can
         filter fallback types against the same numbers this guard used.
         Raises LaunchRejected on violation.
+
+        ONE ASYMMETRY, ON PURPOSE (Phase 102). The live half of the
+        baseline comes from the LAUNCHING provider alone - it is the only
+        provider we are about to spend money on, and asking every
+        registered provider would let one unreadable cloud veto a launch on
+        a working one. The pending half (rows admitted but not yet visible)
+        is account-wide, because a pending row is Manifold's own commitment
+        to spend and it counts wherever it was made. So a running Lambda
+        box does not hold the concurrency slot against a GCP launch, while
+        a Lambda launch admitted seconds ago does. Under the default
+        limit of one instance that is deliberately the safer direction to
+        err in - both halves count something real, and neither invents a
+        number for a cloud it could not read. Pinned in
+        tests/test_provider_toggle.py.
         """
-        running = [i for i in await cloud_provider.list_instances(fresh=True)
-                   if i.is_running]
+        try:
+            listed = await cloud_provider.list_instances(fresh=True)
+        except ProviderUnavailable as exc:
+            # A guard that cannot see what is running must not guess zero:
+            # that is the one wrong answer that spends money. Refused with
+            # the provider's own fix, same translation as _catalog_of.
+            raise LaunchRejected(
+                503,
+                f"Cannot check what is already running before launching: "
+                f"{exc}", reason_code="provider") from exc
+        except ProviderError as exc:
+            raise LaunchRejected(
+                502,
+                f"Cannot check what is already running before launching: "
+                f"{exc}", reason_code="provider") from exc
+        running = [i for i in listed if i.is_running]
         pending = self.db.pending_launch_count()
         in_flight = len(running) + pending
         # The NUMBERS come from Settings when the user set them there
@@ -836,7 +951,14 @@ class Orchestrator:
 
         created_by (Phase 81; missed in 79's threading): the whole cluster
         is attributed to one principal, judged atomically against their
-        ceiling here and stamped on every node's launch row below."""
+        ceiling here and stamped on every node's launch row below.
+
+        provider stays EXPLICITLY 'lambda' by default and is passed down to
+        every node's request_launch, so a cluster never resolves the Phase
+        102 account default. A cluster is one interconnected unit: nodes
+        split across two clouds could not reach each other, and today only
+        the Lambda path is proven multi-node. Changing this means designing
+        cross-provider clusters first, not flipping a default."""
         if node_count < 1:
             raise LaunchRejected(400, "Cluster must have at least 1 node.")
         if node_count > 16:

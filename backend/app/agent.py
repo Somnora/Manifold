@@ -598,6 +598,13 @@ class Autopilot:
             instance_type=str(args["instance_type"]),
             region=str(args["region"]),
             filesystem=str(args["filesystem"]),
+            # Named, never the account default (Phase 102). The brain picks
+            # an instance type from list_instance_types, which reads the
+            # LAMBDA catalog; resolving the provider from a toggle would
+            # send its choice to a cloud whose catalog it never saw. An
+            # autopilot run that should use another cloud is a change to
+            # this action's arguments, not a setting that moves under it.
+            provider="lambda",
             created_by=current_principal(),   # the run starter (see _run_loop)
         )
         return {"launch": {k: launch[k] for k in ("id", "status")}}

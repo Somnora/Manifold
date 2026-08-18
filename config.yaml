@@ -209,6 +209,19 @@ preferences:
     # protecting the wallet. 0 = no budget set.
     monthly_budget_usd: 0.0
 
+  providers:
+    # Which cloud a launch lands on when the caller does not name one.
+    # Agents, the MCP bridge and the launch form all follow it, so moving a
+    # project to another cloud (Lambda credits running low, say) is one
+    # choice here instead of a change of habit for every agent.
+    #
+    # A launch that DOES name a provider always wins, and the background
+    # loops (auto-manage, capacity watches, autopilot) always name one: a
+    # job already queued for a Lambda GPU must not change clouds under a
+    # toggle. Change it on the Settings page, which validates the name
+    # against the providers this backend actually registered.
+    default_provider: lambda
+
 hub:
   # The local half of Manifold: brains on this machine and frontier APIs.
   # Local model servers probed for brains (appear automatically when up).

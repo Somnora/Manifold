@@ -660,6 +660,11 @@ export type Preferences = {
     // A cumulative monthly wallet. Reported, never enforced. 0 = unset.
     monthly_budget_usd: number;
   };
+  // Which cloud a launch that names no provider lands on. Agents and the
+  // MCP bridge follow it, so one choice here moves the whole project.
+  providers: {
+    default_provider: string;
+  };
   // Mirror every worklog entry into this folder (Obsidian vault, repo).
   worklog: {
     mirror_dir: string;
@@ -677,6 +682,7 @@ export type PreferencesPatch = {
   notifications?: Partial<Record<NotificationKind | "desktop", boolean>>;
   data_safety?: Partial<Preferences["data_safety"]>;
   guardrails?: Partial<Preferences["guardrails"]>;
+  providers?: Partial<Preferences["providers"]>;
   worklog?: Partial<Preferences["worklog"]>;
   onboarding?: Partial<Preferences["onboarding"]>;
 };
@@ -1107,6 +1113,10 @@ export const api = {
       preferences: Preferences;
       gateable_actions: GateableAction[];
       notification_kinds: NotificationKind[];
+      // The clouds this backend registered: the legal values for
+      // providers.default_provider, so the control never offers one the
+      // launch path would refuse.
+      registered_providers: string[];
       guardrail_defaults: {
         max_concurrent_instances: number;
         max_hourly_spend_usd: number;

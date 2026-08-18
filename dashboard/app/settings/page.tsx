@@ -5,6 +5,7 @@ import { api, ApiError } from "@/lib/api";
 import { usePolling } from "@/lib/usePolling";
 import { Badge } from "@/components/Badge";
 import { ConnectAgentPanel } from "@/components/ConnectAgentPanel";
+import { DefaultProviderPanel } from "@/components/DefaultProviderPanel";
 import { PolicyCard } from "@/components/PolicyCard";
 import { PolicySettings } from "@/components/PolicySettings";
 import { PrincipalsPanel } from "@/components/PrincipalsPanel";
@@ -127,6 +128,12 @@ export default function SettingsPage() {
 
       <div className="space-y-6">
         <GcpConfigForm onSaved={refresh} />
+        {/* Right under the two clouds' credential forms: the choice of
+            which one a launch defaults to only makes sense beside them. */}
+        <DefaultProviderPanel
+          lambdaConfigured={status?.lambda_configured}
+          gcpConfigured={status?.gcp_configured}
+        />
         <ConnectAgentPanel envPath={status?.env_path} />
         <PolicyCard />
         <section className="rounded-lg border border-zinc-200 bg-white p-4 text-sm text-zinc-600">

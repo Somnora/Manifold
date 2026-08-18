@@ -43,6 +43,7 @@ export function PolicySettings() {
       notifications: { ...prefs.notifications, ...patch.notifications },
       data_safety: { ...prefs.data_safety, ...patch.data_safety },
       guardrails: { ...prefs.guardrails, ...patch.guardrails },
+      providers: { ...prefs.providers, ...patch.providers },
       worklog: { ...prefs.worklog, ...patch.worklog },
       // Every section of Preferences must be spread here. TypeScript enforces
       // it, which is the frontend half of the guard that stops a new section

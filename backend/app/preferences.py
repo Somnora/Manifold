@@ -175,6 +175,30 @@ class GuardrailPrefs:
 
 
 @dataclass(frozen=True)
+class ProviderPrefs:
+    """Which cloud a launch lands on when the caller does not name one.
+
+    The account's answer to "which cloud is this project on", in ONE place.
+    Every client that omits a provider (the MCP bridge, an agent, the launch
+    form on first paint) follows it, so switching clouds when Lambda credits
+    run low is one toggle here instead of an edit to every agent's habits.
+
+    Deliberately NOT validated in this module: a legal value is a provider
+    the running backend actually registered, and preferences.py has no
+    registry. The PUT /preferences route checks the name against
+    orchestrator.providers and refuses an unknown one with the list of
+    registered names; the orchestrator checks again at launch time, because
+    a provider can be de-registered after the choice was stored.
+
+    An explicit provider on the request always wins - this is the default,
+    not a policy. The background loops (auto-manage, capacity watches,
+    autopilot) name their provider explicitly for exactly that reason: a
+    job queued for a Lambda GPU must not change clouds under a toggle.
+    """
+    default_provider: str = "lambda"
+
+
+@dataclass(frozen=True)
 class WorklogPrefs:
     """Where the worklog is mirrored, beyond the always-on copy in the data
     dir. Point mirror_dir at an Obsidian vault or a repo and every agent
@@ -200,6 +224,7 @@ class Preferences:
     notifications: NotificationPrefs = NotificationPrefs()
     data_safety: DataSafetyPrefs = DataSafetyPrefs()
     guardrails: GuardrailPrefs = GuardrailPrefs()
+    providers: ProviderPrefs = ProviderPrefs()
     worklog: WorklogPrefs = WorklogPrefs()
     onboarding: OnboardingPrefs = OnboardingPrefs()
 
@@ -265,6 +290,7 @@ def preferences_from_dict(base: Preferences, raw: dict) -> Preferences:
         notifications=_coerce(base.notifications, raw.get("notifications", {})),
         data_safety=_coerce(base.data_safety, raw.get("data_safety", {})),
         guardrails=_coerce(base.guardrails, raw.get("guardrails", {})),
+        providers=_coerce(base.providers, raw.get("providers", {})),
         worklog=_coerce(base.worklog, raw.get("worklog", {})),
         onboarding=_coerce(base.onboarding, raw.get("onboarding", {})),
     )

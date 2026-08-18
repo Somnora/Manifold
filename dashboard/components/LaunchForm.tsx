@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   api,
   ApiError,
@@ -45,6 +45,11 @@ export function LaunchForm({ onLaunched }: { onLaunched: () => void }) {
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState("");
   const [provider, setProvider] = useState("lambda");
+  // Whether a human has picked a provider on this form. A click always
+  // wins: the account default below only SEEDS the tab, and it arrives
+  // asynchronously, so without this a preference landing a moment after
+  // the click would silently move the launch to another cloud.
+  const providerPicked = useRef(false);
   const [gcpQuota, setGcpQuota] = useState<{
     quotas: { metric: string; limit: number; usage: number; scope: string }[];
     request_url: string;
@@ -76,6 +81,29 @@ export function LaunchForm({ onLaunched }: { onLaunched: () => void }) {
       })
       .catch((e) => setLoadError(e.message));
   }, [provider]);
+
+  // The tab opens on the account's default provider (Settings -> Default
+  // provider), so the form agrees with what an agent launching right now
+  // would get. The form always SENDS the provider explicitly, so what is
+  // on screen is what launches, whatever the default does later.
+  useEffect(() => {
+    let cancelled = false;
+    api
+      .preferences()
+      .then((r) => {
+        const preferred = r.preferences.providers.default_provider;
+        if (cancelled || providerPicked.current || !preferred) return;
+        setProvider(preferred);
+      })
+      .catch(() => {
+        // A preferences read that fails leaves the tab where it is. The
+        // launch still carries whatever the tab shows, so nothing is
+        // silently redirected.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   // The GCP quota read is separate from the catalog load: it can be slow or
   // 503 (no ADC yet) without taking the form down, and it only matters
@@ -207,14 +235,20 @@ export function LaunchForm({ onLaunched }: { onLaunched: () => void }) {
           <button
             type="button"
             className={`px-3 py-1 text-xs font-medium rounded-sm ${provider === "lambda" ? "bg-white shadow-sm text-zinc-900" : "text-zinc-500 hover:text-zinc-700"}`}
-            onClick={() => setProvider("lambda")}
+            onClick={() => {
+              providerPicked.current = true;
+              setProvider("lambda");
+            }}
           >
             Lambda AI
           </button>
           <button
             type="button"
             className={`px-3 py-1 text-xs font-medium rounded-sm ${provider === "gcp" ? "bg-white shadow-sm text-zinc-900" : "text-zinc-500 hover:text-zinc-700"}`}
-            onClick={() => setProvider("gcp")}
+            onClick={() => {
+              providerPicked.current = true;
+              setProvider("gcp");
+            }}
           >
             Google Cloud
           </button>

@@ -158,6 +158,9 @@ def test_a_negative_budget_is_clamped_not_honoured():
     ("notifications", "job_failed", False),
     ("data_safety", "scope", "outputs"),
     ("guardrails", "monthly_budget_usd", 42.0),
+    # A registered provider name, because the route refuses one it does not
+    # know (see tests/test_provider_toggle.py).
+    ("providers", "default_provider", "gcp"),
     ("worklog", "mirror_dir", "/tmp/manifold-worklog"),
     ("onboarding", "completed", True),
 ])

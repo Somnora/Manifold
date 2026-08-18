@@ -86,6 +86,21 @@ class CloudInstanceInfo(BaseModel):
         return self.status in ("booting", "active", "unhealthy")
 
 class CloudProvider(ABC):
+    def unconfigured_reason(self) -> Optional[str]:
+        """Why this provider cannot launch anything yet, in the words that
+        fix it - or None when it is ready to be used.
+
+        Not abstract, and None by default: a provider that needs no local
+        setup inherits it and says nothing. It exists because an
+        unconfigured provider's catalog is legitimately EMPTY, and an empty
+        catalog turns "you have not set up Google Cloud yet" into "Unknown
+        instance type 'g2-standard-4'. Valid types: " - a message that
+        sends the reader looking for a typo that is not there. The launch
+        path asks this BEFORE it reads a catalog, so the refusal names the
+        real reason and the command that clears it.
+        """
+        return None
+
     @abstractmethod
     async def list_instance_types(self) -> List[CloudInstanceTypeSpec]:
         pass
