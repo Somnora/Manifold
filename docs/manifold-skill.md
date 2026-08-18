@@ -111,6 +111,12 @@ desktop app or a dev backend must be running). GET /health confirms it.
 3. `wait_for_launch` with the returned launch id. One blocking call; do
    not poll in a loop. Boots take 2 to 10 minutes for PCIe cards and
    15 to 40 minutes for SXM/multi-GPU boxes. That is Lambda, not a hang.
+4. Know that a box can legitimately GO AWAY AND COME BACK mid-setup: a
+   driver upgrade reboots the instance, SSH drops, and both return on
+   their own. A sequence that does not expect this will read a normal
+   reboot as a dead box - the second most expensive misread on this
+   platform after "idle". Wait for SSH to return before concluding
+   anything.
 
 ### Serve a model (vLLM)
 
