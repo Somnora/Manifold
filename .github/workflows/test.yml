@@ -22,6 +22,13 @@ on:
 jobs:
   backend:
     runs-on: ubuntu-latest
+    # Every job here finishes in minutes when healthy. Without a ceiling, a
+    # wedged step runs until GitHub's 6-hour kill: the modal job's browser
+    # install hung twice on 2026-08-18, and the second hang held a release
+    # commit's run open for exactly 6h00m before the platform cancelled it.
+    # These limits are ~3x the observed worst case, so they only ever fire
+    # on a wedge - and then within minutes, not hours.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
@@ -36,6 +43,7 @@ jobs:
 
   dashboard:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -67,6 +75,9 @@ jobs:
   # repo's CI red for three weeks. This job must not put that at risk.
   modal:
     runs-on: ubuntu-latest
+    # Normal runtime is 4-6 minutes; the browser-install step is the one
+    # that wedges (see the note on `backend`).
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
