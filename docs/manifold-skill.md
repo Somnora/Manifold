@@ -219,6 +219,26 @@ safety system working. Read the reply, fix what it says (usually
 `sync_outputs`), and retry. Use force=true only when the user explicitly
 accepts losing the listed files.
 
+## Research keys: one vault, every agent
+
+Third-party research API keys (YouTube, X, congress.gov, whatever the
+user's pipelines call) live in one audited vault behind the backend, not
+in per-agent dotfiles.
+
+1. Need a key? `list_research_keys` first: names, presence, length,
+   never values. Then `get_research_key(name, purpose)` for the one you
+   need; purpose is required and lands in the audit log.
+2. Given a key by the user? `set_research_key(name, value)` so the next
+   agent (any CLI, any model) inherits it instead of asking again.
+   Names are lowercase snake_case: `congress_gov`, not `Congress-GOV`.
+3. Handle fetched values like the secrets they are: use them, never
+   re-print them. Not into chat, not into files or code, not onto a
+   command line that gets logged; pass them to subprocesses as
+   environment variables.
+4. The vault holds RESEARCH keys only. Manifold's own credentials and
+   LLM provider keys have their own homes and are structurally
+   unreachable through these tools; asking for them is a 404.
+
 ## Habits of a good Manifold agent
 
 - Start with `get_work_log`: it lists what previous sessions (yours,
@@ -231,6 +251,9 @@ accepts losing the listed files.
   bridge process died (backend restarts do NOT cause this - the bridge
   reports "backend unreachable" instead). Ask the user to reconnect the
   server (/mcp in Claude Code) or restart the client.
+- Before hunting dotfiles or asking the user for an API key, check
+  `list_research_keys`; before letting a key die with your session,
+  deposit it with `set_research_key`.
 - Prefer `wait_for_launch` and job status over sleep-and-poll loops.
 - Check `get_job_logs` before concluding anything about a failure; exit
   codes and the last 50 log lines usually name the real cause.

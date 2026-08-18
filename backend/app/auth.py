@@ -210,6 +210,12 @@ ROUTE_ROLES: dict[tuple[str, str], str] = {
     ("POST", "/instances/{instance_id}/endpoints"): "operator",
     ("GET", "/instances/{instance_id}/endpoints"): "viewer",
     ("DELETE", "/instances/{instance_id}/endpoints/{port}"): "operator",
+    # Research keys (Phase 100). Listing is presence/length only, so
+    # viewer; anything that writes or REVEALS a value is operator.
+    ("GET", "/research-keys"): "viewer",
+    ("PUT", "/research-keys/{name}"): "operator",
+    ("POST", "/research-keys/{name}/value"): "operator",
+    ("DELETE", "/research-keys/{name}"): "operator",
     ("GET", "/instances/{instance_id}/detached/{handle}"): "viewer",
     ("GET", "/instances/{instance_id}/detached"): "viewer",
     ("POST", "/instances/{instance_id}/chat"): "operator",

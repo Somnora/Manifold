@@ -107,6 +107,10 @@ def client(settings, mock_client, mock_storage, mock_sidecar, mock_model,
         notification_sender=lambda title, body: os_pings.append((title, body)),
         # Keep custom-template writes inside the test sandbox, never the repo.
         custom_templates_dir=tmp_path_factory_dir(settings),
+        # Research-key vault beside the test DB, never the repo or the
+        # developer's real data dir.
+        research_keys_path=__import__("pathlib").Path(
+            settings.db_path).parent / "research-keys.env",
     )
     with TestClient(app) as test_client:
         yield test_client

@@ -522,6 +522,69 @@ async def deregister_endpoint(instance_id: str, port: int,
 
 
 @mcp.tool()
+async def list_research_keys(note: str = "") -> dict:
+    """The shared research-key vault: names, presence, and length of the
+    third-party API keys the user has deposited (YouTube, X, congress.gov,
+    and so on). NEVER values - fetch one with get_research_key.
+
+    Check here BEFORE hunting dotfiles or asking the user for a key: on
+    this account the vault is the one place research keys live, so every
+    agent inherits them the moment it connects."""
+    return await _call("list_research_keys", "GET", "/research-keys",
+                       note=note)
+
+
+@mcp.tool()
+async def get_research_key(name: str, purpose: str, note: str = "") -> dict:
+    """Fetch ONE research-key value from the vault. `purpose` is required
+    and lands in the audit log with your identity - say what the key is
+    about to be used for.
+
+    HANDLE THE VALUE LIKE THE SECRET IT IS: use it, never re-print it.
+    Do not echo it into chat, write it into files or code, or put it on a
+    command line that gets logged - pass it to subprocesses via an
+    environment variable. It will exist in your context; that is the
+    accepted cost of the handout model, and it is the only place it
+    should exist.
+
+    This tool can only return keys the user deposited in the research
+    vault. Manifold's own credentials (the Lambda key, its API token)
+    live in a different file this tool structurally cannot read - asking
+    for them is a 404, so do not try."""
+    if not purpose.strip():
+        return {"error": "purpose is required: say what this key is for. "
+                         "It lands in the audit log the user reviews."}
+    return await _call(
+        "get_research_key", "POST", f"/research-keys/{name}/value",
+        note=note, args={"name": name, "purpose": purpose},
+        body={"purpose": purpose},
+    )
+
+
+@mcp.tool()
+async def set_research_key(name: str, value: str, purpose: str = "",
+                           note: str = "") -> dict:
+    """Deposit or rotate a research key in the shared vault, so the next
+    agent (any CLI, any model) finds it instead of asking the user again.
+    Names are lowercase snake_case ("congress_gov", "youtube"). Rotating
+    is just setting the same name again; provenance is recorded.
+
+    Deposit keys the USER gave you for research APIs. Do not deposit
+    Manifold's own credentials or LLM provider keys - those have their
+    own homes. There is deliberately no delete tool: agents rotate by
+    overwriting, and removal is a human action in Settings."""
+    return await _call(
+        "set_research_key", "PUT", f"/research-keys/{name}",
+        note=note,
+        # The value is REDACTED from the audit args by construction; only
+        # the request body carries it. An audit row is forever.
+        args={"name": name, "value": f"<redacted, {len(value)} chars>",
+              "purpose": purpose},
+        body={"value": value, "note": purpose},
+    )
+
+
+@mcp.tool()
 async def set_keep_alive(
     instance_id: str, enabled: bool, note: str = ""
 ) -> dict:

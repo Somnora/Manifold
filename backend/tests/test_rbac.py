@@ -31,6 +31,7 @@ def auth_app(tmp_path, mock_client, mock_storage, mock_sidecar):
         connect_fn=mock_connect_fn,
         sidecar_factory=lambda conn: mock_sidecar,
         env_path=tmp_path / ".env",
+        research_keys_path=tmp_path / "research-keys.env",
     )
 
 

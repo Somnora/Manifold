@@ -203,6 +203,7 @@ registration commands and the live last-call status.
 | `run_command(instance_id, command, timeout=45)` | ONE shell command, capped at 50s, audited with its exit code |
 | `run_detached(instance_id, command, purpose)` / `detached_status(id, handle)` | Long work that outlives the call (and backend restarts); a running detached pid counts as activity, so the box protects itself from the idle sweep |
 | `register_endpoint(instance_id, port, model_id)` / `deregister_endpoint(...)` | Adopt a hand-started model server into the OpenAI proxy: routed, listed, and its traffic counts as activity |
+| `list_research_keys()` / `get_research_key(name, purpose)` / `set_research_key(name, value)` | The shared research-key vault: list is presence/length only, fetches are audited with a required purpose, deposits make a key every agent's key |
 | `set_keep_alive(instance_id, enabled)` | Switch idle auto-termination off for one box (for long CPU/IO work started outside Manifold); the max-lifetime ceiling still applies |
 | `get_spend_breakdown(by)` | Spend by `created_by`, `purpose`, type, region — "what did MY project cost" on a shared account |
 | `save_template(yaml_text)` / `delete_template(name)` | Author a custom job template (see docs/custom-templates.md) |
