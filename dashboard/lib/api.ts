@@ -293,6 +293,11 @@ export type LaunchRequest = {
   instance_type: string;
   region: string;
   filesystem: string;
+  // More filesystems to mount beside the primary one, for a run that reads
+  // one dataset and writes another. Attach-only: jobs still mount the
+  // primary, extras are reached at /lambda/nfs/<name>. Same region as the
+  // launch, max 4; the backend enforces both.
+  extra_filesystems?: string[];
   connection_mode: string;
   ssh_key_name?: string;
   name?: string;

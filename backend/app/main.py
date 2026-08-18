@@ -242,6 +242,13 @@ class LaunchRequest(BaseModel):
     instance_type: str
     region: str
     filesystem: str
+    # Phase 103: more filesystems to MOUNT beside the primary one, for a run
+    # that reads one dataset and writes another. Attach-only: jobs still mount
+    # the primary, and extras are reached by absolute /lambda/nfs/<name> path
+    # from commands, the file routes and a shell. The orchestrator owns every
+    # rule about them (cap, duplicates, region lock) so background callers hit
+    # the same wall this one does.
+    extra_filesystems: list[str] = Field(default_factory=list)
     connection_mode: str | None = None
     ssh_key_name: str | None = None    # falls back to ssh.key_name in config.yaml
     name: str = Field(default="", max_length=64)
@@ -1500,6 +1507,7 @@ def create_app(
             instance_type=req.instance_type,
             region=req.region,
             filesystem=req.filesystem,
+            extra_filesystems=req.extra_filesystems,
             connection_mode=req.connection_mode,
             ssh_key_name=req.ssh_key_name,
             name=req.name,

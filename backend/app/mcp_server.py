@@ -303,6 +303,7 @@ async def launch_gpu(
     max_lifetime_seconds: float | None = None,
     max_active_seconds: float | None = None,
     provider: str = "",
+    extra_filesystems: list[str] | None = None,
     note: str = "",
 ) -> dict:
     """Launch a GPU instance. Flows through ALL backend guards (budget,
@@ -338,6 +339,15 @@ async def launch_gpu(
     ceiling remains the outer bound and either firing terminates through
     the same save-files-first flow.
 
+    `extra_filesystems` mounts MORE filesystems next to `filesystem`, for a
+    run that reads one dataset and writes another. It is attach-only: template
+    jobs mount the PRIMARY filesystem, and extras are for your own commands
+    and file access - reach them by absolute path, /lambda/nfs/<name>, from
+    run_command, run_detached, browse_files and upload_file. Every name must
+    exist and live in the launch region (they are region-locked), and the cap
+    is 4 beyond the primary. Filesystems attach only at launch, so a name you
+    leave out here cannot be added later without relaunching.
+
     `purpose` is REQUIRED: a short phrase saying what this box is for, e.g.
     "Tally extraction+evaluation run" or "Red Hope mesh cleanup batch". You
     are probably not the only agent on this account, and purpose is what
@@ -355,11 +365,13 @@ async def launch_gpu(
         return {"error": "purpose is required: say what this box is for "
                          "(other agents decide whether to leave it alone "
                          "based on it)"}
-    body = {
+    body: dict = {
         "instance_type": instance_type,
         "region": region,
         "filesystem": filesystem,
     }
+    if extra_filesystems:
+        body["extra_filesystems"] = extra_filesystems
     if purpose:
         body["purpose"] = purpose
     if name:

@@ -32,7 +32,7 @@ import contextlib
 import logging
 import uuid
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Awaitable, Callable
@@ -82,6 +82,12 @@ BOOT_ABORT_STATUSES = ("terminated", "terminating", "preempted", "unhealthy")
 # 'unhealthy' is deliberately absent: an unhealthy instance is still running
 # and still billing, and calling that a stop would under-report the cost.
 OBSERVED_STOP_STATUSES = ("terminated", "terminating", "preempted")
+
+# Phase 103: how many filesystems may be attached BEYOND the primary one.
+# Lambda does not publish its own attach limit, so this is Manifold's cap,
+# not theirs - a number we can state in a refusal instead of letting a
+# launch fail minutes later at the API with something opaque.
+MAX_EXTRA_FILESYSTEMS = 4
 
 # Sidecar-free GPU sampling (gpu_metrics_via_ssh): one CSV line per GPU.
 NVIDIA_SMI_METRICS = (
@@ -174,6 +180,10 @@ class LaunchPlan:
     prices: dict[str, int]           # cents/hour per candidate type
     name: str
     provider: str = "lambda"
+    # Phase 103: filesystems mounted BESIDE `filesystem`, already validated
+    # (they exist, they are in `region`, no duplicates). Only the provider
+    # call reads them; every other step still means the primary.
+    extra_filesystems: list[str] = field(default_factory=list)
 
 
 # A launch a poller can stop watching: nothing further will change on its own.
@@ -541,6 +551,7 @@ class Orchestrator:
         provider: str | None = None,
         created_by: str | None = None,
         purpose: str = "",
+        extra_filesystems: list[str] | None = None,
     ) -> dict:
         """Validate and admit a launch; returns the persisted launch row.
 
@@ -561,7 +572,16 @@ class Orchestrator:
         name theirs; see resolve_provider. The RESOLVED name is what lands
         on the launch row - a row saying null would leave every later
         reader (boot poll, reconcile sweep, spend attribution) guessing.
+
+        extra_filesystems (Phase 103) are MOUNTED alongside `filesystem`,
+        nothing more: the box gets /lambda/nfs/<name> for each, reachable
+        from run_command, detached commands, the file routes and a shell.
+        `filesystem` remains THE primary - template mounts ({persistent}),
+        sync_outputs and relative file paths all resolve against it - so an
+        extra is a place to read from and write to by absolute path, not a
+        second persistent home.
         """
+        extra_filesystems = list(extra_filesystems or [])
         mode = connection_mode or self.settings.default_connection_mode
         self._validate_mode(mode)
 
@@ -571,12 +591,54 @@ class Orchestrator:
 
         # Checked before the catalog call: this refusal costs nothing, needs
         # no API, and is the more actionable message when both would apply.
-        if filesystem and provider != 'lambda':
+        # Extras land in the same refusal (Phase 103): they are the same
+        # Lambda-only feature, and enforcing here rather than in a client
+        # means every caller - dashboard, MCP, autopilot - hits one wall.
+        if (filesystem or extra_filesystems) and provider != 'lambda':
             raise LaunchRejected(
                 400,
                 f"{provider} launches are scratch-only for now: persistent "
                 f"filesystems are a Lambda feature (GCP Filestore is not "
-                f"wired up). Launch without a filesystem.")
+                f"wired up). Launch without a filesystem "
+                f"(extra_filesystems included).")
+
+        # Extras attach ALONGSIDE a primary; they never stand in for one.
+        # Admitting extras onto a scratch-only box would produce an instance
+        # whose {persistent} mounts, sync and relative paths still have
+        # nowhere to go while /lambda/nfs held real data - an incoherent
+        # state nobody asked for. Refuse and say which name to promote.
+        if extra_filesystems and not filesystem:
+            raise LaunchRejected(
+                422,
+                f"extra_filesystems needs a primary filesystem: this launch "
+                f"asks for {', '.join(extra_filesystems)} with none chosen. "
+                f"Jobs, sync and relative paths all resolve against the "
+                f"primary, so pass one of them as `filesystem` and keep the "
+                f"rest as extras.")
+
+        if len(extra_filesystems) > MAX_EXTRA_FILESYSTEMS:
+            raise LaunchRejected(
+                422,
+                f"Too many extra filesystems: {len(extra_filesystems)} asked "
+                f"for, and Manifold attaches at most "
+                f"{MAX_EXTRA_FILESYSTEMS} beyond the primary one. Attach the "
+                f"ones this run reads and writes; the rest stay unmounted.")
+
+        seen = [filesystem] if filesystem else []
+        for extra in extra_filesystems:
+            if not extra.strip():
+                raise LaunchRejected(
+                    422,
+                    "extra_filesystems contains an empty name. Drop the "
+                    "entry rather than sending a blank one - a blank is not "
+                    "'no filesystem', it is a name we cannot look up.")
+            if extra in seen:
+                raise LaunchRejected(
+                    422,
+                    f"Filesystem '{extra}' is listed twice. Lambda mounts "
+                    f"each filesystem once at /lambda/nfs/{extra}; name it "
+                    f"once (as the primary or as an extra, not both).")
+            seen.append(extra)
 
         cloud_provider = self.providers.get_provider(provider)
         # A provider nobody has set up yet has an EMPTY catalog, and an empty
@@ -637,6 +699,32 @@ class Orchestrator:
                     f"at launch. Launch in {fs.region} instead, or launch "
                     f"without a filesystem (scratch only).",
                 )
+            # Every extra passes the SAME two checks as the primary, one
+            # name at a time, and the refusal names WHICH one failed: with
+            # several filesystems in the request, "region mismatch" without
+            # the offender is a puzzle rather than a fix.
+            for extra in extra_filesystems:
+                if extra not in filesystems:
+                    raise LaunchRejected(
+                        400,
+                        f"Unknown filesystem '{extra}' in extra_filesystems. "
+                        f"Available: "
+                        f"{', '.join(sorted(filesystems)) or '(none)'}"
+                        f" - or drop it and launch with '{filesystem}' "
+                        f"alone.",
+                    )
+                extra_fs = filesystems[extra]
+                if extra_fs.region != region:
+                    raise LaunchRejected(
+                        400,
+                        f"Region mismatch: extra filesystem '{extra}' lives "
+                        f"in {extra_fs.region} but the launch requests "
+                        f"{region}. Lambda filesystems are region-locked and "
+                        f"can only be attached at launch, so a filesystem "
+                        f"from another region cannot be mounted here at all. "
+                        f"Drop '{extra}', or launch in {extra_fs.region} if "
+                        f"that is where the data lives.",
+                    )
 
         # SSH key: per-launch choice wins, config.yaml is the fallback. The
         # name must be registered with Lambda or the launch call would fail
@@ -717,6 +805,7 @@ class Orchestrator:
             provider=provider,
             created_by=created_by,
             purpose=purpose,
+            extra_filesystems=extra_filesystems,
         )
         plan = LaunchPlan(
             launch_id=launch_id,
@@ -728,6 +817,7 @@ class Orchestrator:
             prices={t: types[t].price_cents_per_hour for t in candidates},
             name=name or f"manifold-{launch_id}",
             provider=provider,
+            extra_filesystems=extra_filesystems,
         )
         self._launch_tasks[launch_id] = asyncio.create_task(self._run_launch(plan))
         return self.db.get_launch(launch_id)
@@ -1868,8 +1958,13 @@ class Orchestrator:
                         instance_type=candidate,
                         region=plan.region,
                         ssh_key_names=[plan.ssh_key_name],
+                        # Primary first, then the extras (Phase 103). The
+                        # provider API has always taken a list; validation
+                        # guarantees extras only exist with a primary, so a
+                        # scratch launch still sends [].
                         filesystem_names=(
-                            [plan.filesystem] if plan.filesystem else []),
+                            [plan.filesystem, *plan.extra_filesystems]
+                            if plan.filesystem else []),
                         name=plan.name,
                         user_data=build_user_data(
                             # Only a tailscale-mode launch carries the key.

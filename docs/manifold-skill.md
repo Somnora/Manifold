@@ -107,7 +107,11 @@ desktop app or a dev backend must be running). GET /health confirms it.
 2. `launch_gpu` with a target copied from that list, a `purpose`
    (required - say what the box is for), and optionally a `name` (the
    label humans see) and a ceiling sized to the run (`max_active_seconds`
-   - boot does not spend it).
+   - boot does not spend it). If the run needs data from a second
+   filesystem, pass it in `extra_filesystems` (same region, up to 4): it
+   gets mounted at /lambda/nfs/<name> for your commands and file access,
+   while jobs keep using the primary `filesystem`. Filesystems attach only
+   at launch, so a name left out here means relaunching.
 3. `wait_for_launch` with the returned launch id. One blocking call; do
    not poll in a loop. Boots take 2 to 10 minutes for PCIe cards and
    15 to 40 minutes for SXM/multi-GPU boxes. That is Lambda, not a hang.

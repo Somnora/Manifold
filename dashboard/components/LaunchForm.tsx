@@ -21,12 +21,20 @@ import { HardwareGuide } from "@/components/HardwareGuide";
 //      with capacity. Everything on a scratch-only instance dies with it,
 //      so the form says so in amber before the click, and the data-safety
 //      rescue is the only net (download-to-this-machine, Settings).
+//      A launch may ALSO attach extra filesystems from the same region.
+//      That stays deliberately subordinate: one filesystem is the common
+//      case, and the extras row only appears once a primary is chosen.
 // The form only collects input; every rule (region match, budget,
 // concurrency) is still enforced by the backend and its rejection shown
 // verbatim.
 
 // Sentinel for "launch without a filesystem" ("" = nothing chosen yet).
 const SCRATCH_ONLY = "__scratch_only__";
+
+// How many filesystems may ride along beside the primary. The backend owns
+// the real cap and refuses past it; this only keeps the form from offering
+// a fifth pick that would be rejected on submit.
+const MAX_EXTRA_FILESYSTEMS = 4;
 
 export function LaunchForm({ onLaunched }: { onLaunched: () => void }) {
   const [types, setTypes] = useState<Record<string, InstanceTypeInfo>>({});
@@ -36,6 +44,7 @@ export function LaunchForm({ onLaunched }: { onLaunched: () => void }) {
   const [instanceType, setInstanceType] = useState("");
   const [region, setRegion] = useState("");
   const [filesystem, setFilesystem] = useState("");
+  const [extraFilesystems, setExtraFilesystems] = useState<string[]>([]);
   const [sshKey, setSshKey] = useState("");
   const [mode, setMode] = useState("direct-ssh");
   const [idleTimeout, setIdleTimeout] = useState("");
@@ -182,6 +191,26 @@ export function LaunchForm({ onLaunched }: { onLaunched: () => void }) {
     setFilesystem(filesystemsInRegion[0]?.name ?? SCRATCH_ONLY);
   }, [region, filesystemsInRegion]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // Extras are region-locked too, and an extra can never be the primary.
+  // Whenever either changes, drop the ones that no longer make sense rather
+  // than sending a name the backend will refuse.
+  useEffect(() => {
+    setExtraFilesystems((current) =>
+      current.filter(
+        (n) =>
+          n !== filesystem && filesystemsInRegion.some((f) => f.name === n),
+      ),
+    );
+  }, [filesystem, filesystemsInRegion]);
+
+  const attachableFilesystems = useMemo(
+    () =>
+      filesystemsInRegion.filter(
+        (f) => f.name !== filesystem && !extraFilesystems.includes(f.name),
+      ),
+    [filesystemsInRegion, filesystem, extraFilesystems],
+  );
+
   const outOfCapacity =
     !!selectedType && selectedType.regions_with_capacity.length === 0;
   const scratchOnly = filesystem === SCRATCH_ONLY;
@@ -198,6 +227,12 @@ export function LaunchForm({ onLaunched }: { onLaunched: () => void }) {
         instance_type: instanceType,
         region,
         filesystem: scratchOnly ? "" : filesystem,
+        // Extras only travel with a primary; the backend refuses them
+        // without one, so the form never sends that combination.
+        extra_filesystems:
+          scratchOnly || extraFilesystems.length === 0
+            ? undefined
+            : extraFilesystems,
         connection_mode: mode,
         ssh_key_name: sshKey || undefined,
         idle_timeout_seconds: idleTimeout ? parseFloat(idleTimeout) : undefined,
@@ -459,6 +494,74 @@ export function LaunchForm({ onLaunched }: { onLaunched: () => void }) {
           </span>
         </label>
       </div>
+
+      {/* Extra filesystems: deliberately quiet and below the main grid. One
+          filesystem is the normal launch; this row exists for the run that
+          reads one dataset and writes another. */}
+      {filesystem &&
+      !scratchOnly &&
+      (extraFilesystems.length > 0 || attachableFilesystems.length > 0) ? (
+        <div className="mt-3 border-t border-zinc-100 pt-3">
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="text-xs font-medium text-zinc-600">
+              Also mounted
+            </span>
+            {extraFilesystems.map((name) => (
+              <span
+                key={name}
+                className="flex items-center gap-1 rounded-full border border-zinc-200 bg-zinc-100 px-2 py-0.5 text-[11px] text-zinc-700"
+              >
+                {name}
+                <button
+                  type="button"
+                  className="text-zinc-400 hover:text-zinc-700"
+                  aria-label={`Do not attach ${name}`}
+                  onClick={() =>
+                    setExtraFilesystems((current) =>
+                      current.filter((n) => n !== name),
+                    )
+                  }
+                >
+                  ×
+                </button>
+              </span>
+            ))}
+            {extraFilesystems.length === 0 && (
+              <span className="text-[11px] text-zinc-400">
+                just {filesystem}
+              </span>
+            )}
+            {attachableFilesystems.length > 0 &&
+            extraFilesystems.length < MAX_EXTRA_FILESYSTEMS ? (
+              <select
+                className="rounded border border-zinc-300 bg-white px-2 py-1 text-[11px] text-zinc-600"
+                value=""
+                onChange={(e) => {
+                  const picked = e.target.value;
+                  if (!picked) return;
+                  setExtraFilesystems((current) => [...current, picked]);
+                }}
+              >
+                <option value="">+ attach another filesystem</option>
+                {attachableFilesystems.map((f) => (
+                  <option key={f.name} value={f.name}>
+                    {f.name}
+                  </option>
+                ))}
+              </select>
+            ) : null}
+          </div>
+          <p className="mt-1 text-[11px] text-zinc-400">
+            {extraFilesystems.length >= MAX_EXTRA_FILESYSTEMS
+              ? `${MAX_EXTRA_FILESYSTEMS} extra filesystems is the limit. `
+              : ""}
+            Extras mount at /lambda/nfs/&lt;name&gt; and are yours to read and
+            write from the terminal, a command, or the Files browser. Jobs
+            still use {filesystem}, the filesystem chosen above. Filesystems
+            attach only at launch, so pick them now.
+          </p>
+        </div>
+      ) : null}
 
       {maxLifetime ? (
         <p className="mt-2 text-xs text-zinc-500">

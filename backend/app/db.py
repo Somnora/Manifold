@@ -436,6 +436,14 @@ class Database:
         # assume. See DECISIONS.md - an agent read an unattributed box as a
         # stray and terminated a model that was still loading.
         self._ensure_column("launches", "purpose", "TEXT")
+        # Phase 103: the EXTRA filesystems attached alongside the primary
+        # `filesystem` column, as a JSON list. NULL means "this row says
+        # nothing about extras" - every launch written before 103, and every
+        # single-filesystem launch since - so readers get the key absent
+        # rather than an empty list that would claim we looked and found
+        # none. The primary stays in its own column: templates, sync and
+        # the file routes all key on it.
+        self._ensure_column("launches", "extra_filesystems", "TEXT")
         # Phase 80: a principal's role. Pre-80 rows default to operator -
         # exactly what a minted token could do before roles existed (act,
         # but not manage credentials or policy).
@@ -504,6 +512,7 @@ class Database:
         created_at: str | None = None,
         created_by: str | None = None,
         purpose: str | None = None,
+        extra_filesystems: list[str] | None = None,
     ) -> str:
         """Insert a launch row and return its id.
 
@@ -522,14 +531,32 @@ class Database:
                (id, provider, created_at, requested_type, region, filesystem,
                 connection_mode, hourly_rate_cents, status,
                 idle_timeout_seconds, max_lifetime_seconds,
-                max_active_seconds, created_by, purpose)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'launching', ?, ?, ?, ?, ?)""",
+                max_active_seconds, created_by, purpose, extra_filesystems)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'launching', ?, ?, ?, ?, ?, ?)""",
             (launch_id, provider, created_at or utcnow(), requested_type,
              region, filesystem, connection_mode, hourly_rate_cents,
              idle_timeout_seconds, max_lifetime_seconds, max_active_seconds,
-             created_by, (purpose or "").strip() or None),
+             created_by, (purpose or "").strip() or None,
+             json.dumps(extra_filesystems) if extra_filesystems else None),
         )
         return launch_id
+
+    @staticmethod
+    def _launch_dict(row: sqlite3.Row) -> dict:
+        """A launch row as a dict, with the JSON column decoded.
+
+        extra_filesystems (Phase 103) is ABSENT when the column is NULL,
+        which is the case for every row written before the column existed
+        AND for every launch that attached only the primary filesystem. We
+        cannot tell those two apart, so the honest answer is no key at all -
+        an empty list would tell a reader we checked this box and found no
+        extra mounts, which for an old row is a guess.
+        """
+        launch = dict(row)
+        raw = launch.pop("extra_filesystems", None)
+        if raw:
+            launch["extra_filesystems"] = json.loads(raw)
+        return launch
 
     def update_launch(self, launch_id: str, **fields: Any) -> None:
         allowed = {
@@ -552,13 +579,13 @@ class Database:
         row = self._execute(
             "SELECT * FROM launches WHERE id = ?", (launch_id,)
         ).fetchone()
-        return dict(row) if row else None
+        return self._launch_dict(row) if row else None
 
     def list_launches(self) -> list[dict]:
         rows = self._execute(
             "SELECT * FROM launches ORDER BY created_at DESC"
         ).fetchall()
-        return [dict(r) for r in rows]
+        return [self._launch_dict(r) for r in rows]
 
     def pending_launch_count(self) -> int:
         """How MANY launches are admitted but not yet visible on the cloud.
@@ -980,7 +1007,7 @@ class Database:
                ORDER BY created_at DESC LIMIT 1""",
             (lambda_instance_id,),
         ).fetchone()
-        return dict(row) if row else None
+        return self._launch_dict(row) if row else None
 
     # -- audit log -----------------------------------------------------------
 

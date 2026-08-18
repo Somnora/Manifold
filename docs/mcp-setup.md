@@ -187,7 +187,7 @@ registration commands and the live last-call status.
 | Tool | What it does |
 | --- | --- |
 | `list_launch_options(provider?)` | Ranked {type, region, filesystem} targets that have capacity NOW, co-located with your data first - call before `launch_gpu`. Targets come from the account's default cloud and every row names it; pass `provider` only to look at another one |
-| `launch_gpu(instance_type, region, filesystem, purpose, name?, max_active_seconds?, provider?, ...)` | Launch through ALL guards; `purpose` is required (it is what other agents see); returns a launch id. Leave `provider` empty to use the account's default cloud, name one only to override it for this launch |
+| `launch_gpu(instance_type, region, filesystem, purpose, name?, max_active_seconds?, provider?, extra_filesystems?, ...)` | Launch through ALL guards; `purpose` is required (it is what other agents see); returns a launch id. Leave `provider` empty to use the account's default cloud; `extra_filesystems` mounts up to 4 more same-region filesystems alongside the primary, for your own commands and file access (jobs still use the primary) |
 | `get_launch_status(launch_id)` | One snapshot: phase + boot countdown while it boots |
 | `wait_for_launch(launch_id, timeout=120)` | Block until active/failed instead of polling (best for slow SXM4 boots) |
 | `list_instances()` | Live instances: SSH state, `created_by`, `purpose`, the idle sweep's `activity` verdict, and the last GPU telemetry sample |
