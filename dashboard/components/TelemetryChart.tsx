@@ -126,7 +126,14 @@ export function TelemetryChart({ instanceId }: { instanceId: string }) {
   }
 
   return (
-    <div className="mt-4 grid grid-cols-1 xl:grid-cols-2 gap-4">
+    // auto-fit, not a fixed column count: a hardcoded xl:grid-cols-2 kept a
+    // second track reserved at full width, so a single-GPU box rendered one
+    // tile with a dead right half (reported from a full-screen window,
+    // 2026-08-17). auto-fit collapses empty tracks: one GPU spans the full
+    // card, an 8x box tiles 3-4 per row, and the sparklines gain real
+    // horizontal resolution. min(400px,100%) keeps narrow phones to one
+    // column instead of overflowing.
+    <div className="mt-4 grid gap-4 grid-cols-[repeat(auto-fit,minmax(min(400px,100%),1fr))]">
       {gpus.map((gpu, i) => {
         const hist = history[i] || { util: [], vram: [] };
         const vramPct = (gpu.vram_used_mib / gpu.vram_total_mib) * 100;

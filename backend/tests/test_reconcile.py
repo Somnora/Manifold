@@ -321,3 +321,45 @@ async def test_adopted_connection_survives_a_transient_provider_failure(
     assert not any(entry["action"] == "external_termination_detected"
                    for entry in db.list_audit())
     await orch.shutdown()
+
+
+# -- Phase 101: the reconcile no longer waits for someone to look -------------
+
+
+def test_the_backend_notices_without_anyone_looking(client, mock_client):
+    """The gap this closes: reconciliation used to ride ONLY the authed
+    /instances poll. No dashboard open + no agent polling = a box
+    terminated out-of-band kept its launch row open and its SSH
+    supervisor reconnect-looping until the next human look. The
+    dispatcher's own adoption tick now carries the reconcile."""
+    launch_id, instance_id = launch_connected(client)
+    mock_client.instances[instance_id].status = "terminated"
+
+    # Deliberately NO client.get("/instances") - nobody is looking. The
+    # tick must run on the APP's loop (it awaits supervisor teardown, and
+    # those tasks live there), so it goes through the TestClient portal.
+    client.portal.call(client.app.state.dispatcher._adopt_tick)
+
+    orch = client.app.state.orchestrator
+    assert instance_id not in orch.connections, (
+        "the supervisor kept reconnect-looping at a dead host")
+    row = next(l for l in client.get("/launches").json()["launches"]
+               if l["id"] == launch_id)
+    assert row["status"] == "terminated"
+    assert row["resolved_at"] is not None
+    audit = client.get("/audit").json()["entries"]
+    assert any(e["action"] == "external_termination_detected" for e in audit)
+
+
+def test_a_second_tick_invents_nothing(client, mock_client):
+    """Reconciling an already-settled row must be a no-op, not a second
+    death certificate."""
+    _, instance_id = launch_connected(client)
+    mock_client.instances[instance_id].status = "terminated"
+    client.portal.call(client.app.state.dispatcher._adopt_tick)
+    client.portal.call(client.app.state.dispatcher._adopt_tick)
+
+    audit = client.get("/audit").json()["entries"]
+    detections = [e for e in audit
+                  if e["action"] == "external_termination_detected"]
+    assert len(detections) == 1, detections

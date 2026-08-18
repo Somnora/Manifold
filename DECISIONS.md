@@ -6136,3 +6136,28 @@ the vault file itself.
 hand-added key appears with "provenance unknown", a hand-deleted value shows
 present=false with its annotation intact. Neither is smoothed over — same
 truthful-or-absent rule, applied to the vault's own bookkeeping.
+
+## 2026-08-18 — Phase 101: the backend notices without anyone looking, and the telemetry stretches
+
+**Reconcile rides the adoption tick.** Found the hard way on 2026-08-17
+night: `instances_with_state()` is the external-termination reconcile point
+(closes rows, reaps supervisors, stamps last-seen), but it ran ONLY when an
+authed client polled `/instances`. No dashboard open + no agent polling =
+a box terminated out-of-band kept its launch row open and its supervisor
+reconnect-looping indefinitely. The dispatcher's adoption loop already did
+one provider list per tick for the ADOPT half of the same sweep; the tick
+now runs reconcile-then-adopt (`_adopt_tick`). No new poller (the phase-93
+pile-up lesson), and the client's list cache makes the paired calls one
+network request. Reconcile before adopt, deliberately: forget a recycled
+IP before anything dials it.
+
+**Telemetry grid: auto-fit, not a fixed column count.** The per-GPU grid
+hardcoded `xl:grid-cols-2`, so a single-GPU box at full width rendered one
+tile with a permanently dead right half (owner report, with screenshots).
+`repeat(auto-fit, minmax(min(400px,100%), 1fr))` collapses empty tracks:
+one GPU spans the full card, multi-GPU boxes tile 2-4 per row by available
+width, narrow windows stack. Considered filling the right side with other
+content instead; rejected - any fixed sibling recreates the same hole one
+level up the moment a box has 2+ GPUs, and the sparklines are the part
+that genuinely benefits from width. Same bug class as the Settings page
+(fixed grid + auto-placement), same philosophy as its fix.
