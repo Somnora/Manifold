@@ -229,8 +229,8 @@ def test_diagnose_warns_when_only_directory_scoped(tmp_path, monkeypatch):
 def test_doctor_flag_routes_to_doctor(monkeypatch):
     called = []
     monkeypatch.setattr(doctor, "main", lambda: called.append("doctor"))
-    monkeypatch.setattr(
-        desktop.uvicorn, "run", lambda *a, **k: called.append("uvicorn"))
+    monkeypatch.setattr("uvicorn.run",
+                        lambda *a, **k: called.append("uvicorn"))
     monkeypatch.setattr(desktop.sys, "argv", ["manifold-backend", "--doctor"])
     desktop.main()
     assert called == ["doctor"]
