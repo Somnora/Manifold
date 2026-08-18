@@ -177,3 +177,65 @@ def parse_pids_alive(stdout: str) -> tuple[set[str], dict[str, int | None]]:
         elif parts[1] == "VANISHED":
             settled[parts[0]] = None
     return alive, settled
+
+
+class DetachedStartRejected(Exception):
+    """A start that must not proceed, carrying the HTTP status a route maps
+    it to (the same shape as the orchestrator's LaunchRejected)."""
+
+    def __init__(self, status: int, message: str):
+        super().__init__(message)
+        self.status = status
+        self.message = message
+
+
+async def start_detached(conn, db, *, instance_id: str, command: str,
+                         note: str, created_by: str | None) -> dict:
+    """Write the command to the box, launch it detached, register the row.
+
+    Returns {"handle", "pid"}. Raises ConnectionError if the link is down
+    at any step, and DetachedStartRejected when the open-handle cap is
+    reached (409) or the launch line reported no pid (502).
+
+    SHARED ON PURPOSE (Phase 104). Two callers now start detached work: the
+    run-detached route, and the launch-bootstrap sweep in the dispatcher.
+    The sequence - SFTP the script, setsid it, read the pid, insert the row
+    - is the same one either way, and a second copy of it is a second place
+    for them to drift. The sweep goes through here rather than through the
+    HTTP route: a background loop calling its own app over the network to
+    reach logic that lives one import away is a needless dependency on the
+    server being reachable from inside itself.
+
+    Deliberately NOT covered here: audit, activity touch, notifications.
+    Those differ per caller - the bootstrap's audit line may not carry the
+    script's content - so each caller writes its own.
+
+    THE CRASH WINDOW, named rather than hidden: between the setsid line
+    landing on the box and create_detached committing, a backend death
+    leaves a live process with no row. Nothing then probes or settles it,
+    and a caller that retries starts a second copy. That window is as old
+    as the feature (the route has always had it) and this extraction
+    neither widens nor closes it.
+    """
+    if len(db.open_detached(instance_id)) >= MAX_OPEN_PER_INSTANCE:
+        raise DetachedStartRejected(
+            409, f"{MAX_OPEN_PER_INSTANCE} detached commands are "
+                 f"already open on {instance_id}; wait for some to "
+                 f"finish or check their status")
+    handle = new_handle()
+
+    async def script_bytes():
+        yield command.encode()
+
+    await conn.sftp_write(script_sftp_path(handle), script_bytes())
+    _code, stdout, stderr = await conn.run(launch_line(handle), timeout=20.0)
+    try:
+        pid = int(stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        raise DetachedStartRejected(
+            502, f"detached launch did not report a pid "
+                 f"(stdout {stdout[-200:]!r}, stderr {stderr[-200:]!r})")
+    db.create_detached(handle=handle, instance_id=instance_id,
+                       command=command, note=note, created_by=created_by,
+                       pid=pid)
+    return {"handle": handle, "pid": pid}

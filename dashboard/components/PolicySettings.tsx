@@ -242,6 +242,7 @@ export function PolicySettings() {
               ["instance_ceiling", "An instance is near, or past, its max lifetime", "The heads-up before Manifold terminates on a lifetime ceiling, and the cases where it hit the ceiling and deliberately did not destroy the box."],
               ["budget_threshold", "Month-to-date spend crosses a share of the budget", "Advisory only: the monthly budget never blocks a launch, so this notification is the whole feature."],
               ["terminal_reaped", "A terminal shell is closed after being left detached", "Its grace period ran out and Manifold ended it, stopping anything running inside - an agent session included."],
+              ["bootstrap_failed", "A launch's bootstrap script fails", "The instance is left running either way: nothing is destroyed because a setup script exited nonzero, so this notification is how you find out."],
             ] as [NotificationKind, string, string][]
           ).map(([kind, label, hint]) => (
             <Toggle

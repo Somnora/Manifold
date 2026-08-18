@@ -40,6 +40,7 @@ NOTIFICATION_KINDS = (
     "instance_ceiling",     # an instance is near, or past, its max lifetime
     "budget_threshold",     # month-to-date spend crossed a share of the budget
     "terminal_reaped",      # a detached shell was killed after its grace period
+    "bootstrap_failed",     # a launch's bootstrap script exited nonzero
 )
 
 
@@ -100,6 +101,12 @@ class NotificationPrefs:
     # On by default: a silent kill is how "my chat history disappeared"
     # becomes a mystery instead of a fact with a timestamp.
     terminal_reaped: bool = True
+    # A launch's bootstrap script exited nonzero. On by default because the
+    # box does NOT get terminated for it (a typo in an apt line must not
+    # destroy work already on the disk), so this ping is the only thing
+    # standing between "the setup failed" and an agent later finding half a
+    # machine and no explanation.
+    bootstrap_failed: bool = True
     # Also raise an OS notification (macOS Notification Center, libnotify on
     # Linux). In-app notifications are always recorded regardless; this only
     # controls the ping outside the window.

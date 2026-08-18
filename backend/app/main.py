@@ -273,6 +273,12 @@ class LaunchRequest(BaseModel):
     # tell work from waste. Optional: an empty purpose is reported as
     # unattributed rather than filled in with a guess.
     purpose: str = Field(default="", max_length=200)
+    # A setup script the box runs once when it comes up (Phase 104): the
+    # clone-install-pull dance nobody should have to come back and start by
+    # hand. Empty = none, and none is the default. 16 KiB matches the
+    # detached-command cap these bytes travel through anyway; over it the
+    # request is refused with the number rather than truncated.
+    bootstrap: str = Field(default="", max_length=16384)
 
 
 class ClusterLaunchRequest(BaseModel):
@@ -1517,6 +1523,7 @@ def create_app(
             provider=req.provider,
             created_by=current_principal(),
             purpose=req.purpose,
+            bootstrap=req.bootstrap,
         )
         return {"launch": launch}
 
@@ -1572,6 +1579,7 @@ def create_app(
 
     @app.get("/instances")
     async def list_instances():
+        from . import bootstrap as boot
         instances = await orchestrator.instances_with_state()
         # Hoisted: ONE query for the whole fleet, not one per instance inside
         # the loop. This route is the hottest in the app (the home page polls
@@ -1612,6 +1620,17 @@ def create_app(
             # connected, and a box that has dropped off SSH while past its
             # ceiling is precisely the one whose limit the user needs to see.
             inst.update(dispatcher.ceiling_status(inst["id"], launch))
+            # The launch bootstrap (Phase 104), read off the detached row -
+            # no probe, because this route is polled every 2s per instance.
+            # The key is ABSENT for a launch that had no script and for one
+            # whose script has not started yet: "we have nothing to say" is
+            # not one of the four states and is not invented into one.
+            if launch and launch.get("bootstrap"):
+                report = boot.report(
+                    db.find_detached_by_note(boot.note_for(launch["id"])),
+                    connected=inst["connection_state"] == "connected")
+                if report is not None:
+                    inst["bootstrap"] = report
         # Agents act on this data: fixture state must be self-identifying
         # (an agent once had to spot a TEST-NET IP to detect mock mode).
         return {"instances": instances, "mock": mock}
@@ -1728,31 +1747,17 @@ def create_app(
         conn = orchestrator.connections.get(instance_id)
         if conn is None or conn.ssh_connection() is None:
             raise HTTPException(409, f"no connected instance {instance_id}")
-        if len(db.open_detached(instance_id)) >= det.MAX_OPEN_PER_INSTANCE:
-            raise HTTPException(
-                409, f"{det.MAX_OPEN_PER_INSTANCE} detached commands are "
-                     f"already open on {instance_id}; wait for some to "
-                     f"finish or check their status")
-        handle = det.new_handle()
-
-        async def script_bytes():
-            yield req.command.encode()
-
+        # The write-launch-parse-register sequence lives in detached.py, so
+        # the launch-bootstrap sweep runs the identical one (Phase 104).
         try:
-            await conn.sftp_write(det.script_sftp_path(handle), script_bytes())
-            _code, stdout, stderr = await conn.run(
-                det.launch_line(handle), timeout=20.0)
+            started = await det.start_detached(
+                conn, db, instance_id=instance_id, command=req.command,
+                note=req.note, created_by=current_principal())
         except ConnectionError as exc:
             raise HTTPException(409, str(exc))
-        try:
-            pid = int(stdout.strip().splitlines()[-1])
-        except (ValueError, IndexError):
-            raise HTTPException(
-                502, f"detached launch did not report a pid "
-                     f"(stdout {stdout[-200:]!r}, stderr {stderr[-200:]!r})")
-        db.create_detached(handle=handle, instance_id=instance_id,
-                           command=req.command, note=req.note,
-                           created_by=current_principal(), pid=pid)
+        except det.DetachedStartRejected as exc:
+            raise HTTPException(exc.status, exc.message)
+        handle, pid = started["handle"], started["pid"]
         dispatcher.touch_activity(instance_id)
         db.record_audit(
             current_principal(), "detached_started",
@@ -1801,6 +1806,16 @@ def create_app(
         elif state in ("exited", "vanished") and row["exited_at"] is None:
             db.finish_detached(handle,
                                exit_code if state == "exited" else None)
+            # This poll may be the FIRST place a bootstrap's failure is
+            # seen - the telemetry probe is the other, and which one wins
+            # depends on whether anybody happened to be looking. Both call
+            # the same helper; notify_once keyed on the handle means one
+            # ping either way (see bootstrap.announce_exit).
+            from . import bootstrap as boot
+            boot.announce_exit(
+                notifier, instance_id=instance_id, handle=handle,
+                note=row["note"],
+                exit_code=exit_code if state == "exited" else None)
         # A settled registry row is the tie-breaker for a probe that could
         # not read the exit file (e.g. cleaned up on the box).
         if state == "unknown" and row["exited_at"] is not None:

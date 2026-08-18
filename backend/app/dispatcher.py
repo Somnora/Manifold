@@ -474,12 +474,14 @@ class Dispatcher:
     async def _probe_detached(self, instance_id: str, conn) -> None:
         """One SSH round trip that settles finished detached commands and
         records which are still alive. No open handles, no SSH cost."""
+        from . import bootstrap as boot
         from . import detached as det
         open_rows = self.db.open_detached(instance_id)
         if not open_rows:
             self._detached_alive.pop(instance_id, None)
             return
         pid_by_handle = {r["handle"]: r["pid"] for r in open_rows}
+        notes = {r["handle"]: r["note"] for r in open_rows}
         _code, stdout, _err = await conn.run(
             det.pids_alive_line(pid_by_handle), timeout=20.0)
         alive, settled = det.parse_pids_alive(stdout)
@@ -492,11 +494,81 @@ class Dispatcher:
                    # None is VANISHED: it ended, and how is not knowable.
                    # Never written as an exit code.
                    else "vanished (no exit recorded - reboot or external kill)"))
+            # A bootstrap that failed is worth interrupting someone for, and
+            # this is one of TWO places that can be the first to see it (the
+            # status-poll route is the other). Both call the same helper;
+            # notify_once on the handle makes the loser a no-op.
+            boot.announce_exit(self.notifier, instance_id=instance_id,
+                               handle=handle, note=notes.get(handle),
+                               exit_code=exit_code)
         if alive:
             self.touch_activity(instance_id)
             self._detached_alive[instance_id] = (self._clock(), sorted(alive))
         else:
             self._detached_alive.pop(instance_id, None)
+
+    async def _sweep_bootstrap(self, instance_id: str, conn) -> None:
+        """Start this instance's launch bootstrap, if it has one and it has
+        not been started yet. A RECONCILER, not an event handler.
+
+        WHY IT IS SHAPED THIS WAY. The obvious design - fire the bootstrap
+        at the moment the launch flips to active - does not work here.
+        Three separate code paths make a launch active (the normal
+        pipeline's _establish_connection, the resume-after-downtime path,
+        and orphan repair), so a hook is either duplicated three times or
+        misses two of them. Worse, at every one of those points the SSH
+        supervisor is still CONNECTING, and conn.run/conn.sftp_write raise
+        until it is CONNECTED - so the hook would have to sleep-and-retry
+        inside the launch path, where a crash loses the start with nothing
+        recording that it was owed.
+
+        So nothing fires at the transition. This asks four questions on
+        every telemetry tick and starts the bootstrap when all four hold:
+
+          1. the launch row is active,
+          2. it carries bootstrap text,
+          3. this connection is CONNECTED (the caller has already
+             established that - it is why we are in this loop at all),
+          4. no detached row carries this launch's bootstrap note.
+
+        (4) is the exactly-once guarantee, and it is a row in SQLite rather
+        than a flag in memory, so a backend restart cannot forget it and a
+        repeated sweep cannot double it. (3) is satisfied by waiting rather
+        than by retrying: a tick that finds the box down does nothing and
+        the next tick asks again. An adopted box has no launch row and no-
+        ops at question 1; an auto-manage launch carries no script and
+        no-ops at question 2.
+        """
+        from . import bootstrap as boot
+        from . import detached as det
+        launch = self.db.find_launch_by_instance(instance_id)
+        if launch is None or launch.get("status") != "active":
+            return
+        script = launch.get("bootstrap")
+        if not script:
+            return
+        if conn.state != ConnectionState.CONNECTED:
+            # Re-asked here and not left to the caller, so the guarantee
+            # belongs to this function. Not an error and not a retry: the
+            # next tick asks again, which is exactly what a hook at the
+            # active transition could not do.
+            return
+        note = boot.note_for(launch["id"])
+        if self.db.find_detached_by_note(note) is not None:
+            return                      # already started; never start twice
+        started = await det.start_detached(
+            conn, self.db, instance_id=instance_id, command=script,
+            note=note, created_by=launch.get("created_by"))
+        self.touch_activity(instance_id)
+        # Its OWN audit action, and deliberately not the run-detached
+        # route's line: that one logs the note-or-command, which for a
+        # bootstrap would put the script's contents - tokens included -
+        # into a table every viewer can read. Size and hash only.
+        self.db.record_audit(
+            "backend", "bootstrap_started",
+            boot.audit_detail(instance_id=instance_id, launch_id=launch["id"],
+                              handle=started["handle"], pid=started["pid"],
+                              script=script))
 
     def _detached_evidence(self, instance_id: str) -> str | None:
         """The reason to spare this box, if a detached command was confirmed
@@ -2537,6 +2609,18 @@ class Dispatcher:
         for instance_id, conn in list(self.orchestrator.connections.items()):
             if conn.state != ConnectionState.CONNECTED:
                 continue
+            # The launch bootstrap (Phase 104), before the probe rather
+            # than after it, so a script started on this tick is confirmed
+            # alive on this tick and protects its box immediately. Nothing
+            # fires at the active transition; this reconciles instead, and
+            # the detached row it creates is what stops it firing twice.
+            try:
+                await self._sweep_bootstrap(instance_id, conn)
+            except Exception:   # noqa: BLE001 - a bootstrap that could not
+                # start must never break telemetry: the box keeps sampling,
+                # and the next tick tries again (the exactly-once check is a
+                # row, so a retry cannot double a start that did land).
+                logger.exception("bootstrap sweep failed for %s", instance_id)
             # Detached commands first (Phase 95): work started through
             # Manifold asserts its own liveness. One probe covers every
             # open handle on the box; a live pid is evidence of work, and

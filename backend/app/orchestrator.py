@@ -552,6 +552,7 @@ class Orchestrator:
         created_by: str | None = None,
         purpose: str = "",
         extra_filesystems: list[str] | None = None,
+        bootstrap: str = "",
     ) -> dict:
         """Validate and admit a launch; returns the persisted launch row.
 
@@ -580,6 +581,12 @@ class Orchestrator:
         sync_outputs and relative file paths all resolve against it - so an
         extra is a place to read from and write to by absolute path, not a
         second persistent home.
+        bootstrap (Phase 104) is a setup script stored on the launch row
+        and started once on the instance by the dispatcher's reconciling
+        sweep, NOT here: at every point this pipeline could call it the
+        connection is still coming up. See bootstrap.py. Nothing about the
+        launch depends on it, and a launch with one is admitted exactly as
+        a launch without one.
         """
         extra_filesystems = list(extra_filesystems or [])
         mode = connection_mode or self.settings.default_connection_mode
@@ -806,6 +813,7 @@ class Orchestrator:
             created_by=created_by,
             purpose=purpose,
             extra_filesystems=extra_filesystems,
+            bootstrap=bootstrap,
         )
         plan = LaunchPlan(
             launch_id=launch_id,

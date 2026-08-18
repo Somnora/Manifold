@@ -51,6 +51,7 @@ export function LaunchForm({ onLaunched }: { onLaunched: () => void }) {
   const [maxLifetime, setMaxLifetime] = useState("");
   const [maxActive, setMaxActive] = useState("");
   const [purpose, setPurpose] = useState("");
+  const [bootstrap, setBootstrap] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState("");
   const [provider, setProvider] = useState("lambda");
@@ -239,6 +240,8 @@ export function LaunchForm({ onLaunched }: { onLaunched: () => void }) {
         max_lifetime_seconds: maxLifetime ? parseFloat(maxLifetime) : undefined,
         max_active_seconds: maxActive ? parseFloat(maxActive) : undefined,
         purpose: purpose.trim() || undefined,
+        // Sent verbatim (it is code), but a blank one is not sent at all.
+        bootstrap: bootstrap.trim() ? bootstrap : undefined,
       });
       onLaunched();
     } catch (err) {
@@ -562,6 +565,30 @@ export function LaunchForm({ onLaunched }: { onLaunched: () => void }) {
           </p>
         </div>
       ) : null}
+      {/* Collapsed by default: an empty bootstrap is the normal case, and a
+          textarea sitting open above the Launch button would read as
+          something you are meant to fill in. */}
+      <details className="mt-3" open={!!bootstrap}>
+        <summary className="cursor-pointer text-xs font-medium text-zinc-600">
+          Bootstrap script (optional)
+        </summary>
+        <textarea
+          className={`${field} mt-2 font-mono`}
+          rows={6}
+          maxLength={16384}
+          placeholder={"git clone https://github.com/me/project ~/project\ncd ~/project && pip install -r requirements.txt"}
+          value={bootstrap}
+          onChange={(e) => setBootstrap(e.target.value)}
+        />
+        <p className="mt-1 text-[11px] text-zinc-500">
+          Bash, run once on the instance when it comes up. It keeps running
+          if you close this page or restart Manifold, and the instance
+          counts as busy while it works, so the idle timeout will not reap
+          it mid-install. If the script fails, the instance is left running
+          and you get a notification - nothing is destroyed over a bad setup
+          line. Up to 16 KiB.
+        </p>
+      </details>
 
       {maxLifetime ? (
         <p className="mt-2 text-xs text-zinc-500">

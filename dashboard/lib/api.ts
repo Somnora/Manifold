@@ -216,6 +216,15 @@ export type Instance = {
     util_pct_mean: number | null;
     gpu_count: number | null;
   } | null;
+  // The launch's bootstrap script, if it was given one AND has started.
+  // Absent means either no script or not started yet - the field appears
+  // the moment there is something real to say, and never guesses a state.
+  // A nonzero exit never terminates the box; it is reported and left alone.
+  bootstrap?: {
+    state: "running" | "exited" | "vanished" | "unreachable";
+    // Present only for "exited". Absent is not zero.
+    exit_code?: number;
+  };
 };
 
 export type Launch = {
@@ -312,6 +321,8 @@ export type LaunchRequest = {
   // instances. An unattributed box is how someone else's loading model got
   // terminated as a stray.
   purpose?: string;
+  // A setup script the instance runs once when it comes up. Omit for none.
+  bootstrap?: string;
 };
 
 export type TemplateParameter = {
@@ -645,7 +656,8 @@ export type NotificationKind =
   | "instance_idle"
   | "instance_ceiling"
   | "budget_threshold"
-  | "terminal_reaped";
+  | "terminal_reaped"
+  | "bootstrap_failed";
 
 export type Preferences = {
   approvals: Record<GateableAction, boolean>;

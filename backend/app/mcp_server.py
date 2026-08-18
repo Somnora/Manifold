@@ -304,6 +304,7 @@ async def launch_gpu(
     max_active_seconds: float | None = None,
     provider: str = "",
     extra_filesystems: list[str] | None = None,
+    bootstrap: str = "",
     note: str = "",
 ) -> dict:
     """Launch a GPU instance. Flows through ALL backend guards (budget,
@@ -347,6 +348,17 @@ async def launch_gpu(
     exist and live in the launch region (they are region-locked), and the cap
     is 4 beyond the primary. Filesystems attach only at launch, so a name you
     leave out here cannot be added later without relaunching.
+    `bootstrap` is an optional shell script (bash) the box runs ONCE when it
+    comes up - the clone, the pip install, the model pull you would
+    otherwise have to come back and start by hand. It runs detached, so it
+    survives a backend restart; its exit code is recorded and while it runs
+    the box counts as busy, so the idle sweep leaves it alone. A NONZERO
+    EXIT DOES NOT TERMINATE THE BOX: nothing is destroyed because your
+    setup script failed. Check it with detached_status using the handle
+    from list_detached_commands (its note is "bootstrap:<launch id>"), or
+    read the `bootstrap` field on the instance in list_instances. If the
+    work is long and you want to watch it, run_detached after the box is up
+    is the same machinery with a handle in your hand from second zero.
 
     `purpose` is REQUIRED: a short phrase saying what this box is for, e.g.
     "Tally extraction+evaluation run" or "Red Hope mesh cleanup batch". You
@@ -393,9 +405,18 @@ async def launch_gpu(
         # "use the account default", which is the whole point of leaving
         # this empty. Naming one here overrides that for this launch only.
         body["provider"] = provider
+    if bootstrap:
+        body["bootstrap"] = bootstrap
+    # The audit copy is the body MINUS the script. `args` is written to the
+    # audit log verbatim, and a bootstrap is exactly where an agent puts an
+    # `export HF_TOKEN=...` line; its length is enough for a reader to know
+    # one was sent (the backend records size and hash when it starts).
+    args = {k: v for k, v in body.items() if k != "bootstrap"}
+    if bootstrap:
+        args["bootstrap_bytes"] = len(bootstrap.encode())
     return await _call(
         "launch_gpu", "POST", "/instances",
-        note=note, args=body, body=body,
+        note=note, args=args, body=body,
     )
 
 
