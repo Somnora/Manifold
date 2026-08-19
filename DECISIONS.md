@@ -6525,3 +6525,56 @@ bounded, so full materialization costs nothing measurable. A hammer test
 (300 cross-thread write-then-read cycles against a competing query loop)
 pins the fix. A flaky red is worse than a red: two more of these and
 nobody believes CI at all - that is why this jumped the queue.
+
+## 2026-08-19 — The first real GCP launch: validated, with three real findings
+
+The GCP provider path got its phase-gate validation: one n1-standard-4-t4
+in us-central1-a ($0.54/hr, ~10 minutes, ~$0.10), launched and driven
+entirely through the MCP bridge the way an agent would. Proven live:
+launch_gpu(provider="gcp") creates a real VM with the resolved provider
+stored on the row; the lifetime-vs-boot-budget guard rejects a too-small
+ceiling with the right message; the managed SSH connection dials and
+reconnects; cloud-init installs driver 595 + Docker + the nvidia runtime
+(~7 min, DKMS dominates); the sidecar serves telemetry into
+list_instances; run_command audits every call; a container sees the T4
+(`--gpus all` works); the scratch-only mount-jail guard refuses gpu-smoke
+with a clear error; and terminate leaves nothing behind at the provider
+(verified against the GCE operations log with the backend's own ADC).
+
+Three real findings, all one root cause - GCP's RUNNING is not Lambda's
+active - scoped as phase-110:
+
+1. PREMATURE ACTIVE. gcp_provider maps RUNNING -> "active", and
+   _establish_connection stamps active_at without waiting for SSH, so
+   wait_for_launch says "SSH is up" ~36s after acceptance while sshd is
+   minutes away, and max_active_seconds starts burning during boot -
+   the contract says boot never spends it. Fix: hold the active stamp
+   until the ManagedConnection actually connects (provider-agnostic; on
+   Lambda nothing changes because provider-active already means SSH-up).
+2. BOOTSTRAP RACES CLOUD-INIT. _sweep_bootstrap fires on the first
+   CONNECTED tick; on GCP that is minutes before cloud-init finishes, so
+   the launch bootstrap ran against a box with no /workspace/ephemeral,
+   exited 1, and the exactly-once marker (correctly) never retries. The
+   init script already ends with `touch /var/run/manifold-init-done` -
+   the sweep should gate on that sentinel.
+3. DOCKER-GROUP RACE. The SSH connection authenticates before cloud-init
+   adds ubuntu to the docker group, so every exec channel on that
+   connection gets "permission denied" from plain docker (sudo works).
+   Lambda images ship the membership, which is why it never bit. The
+   active-gate fix (reconnect after init-done) resolves this too.
+
+Two things that LOOKED like bugs and are not, recorded so the next
+reader does not re-investigate them: (a) terminate's rescue found 0 files
+despite a planted validation-proof.txt because the sidecar's
+unpersisted scan matches DEFAULT_VALUABLE_PATTERNS (weights, images,
+datasets, media) and *.txt is deliberately not in the class - the hook
+worked as designed; whether the pattern list should widen (*.json, *.md,
+*.txt) is a policy question for the owner, not a defect. (b) the MCP
+bridge reported "backend unreachable" on the terminate while the backend
+was fine: a GCE instance delete legitimately takes ~68s (the provider
+waits the operation out) and the bridge's HTTP timeout is 60s, so the
+call succeeded and its rescue report was lost in flight - terminate
+needs the same bounded-wait shape as wait_for_launch. The reconcile
+sweep then labeled Manifold's own in-flight delete
+"external_termination_detected"; an in-flight terminate should suppress
+that conclusion for its instance.
