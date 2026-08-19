@@ -994,9 +994,16 @@ async def create_filesystem(name: str, region: str, note: str = "") -> dict:
 
 
 async def _connected_instance_for_fs(filesystem: str | None) -> tuple | None:
-    """A connected instance that mounts `filesystem` (or any, if None), as
+    """A connected instance that CARRIES `filesystem` (or any, if None), as
     (instance_id, filesystem_name). None when nothing suitable is connected.
-    Lets file browsing ride the SSH connection with no S3 keys."""
+    Lets file browsing ride the SSH connection with no S3 keys.
+
+    Carries, not mounts: an instance's `filesystems` list is Lambda's
+    registry on Lambda and ATTACHED disks on GCP, and attached is not
+    mounted. This client cannot tell the difference and does not pretend to
+    - the backend asserts the mount on the browse itself and refuses with a
+    409 rather than listing an empty boot-disk directory as if the volume
+    were empty."""
     listing = await _call("list_persistent_files", "GET", "/instances", note="")
     for inst in listing.get("instances", []):
         if inst.get("connection_state") != "connected":
@@ -1100,8 +1107,15 @@ async def _pick_instance(instance_id: str | None, tool: str, note: str,
 async def upload_file(local_path: str, remote_path: str = "inbox/",
                       instance_id: str | None = None, note: str = "") -> dict:
     """Upload a file from THIS machine to an instance over the managed SSH
-    connection. remote_path ending in '/' keeps the filename; relative
-    paths land on the persistent filesystem (surviving termination).
+    connection. remote_path ending in '/' keeps the filename; a relative
+    path is resolved against the instance's persistent filesystem.
+
+    That path survives termination only while it is really mounted, so the
+    upload is REFUSED (409) when it is not - on GCP a data volume is
+    attached minutes before it is mounted, and writing into the unmounted
+    path would put the file on the boot disk, which is deleted with the
+    instance, while this tool reported it saved. Nothing is uploaded in that
+    case and nothing is lost; wait for the launch to go active and retry.
     If instance_id is omitted and exactly one instance is connected, it is
     used."""
     args = {"local_path": local_path, "remote_path": remote_path,

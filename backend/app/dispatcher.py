@@ -1212,6 +1212,26 @@ class Dispatcher:
                 busy_batch.add(iid)
         return busy_batch, busy_server
 
+    def _still_provisioning(self, instance_id: str) -> bool:
+        """Is this box's launch still inside the provisioning window?
+
+        CONNECTED IS NOT READY. On GCE a box answers SSH minutes before
+        cloud-init has finished, and a launch carrying a data volume is not
+        promoted until that volume is verifiably mounted. Dispatch used to
+        key on the connection alone, so queued jobs landed in that window
+        and died at the mount guard as a TERMINAL failure with no requeue -
+        the error text even had to say "if the box is still coming up,
+        requeue in a minute", which was the code describing its own bug.
+        Leaving the job QUEUED is what makes it correct: the gate promotes
+        the launch a minute later and the next tick dispatches it.
+
+        An ADOPTED box has no launch row and is never gated here - nothing
+        in Manifold knows when it provisioned, which is the same rule the
+        gate itself follows.
+        """
+        launch = self.db.find_launch_by_instance(instance_id)
+        return bool(launch) and launch.get("status") == "booting"
+
     def _pick_dispatchable(self) -> list[tuple[dict, str, ManagedConnection]]:
         """Every queued task that has an eligible connected instance RIGHT
         NOW, each bound to its instance. One pass can dispatch to several
@@ -1224,12 +1244,15 @@ class Dispatcher:
           on an auto-owned box); untargeted manual jobs take the first free
           non-auto-owned instance;
         - per instance: one batch task at a time, one server at a time,
-          server+batch coexist (see _busy_map).
+          server+batch coexist (see _busy_map);
+        - and never an instance whose launch is still 'booting' (see
+          _still_provisioning).
         """
         connected = {
             iid: conn
             for iid, conn in self.orchestrator.connections.items()
             if conn.state == ConnectionState.CONNECTED
+            and not self._still_provisioning(iid)
         }
         if not connected:
             return []
@@ -2698,14 +2721,19 @@ class Dispatcher:
     async def _sample_telemetry_once(self) -> None:
         self._maybe_prune_telemetry()
         for instance_id, conn in list(self.orchestrator.connections.items()):
-            if conn.state != ConnectionState.CONNECTED:
-                continue
             # The provisioning gate (Phase 110) goes first: it is what turns
             # a still-'booting' launch into an active one, and the bootstrap
             # sweep below only fires on an active launch. Same shape and the
             # same reason - three paths open a connection and none of them
             # is a moment at which readiness could be decided, so this asks
             # the row and the box on every tick instead.
+            #
+            # BEFORE the connected check, unlike everything below it: a box
+            # that answered SSH once and then dropped has a launch whose
+            # provisioning budget is running, and skipping it here is what
+            # let such a row sit in 'booting' forever while the supervisor
+            # reconnected and the instance billed. The gate reads the row,
+            # so it can age that launch out with no session at all.
             try:
                 await self.orchestrator.sweep_provisioning(instance_id, conn)
             except Exception:   # noqa: BLE001 - a gate that could not run
@@ -2713,6 +2741,8 @@ class Dispatcher:
                 # which is the truth, and the next tick asks again.
                 logger.exception("provisioning sweep failed for %s",
                                  instance_id)
+            if conn.state != ConnectionState.CONNECTED:
+                continue
             # The volume mount-heal (Phase 112), between the two: the gate
             # above only looks at 'booting' rows, and orphan repair mints
             # ACTIVE rows that never passed it. Runs the mount half only -

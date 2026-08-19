@@ -31,7 +31,17 @@ class MockGCPProvider(GCPProvider):
                 "disk_type": "pd-balanced",
             },
         }
-        self._regions = ["us-central1", "us-east1", "us-west1", "europe-west4", "asia-east1"]
+        # ZONES, not regions, because that is what the real provider yields
+        # (gcp_catalog intersects the shelf with Google's acceleratorTypes
+        # per zone) and every consumer treats the list as zones: the Volumes
+        # panel offers them as the zone dropdown, and create_volume refuses
+        # anything without two dashes. Region strings here made creating or
+        # attaching a volume impossible in the zero-credential demo - every
+        # option the panel offered came back "'asia-east1' is not a GCE
+        # zone". The first entry matches the seeded demo disk's zone, so the
+        # form opens on a combination that works.
+        self._regions = ["us-central1-a", "us-central1-b", "us-east1-c",
+                         "us-west1-b", "europe-west4-a"]
         self._types = {
             "g2-standard-4": CloudInstanceTypeSpec(
                 name="g2-standard-4",

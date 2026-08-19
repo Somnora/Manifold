@@ -248,6 +248,106 @@ async def test_the_budget_fails_the_launch_and_leaves_the_box_running(
     assert len(gate.audits("provisioning_timeout")) == 1
 
 
+async def test_a_connection_that_drops_after_answering_once_still_ages_out(
+        tmp_path, db):
+    """THE HOLE the budget had. `_await_provisioning`'s own bound fires only
+    while connected_at is NULL, and the gate returned on a non-CONNECTED
+    connection BEFORE it looked at the budget at all - so a box that answered
+    SSH once and then lost the link had a supervisor retrying forever, a row
+    stuck in 'booting' with no provisioning_timeout ever written, and a card
+    counting up past its own budget. The idle sweep skips 'booting', so
+    nothing else would ever mention the money.
+
+    The budget is anchored in the ROW - hence a connected_at written long
+    ago rather than a zero timeout here - so the gate can spend it with no
+    session at all, and a backend restart resumes the same deadline instead
+    of granting a fresh one.
+    """
+    gate = await open_gate(tmp_path, db, Box(), provisioning_timeout=600.0)
+    gate.db.update_launch(gate.launch_id,
+                          connected_at="2020-01-01T00:00:00+00:00")
+    gate.conn.state = ConnectionState.RECONNECTING
+
+    await gate.sweep()
+
+    launch = gate.launch()
+    assert launch["status"] == "failed"
+    assert "answered SSH and then stopped answering" in launch["error"]
+    assert "reconnecting" in launch["error"]
+    assert "still be running and billing" in launch["error"]
+    assert len(gate.audits("provisioning_timeout")) >= 1
+    # Never destroyed to tidy up a status field.
+    assert gate.client.instances[gate.instance_id].status == "active"
+
+
+async def test_a_dropped_connection_inside_the_budget_keeps_waiting(
+        tmp_path, db):
+    """A reconnect is normal - sshd restarts, the network blips - so the
+    ageing-out only happens once the budget is genuinely spent."""
+    gate = await open_gate(tmp_path, db, Box(), provisioning_timeout=600.0)
+    await gate.sweep()
+    gate.conn.state = ConnectionState.RECONNECTING
+
+    await gate.sweep()
+
+    assert gate.launch()["status"] == "booting"
+    assert gate.audits("provisioning_timeout") == []
+
+
+async def test_a_box_that_stops_answering_mid_question_says_that(tmp_path, db):
+    """`signal == "unknown"` is deliberately distinct from "pending" - "we
+    could not ask" and "we asked and it said not yet" are different answers -
+    and both were closing the launch with the same sentence, which sent the
+    reader to an init log that may have nothing to say about it."""
+    gate = await open_gate(tmp_path, db, Box(), provisioning_timeout=0.0)
+
+    class Mute(ScriptedSSH):
+        async def run(self, command):
+            raise ConnectionError("session went away mid-question")
+
+    gate.conn._conn = Mute(gate.box)
+
+    await gate.sweep()
+
+    launch = gate.launch()
+    assert launch["status"] == "failed"
+    assert "could not ask it whether provisioning had finished" in launch["error"]
+    assert "manifold-init.log" not in launch["error"]
+
+
+async def test_a_box_that_is_still_installing_says_where_to_look(tmp_path, db):
+    """The other half: "pending" is the box answering, and its answer has a
+    place to go and read."""
+    gate = await open_gate(tmp_path, db, Box(), provisioning_timeout=0.0)
+
+    await gate.sweep()
+
+    assert "did not finish provisioning" in gate.launch()["error"]
+    assert "/var/log/manifold-init.log" in gate.launch()["error"]
+
+
+def test_the_telemetry_tick_gates_a_disconnected_box_too(client, db):
+    """The wiring pin for the half above: the tick used to `continue` on any
+    non-CONNECTED connection before the gate ran, which is exactly the state
+    a launch has to age out in. The gate reads the row, so it needs no
+    session - everything BELOW it in the tick still requires one."""
+    resp = client.post("/instances", json={
+        "instance_type": "gpu_1x_a10", "region": "us-east-1",
+        "filesystem": "manifold-data"})
+    launch = wait_for_launch_status(client, resp.json()["launch"]["id"])
+    instance_id = launch["lambda_instance_id"]
+    orch = client.app.state.orchestrator
+    db.update_launch(launch["id"], status="booting", active_at=None,
+                     connected_at="2020-01-01T00:00:00+00:00")
+    orch.connections[instance_id].state = ConnectionState.RECONNECTING
+
+    client.portal.call(client.app.state.dispatcher._sample_telemetry_once)
+
+    closed = db.get_launch(launch["id"])
+    assert closed["status"] == "failed"
+    assert "stopped answering" in closed["error"]
+
+
 async def test_cloud_init_finished_without_our_marker_promotes_with_a_warning(
         tmp_path, db):
     """The fallback. cloud-init has stopped, so our marker is never going to

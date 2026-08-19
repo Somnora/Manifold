@@ -100,14 +100,25 @@ def test_blank_disk_and_no_record_is_the_one_permitted_mkfs():
 
 def test_blank_disk_but_recorded_formatted_is_a_loud_terminal_refusal():
     """An interrupted mkfs is indistinguishable from never-formatted, so it
-    is never retried. Because formatted_at transitions exactly once, the
-    volume provably never held user data - which is what makes "delete it
-    and create another" safe advice rather than a shrug."""
+    is never retried.
+
+    The advice ("delete it and create another") comes with its premise
+    attached rather than as proof. formatted_at transitions exactly once,
+    before the mkfs, so MANIFOLD'S RECORDS show it never mounted the volume
+    and never wrote to it - but a disk formatted, filled and later wiped
+    externally looks identical from here, and the by-id link can point at a
+    different device than we think (the type-mismatch cell exists for
+    exactly that). Scoped to what Manifold can actually know."""
     p = plan(blkid_output="", formatted_at="2026-08-19T00:00:00+00:00")
     assert p.action == "refuse"
     assert p.terminal is True
     assert "interrupted mkfs" in p.detail
-    assert "never held any of your data" in p.detail
+    assert "Manifold's own records" in p.detail
+    assert "outside Manifold" in p.detail
+    assert "delete it and create another" in p.detail
+    # Never the unprovable form: a blank blkid NOW is not evidence about
+    # every byte that was ever on the disk.
+    assert "provably" not in p.detail
 
 
 def test_a_filesystem_we_did_not_write_is_never_mounted_and_never_formatted():
@@ -420,6 +431,140 @@ def test_a_job_dispatched_to_an_unmounted_box_refuses_instead_of_writing(
     assert task["output_paths"] == []
 
 
+def test_an_upload_to_an_unmounted_path_refuses_instead_of_writing(client):
+    """The THIRD write site under /lambda/nfs/<name>, and it was unguarded.
+
+    Two consequences, and the second is worse. `sftp_write` calls
+    `makedirs(parent, exist_ok=True)`, so the upload CREATES the mount point
+    on the auto-delete boot disk: the bytes die with the instance while the
+    route returns 200 and the audit row records a durable location. And
+    because `mount_command` refuses to mount over a non-empty unmounted
+    directory (terminal), one upload in that window makes the volume
+    permanently unmountable on that box and fails every later launch
+    carrying it.
+    """
+    instance_id = launch_connected(client)
+    unmount(client, instance_id)
+    session = client.app.state.orchestrator.connections[instance_id]._conn
+
+    resp = client.post(
+        f"/instances/{instance_id}/files/upload",
+        files={"file": ("notes.txt", b"important")},
+        data={"dest": "inbox/"})
+
+    assert resp.status_code == 409, resp.text
+    detail = resp.json()["detail"]
+    assert "/lambda/nfs/manifold-data is not a mounted filesystem" in detail
+    assert "Nothing was uploaded and nothing was lost" in detail
+    # Nothing written, and - the part that poisons the volume - no directory
+    # created either.
+    assert session.sftp_files == {}
+    # And no audit row asserting a durable location for a file that is still
+    # on the user's own machine.
+    entries = client.get("/audit").json()["entries"]
+    assert all(e["action"] != "file_upload" for e in entries)
+
+
+def test_the_upload_guard_is_scoped_to_the_persistent_root(client):
+    """It gets out of the way everywhere else. /workspace/ephemeral IS the
+    boot disk by design - guarding it would refuse the one path that is
+    supposed to be scratch."""
+    instance_id = launch_connected(client)
+    unmount(client, instance_id)
+
+    resp = client.post(
+        f"/instances/{instance_id}/files/upload",
+        files={"file": ("scratch.txt", b"throwaway")},
+        data={"dest": "/workspace/ephemeral/scratch.txt"})
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["path"] == "/workspace/ephemeral/scratch.txt"
+
+
+def test_an_upload_to_a_mounted_path_still_lands(client):
+    """The other half of a guard: it must not break the normal case."""
+    instance_id = launch_connected(client)
+
+    resp = client.post(
+        f"/instances/{instance_id}/files/upload",
+        files={"file": ("notes.txt", b"important")},
+        data={"dest": "inbox/"})
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["path"] == "/lambda/nfs/manifold-data/inbox/notes.txt"
+    assert resp.json()["bytes"] == len(b"important")
+
+
+def test_browsing_an_unmounted_volume_refuses_instead_of_listing_nothing(
+        client):
+    """An instance's `filesystems` list means ATTACHED on GCP, not mounted,
+    and the MCP browse tool treats it as mounts. On a mounted-then-unmounted
+    box that listed the empty boot-disk directory and reported zero entries
+    for a volume that may be full - an empty list meaning "we looked and
+    found none" when the truth is "we looked in the wrong place"."""
+    instance_id = launch_connected(client)
+    unmount(client, instance_id)
+
+    resp = client.get(f"/instances/{instance_id}/files/list",
+                      params={"root_name": "persistent",
+                              "path": "manifold-data/outputs"})
+
+    assert resp.status_code == 409, resp.text
+    detail = resp.json()["detail"]
+    assert "/lambda/nfs/manifold-data is not a mounted filesystem" in detail
+    assert "Nothing was listed" in detail
+
+
+def test_a_queued_job_waits_out_the_provisioning_window(client, db):
+    """Dispatch keyed on the CONNECTION being connected and never on the
+    launch being active, so queued jobs landed on a box that was up but not
+    yet provisioned - on GCE that window is minutes, and with a data volume
+    it ends only when the mount is verified. The job then died at the mount
+    guard as a TERMINAL failure with no requeue, which is why its own error
+    text had to say "if the box is still coming up, requeue in a minute".
+
+    Deferring is what makes it correct: the job stays queued, where it can
+    still succeed."""
+    from tests.test_dispatch_flow import wait_until
+
+    instance_id = launch_connected(client)
+    launch = db.find_launch_by_instance(instance_id)
+    db.update_launch(launch["id"], status="booting", active_at=None)
+    dispatcher = client.app.state.dispatcher
+
+    resp = client.post("/tasks", json={
+        "template": "gpu-smoke", "parameters": {"note": "waits"}})
+    assert resp.status_code == 202
+    task_id = resp.json()["task"]["id"]
+
+    # Nothing is dispatchable while the launch is still provisioning, even
+    # though the connection is CONNECTED and the instance is otherwise free.
+    assert dispatcher._pick_dispatchable() == []
+    assert client.get(f"/tasks/{task_id}").json()["status"] == "queued"
+
+    # And it runs on its own the moment the gate promotes the launch.
+    db.update_launch(launch["id"], status="active", active_at=utcnow())
+    wait_until(lambda: client.get(f"/tasks/{task_id}").json()["status"]
+               != "queued", timeout=10)
+
+
+def test_an_adopted_box_is_still_dispatchable(client, db):
+    """The gate exempts adopted boxes by construction (no launch row, so
+    nothing knows when they provisioned) and so does this. Special-casing
+    them out of dispatch would strand every job on an adopted instance."""
+    instance_id = launch_connected(client)
+    launch = db.find_launch_by_instance(instance_id)
+    db.update_launch(launch["id"], status="booting", active_at=None,
+                     lambda_instance_id="i-somebody-elses")
+    dispatcher = client.app.state.dispatcher
+
+    resp = client.post("/tasks", json={
+        "template": "gpu-smoke", "parameters": {"note": "adopted"}})
+    task_id = resp.json()["task"]["id"]
+
+    assert [t["id"] for t, _, _ in dispatcher._pick_dispatchable()] == [task_id]
+
+
 # -- the provisioning gate, with a volume -----------------------------------------
 
 
@@ -642,8 +787,8 @@ async def test_a_foreign_filesystem_fails_the_launch_immediately(tmp_path, db):
 
 async def test_an_interrupted_mkfs_is_never_retried(tmp_path, db):
     """The row says formatted, the disk is blank. That is the ambiguous
-    cell, and the safe answer is a loud refusal - it can also say, truthfully,
-    that the volume never held any data."""
+    cell, and the safe answer is a loud refusal - carrying what Manifold's
+    own records do say, and not a claim about the disk it cannot make."""
     disk = Disk(blkid="")
     gate = await open_volume_gate(tmp_path, db, disk)
     db.mark_volume_formatted(gate.NAME, "ext4")     # the crash, simulated
@@ -652,7 +797,8 @@ async def test_an_interrupted_mkfs_is_never_retried(tmp_path, db):
 
     assert gate.launch()["status"] == "failed"
     assert "interrupted mkfs" in gate.launch()["error"]
-    assert "never held any of your data" in gate.launch()["error"]
+    assert "Manifold's own records" in gate.launch()["error"]
+    assert "provably" not in gate.launch()["error"]
     assert disk.mkfs_calls == 0
 
 
@@ -837,6 +983,50 @@ async def test_an_attached_volume_is_refused_and_names_its_holder(
     assert "owner" in exc.value.detail
 
 
+async def test_a_holder_whose_state_cannot_be_read_gets_its_own_sentence(
+        tmp_path, db):
+    """Three outcomes, not two. The enrichment used to collapse "we could
+    not check" into "the holder is running" and then give advice that only
+    works for a running holder - terminate it - about a box that may be
+    STOPPED, which keeps its disks and will not release the volume however
+    many times you try that."""
+    provider = MockGCPProvider()
+    provider.volumes["manifold-vol-demo"]["users"].append("manifold-abc123")
+
+    async def unreachable(_instance_id):
+        raise RuntimeError("Google is unreachable right now")
+
+    provider.get_instance = unreachable
+    orch = gcp_orchestrator(tmp_path, db, provider)
+
+    with pytest.raises(LaunchRejected) as exc:
+        await launch_gcp(orch)
+
+    detail = exc.value.detail
+    assert "could not read that instance's state" in detail
+    # Both moves named, because which one is right depends on the fact we
+    # could not read.
+    assert "RUNNING" in detail and "STOPPED" in detail
+
+
+async def test_a_stopped_holder_still_gets_the_stopped_sentence(tmp_path, db):
+    """The branch that must survive the third one being added: GCE's
+    TERMINATED means stopped, and a stopped box keeps its disks."""
+    provider = MockGCPProvider()
+    provider.volumes["manifold-vol-demo"]["users"].append("manifold-abc123")
+
+    async def stopped(_instance_id):
+        return _Msg(status="terminated")
+
+    provider.get_instance = stopped
+    orch = gcp_orchestrator(tmp_path, db, provider)
+
+    with pytest.raises(LaunchRejected) as exc:
+        await launch_gcp(orch)
+
+    assert "stopped rather than running" in exc.value.detail
+
+
 async def test_a_stale_row_saying_attached_does_not_block_a_free_disk(
         tmp_path, db):
     """The whole reason admission asks Google. A launch row can say
@@ -865,7 +1055,7 @@ async def test_a_bad_volume_name_is_refused_before_anything_is_asked(
         await launch_gcp(orch, filesystem="Bad Name; rm -rf /")
 
     assert exc.value.status_code == 422
-    assert "GCE disk names" in exc.value.detail
+    assert "Volume names are 2-63 characters" in exc.value.detail
 
 
 async def test_extra_filesystems_stay_refused_on_gcp(tmp_path, db):
@@ -1065,6 +1255,15 @@ def test_volumes_are_listed_from_the_cloud_with_sqlite_as_the_overlay(
     bill invisibly forever if the data dir were ever lost. A disk with no
     row still appears, marked as one Manifold has no record of."""
     with mock_mode_client(tmp_path, monkeypatch) as c:
+        # A disk that exists at "Google" and nowhere else - hand-created, or
+        # a SQLite restored from before it existed. It still LISTS, and it
+        # is marked as one Manifold cannot use.
+        c.app.state.orchestrator.providers.get_provider("gcp").volumes[
+            "somebody-elses-disk"] = {
+                "name": "somebody-elses-disk", "zone": "us-central1-a",
+                "size_gb": 100, "users": [], "status": "READY",
+                "disk_type": "pd-balanced"}
+
         body = c.get("/volumes").json()
         demo = next(v for v in body["volumes"]
                     if v["name"] == "manifold-vol-demo")
@@ -1073,11 +1272,57 @@ def test_volumes_are_listed_from_the_cloud_with_sqlite_as_the_overlay(
         assert demo["mount_point"] == "/lambda/nfs/manifold-vol-demo"
         assert demo["list_price_usd_per_month"] == 20.0
         assert "list price" in body["price_basis"]
-        # The fixture disk exists at "Google" with no Manifold row.
-        assert demo["known_to_manifold"] is False
+        foreign = next(v for v in body["volumes"]
+                       if v["name"] == "somebody-elses-disk")
+        assert foreign["known_to_manifold"] is False
+        assert "formatted_at" not in foreign
         # Never a bytes_used it cannot know: a 0 there would assert "empty"
         # about a disk that may be full.
         assert "bytes_used" not in demo
+
+
+def test_the_demo_volume_is_usable_in_the_zero_credential_demo(
+        tmp_path, monkeypatch):
+    """The seeded disk is there so the demo has something to pick, and
+    without Manifold's OWN row it was the opposite: `known_to_manifold`
+    false, which the Volumes page renders as "not created by Manifold -
+    unusable here" and the launch path refuses outright. Mock mode writes
+    the row for its own fixture disks, so the demo opens on a working
+    combination instead of a blocker."""
+    with mock_mode_client(tmp_path, monkeypatch) as c:
+        body = c.get("/volumes").json()
+        demo = next(v for v in body["volumes"]
+                    if v["name"] == "manifold-vol-demo")
+        assert demo["known_to_manifold"] is True
+        # NULL formatted_at: the demo's first launch is what formats it.
+        assert demo["formatted_at"] is None
+        # And the zone it lives in is one the zone picker actually offers.
+        zones = [z["code"] for z in c.get("/regions?provider=gcp").json()["regions"]]
+        assert demo["zone"] in zones
+
+
+def test_the_mock_zone_list_is_zones_not_regions(tmp_path, monkeypatch):
+    """The Volumes panel sources its Zone dropdown from /regions?provider=gcp
+    and a volume is ZONAL, so a fixture holding REGIONS made every option it
+    offered come back "'asia-east1' is not a GCE zone" - creating or
+    attaching a volume was impossible in the zero-credential demo, which
+    left the phase-112 UI with no end-to-end path that costs nothing."""
+    with mock_mode_client(tmp_path, monkeypatch) as c:
+        zones = [z["code"] for z in c.get("/regions?provider=gcp").json()["regions"]]
+        assert zones, "mock GCP must offer somewhere to launch"
+        for zone in zones:
+            assert zone.count("-") >= 2, zone
+        resp = c.post("/volumes", json={
+            "name": "demo-made-in-the-demo", "zone": zones[0], "size_gb": 200})
+        assert resp.status_code == 201, resp.text
+
+
+def test_the_volume_list_says_when_it_is_fixture_data(tmp_path, monkeypatch):
+    """Every sibling agent-facing route carries this flag and the MCP tool
+    relays the body verbatim, so without it an agent in the zero-spend demo
+    reports disks billing at $10-20 a month that do not exist."""
+    with mock_mode_client(tmp_path, monkeypatch) as c:
+        assert c.get("/volumes").json()["mock"] is True
 
 
 def test_creating_a_volume_records_it_and_leaves_formatted_at_null(
@@ -1100,7 +1345,10 @@ def test_a_bad_volume_name_never_reaches_the_cloud(tmp_path, monkeypatch):
             "name": "Crops; rm -rf /", "zone": "us-central1-a",
             "size_gb": 200})
         assert resp.status_code == 422
-        assert "GCE disk names" in resp.json()["detail"]
+        # The rule Manifold ENFORCES, which is 2-63: the regex refuses the
+        # one-character name Google's own 1-63 rule allows, and quoting
+        # Google's number would send the reader to argue with Google.
+        assert "Volume names are 2-63 characters" in resp.json()["detail"]
         assert all(v["name"] != "Crops; rm -rf /"
                    for v in c.get("/volumes").json()["volumes"])
 
@@ -1141,6 +1389,49 @@ def test_an_attached_volume_cannot_be_deleted(tmp_path, monkeypatch):
 
         assert resp.status_code == 409
         assert "manifold-holder" in resp.json()["detail"]
+
+
+def test_an_unconfigured_project_never_answers_you_have_no_volumes(client):
+    """`GET /volumes -> {"volumes": []}` from a project nobody contacted is
+    the forbidden move on the one resource that bills whether or not anyone
+    could list it: the page renders "No data volumes yet" and a disk can
+    bill invisibly forever. create_volume already asked this question; the
+    other two paths did not."""
+    resp = client.get("/volumes")
+
+    assert resp.status_code == 400, resp.text
+    assert "gcloud auth application-default login" in resp.json()["detail"]
+    assert "volumes" not in resp.json()
+
+
+def test_an_unconfigured_project_does_not_declare_a_volume_absent(client):
+    """DELETE answered "No data volume named X in this Google Cloud project"
+    without ever contacting a Google Cloud project."""
+    resp = client.delete("/volumes/crops?confirm_name=crops")
+
+    assert resp.status_code == 400, resp.text
+    assert "gcloud auth application-default login" in resp.json()["detail"]
+
+
+def test_the_delete_404_says_whose_list_it_is_reading(tmp_path, monkeypatch):
+    """It built its list from SQLite while the sentence claimed to enumerate
+    the Google project - so it declared a volume absent from the project and
+    then listed that same volume among what the project has, while omitting
+    the disks Google actually had. Same wording the launch path already
+    uses."""
+    with mock_mode_client(tmp_path, monkeypatch) as c:
+        # A row for a disk that is NOT at Google: deleted in the console, or
+        # this database outlived it.
+        c.app.state.orchestrator.db.create_volume(
+            name="ghost-vol", zone="us-central1-a", size_gb=200)
+
+        resp = c.delete("/volumes/ghost-vol?confirm_name=ghost-vol")
+
+        assert resp.status_code == 404
+        detail = resp.json()["detail"]
+        assert "Volumes Manifold has created: ghost-vol" in detail
+        assert "Manifold's own record" in detail
+        assert "Have:" not in detail
 
 
 def test_a_volume_is_not_a_filesystem_and_the_storage_page_says_so(

@@ -1220,26 +1220,65 @@ class Orchestrator:
                 detail += f" That box is for: {purpose}."
             if owner:
                 detail += f" It was launched by {owner}."
-        stopped = False
+        # THREE outcomes, not two. "We could not check" is not "it is
+        # running": the advice for a running holder (terminate it) is the
+        # wrong move for a stopped one, so an unread state gets its own
+        # sentence rather than borrowing the running one. None covers both
+        # ways of not knowing - the call failed, or Google does not show us
+        # that instance at all (it may not be one Manifold launched).
+        holder_state: str | None = None
         try:
             info = await cloud_provider.get_instance(holder)
-            stopped = info is not None and info.status == "terminated"
+            if info is not None:
+                holder_state = ("stopped" if info.status == "terminated"
+                                else "running")
         except Exception:   # noqa: BLE001 - a decoration, never a blocker.
             # We already know the answer (refuse); failing to enrich it must
             # not turn a clean 409 into a 500.
-            stopped = False
-        if stopped:
+            holder_state = None
+        if holder_state == "stopped":
             detail += (" Google reports that instance as stopped rather than "
                        "running - a stopped instance keeps its disks, so it "
                        "will not release this one by itself. Delete it, or "
                        "detach the disk in the Google Cloud console.")
-        else:
+        elif holder_state == "running":
             detail += (" Terminate that instance (Manifold saves its files "
                        "first, and the volume survives), then launch again.")
+        else:
+            detail += (" Manifold could not read that instance's state, so "
+                       "it cannot say which move frees the volume: a RUNNING "
+                       "holder releases it when terminated (Manifold saves "
+                       "its files first, and the volume survives), while a "
+                       "STOPPED one keeps its disks and has to be deleted, "
+                       "or the disk detached, in the Google Cloud console.")
         return detail
 
-    async def create_volume(self, name: str, zone: str,
-                            size_gb: int) -> dict:
+    def _configured_gcp_volumes(self, doing: str):
+        """The GCP provider, or a refusal that names what is missing.
+
+        THE ONE PLACE the volume CRUD asks "is Google set up here at all".
+        A provider with no project id answers every read with an empty list
+        and every lookup with None - so without this, GET /volumes returns
+        `{"volumes": []}` and DELETE returns "no such volume in this Google
+        Cloud project" about a project nobody ever contacted. Both are the
+        forbidden move: an empty answer standing in for an unasked question,
+        on a resource that bills whether anyone could list it or not.
+        """
+        provider = self._gcp_volumes()
+        if provider is None:
+            raise LaunchRejected(
+                400, f"Google Cloud is not set up here, so Manifold cannot "
+                     f"{doing}.", reason_code="provider")
+        # By capability, like _gcp_volumes itself: a stub registered under
+        # 'gcp' says "not me" instead of raising an AttributeError.
+        unconfigured = getattr(provider, "unconfigured_reason",
+                               lambda: None)()
+        if unconfigured:
+            raise LaunchRejected(400, unconfigured, reason_code="provider")
+        return provider
+
+    async def create_volume(self, name: str, zone: str, size_gb: int, *,
+                            caller: str = "dashboard") -> dict:
         """Create a GCP data volume through the guarded gateway.
 
         The name is validated against GCE's own charset BEFORE it touches
@@ -1265,14 +1304,7 @@ class Orchestrator:
                 f"'{zone}' is not a GCE zone. A volume is ZONAL and must be "
                 f"created in the zone you will launch in, e.g. "
                 f"us-central1-a.")
-        provider = self._gcp_volumes()
-        if provider is None:
-            raise LaunchRejected(
-                400, "Google Cloud is not set up here, so Manifold cannot "
-                     "create a data volume.", reason_code="provider")
-        unconfigured = provider.unconfigured_reason()
-        if unconfigured:
-            raise LaunchRejected(400, unconfigured, reason_code="provider")
+        provider = self._configured_gcp_volumes("create a data volume")
         if self.db.get_volume(name) is not None:
             raise LaunchRejected(
                 409,
@@ -1288,7 +1320,7 @@ class Orchestrator:
         row = self.db.create_volume(name=name, zone=disk["zone"],
                                     size_gb=int(disk["size_gb"]))
         self.db.record_audit(
-            "dashboard", "volume_created",
+            caller, "volume_created",
             f"{name}: {disk['size_gb']} GiB in {disk['zone']}")
         return self._volume_payload(disk, row)
 
@@ -1301,12 +1333,14 @@ class Orchestrator:
         forever the first time that database was lost or replaced. SQLite is
         the overlay - created_at, formatted_at, the fstype - and a disk with
         no row still appears, marked as one Manifold has no record of.
+
+        An unconfigured project REFUSES rather than answering `[]`. The
+        provider would hand back an empty list without contacting Google,
+        and "you have no volumes" about a project nobody asked is the exact
+        reading that lets a disk bill invisibly - which is the same money
+        argument that put this list on GCE rather than on SQLite.
         """
-        provider = self._gcp_volumes()
-        if provider is None:
-            raise LaunchRejected(
-                400, "Google Cloud is not set up here, so Manifold cannot "
-                     "list data volumes.", reason_code="provider")
+        provider = self._configured_gcp_volumes("list data volumes")
         try:
             disks = await provider.list_volumes()
         except ProviderUnavailable as exc:
@@ -1351,8 +1385,8 @@ class Orchestrator:
             payload["fstype"] = row["fstype"]
         return payload
 
-    async def delete_volume(self, name: str, *,
-                            confirm_name: str = "") -> dict:
+    async def delete_volume(self, name: str, *, confirm_name: str = "",
+                            caller: str = "dashboard") -> dict:
         """Permanently delete a data volume, with the data-safety dance.
 
         The same philosophy as delete_filesystem, for the same reason:
@@ -1364,11 +1398,7 @@ class Orchestrator:
         can say attached about an instance that no longer exists, and a
         disk GCE reports free is free.
         """
-        provider = self._gcp_volumes()
-        if provider is None:
-            raise LaunchRejected(
-                400, "Google Cloud is not set up here, so Manifold cannot "
-                     "delete a data volume.", reason_code="provider")
+        provider = self._configured_gcp_volumes("delete a data volume")
         try:
             disk = await provider.find_volume(name)
         except ProviderUnavailable as exc:
@@ -1376,11 +1406,17 @@ class Orchestrator:
         except ProviderError as exc:
             raise LaunchRejected(502, str(exc), reason_code="provider") from exc
         if disk is None:
+            # The list is SQLite's, so the sentence says so. It said "Have:"
+            # under a sentence about the Google project, and then listed the
+            # very name it had just called absent - Manifold's row for a disk
+            # deleted in the console. Same wording the launch path uses.
             known = ", ".join(sorted(v["name"] for v in self.db.list_volumes()))
             raise LaunchRejected(
                 404,
                 f"No data volume named '{name}' in this Google Cloud "
-                f"project. Have: {known or '(none)'}")
+                f"project. Volumes Manifold has created: {known or '(none)'}"
+                f" - that is Manifold's own record, and a disk it lists may "
+                f"already be gone from Google.")
         users = disk.get("users") or []
         if users:
             raise LaunchRejected(
@@ -1396,10 +1432,17 @@ class Orchestrator:
                 f"undo and no rescue - Manifold cannot read a detached disk, "
                 f"so it cannot tell you what is on it. To proceed, repeat "
                 f"the exact volume name in confirm_name.")
-        await provider.delete_volume(name, zone=disk["zone"])
+        try:
+            await provider.delete_volume(name, zone=disk["zone"])
+        except ProviderUnavailable as exc:
+            raise LaunchRejected(503, str(exc), reason_code="provider") from exc
+        except ProviderError as exc:
+            # The disk is still there and still billing; an unhandled 500
+            # would have said nothing about which.
+            raise LaunchRejected(502, str(exc), reason_code="provider") from exc
         self.db.delete_volume(name)
         self.db.record_audit(
-            "dashboard", "volume_deleted",
+            caller, "volume_deleted",
             f"{name}: {disk['size_gb']} GiB in {disk['zone']} destroyed")
         return {"deleted": name, "zone": disk["zone"],
                 "size_gb": int(disk["size_gb"])}
@@ -2268,6 +2311,36 @@ class Orchestrator:
                     f"launch {launch['id']}: instance {instance_id} is no "
                     f"longer running; connection reaped and history closed",
                 )
+            elif status == "booting" and instance is None:
+                # It vanished mid-boot: terminated from the provider's
+                # console, or it never came up at all. NOBODY else closes
+                # this row - the boot wait and the provisioning gate both
+                # work through a connection that this sweep has just reaped,
+                # so the card counted up forever ("installing drivers and
+                # runtime") on a box that no longer exists, and the idle
+                # sweep skips 'booting' so nothing else ever said a word.
+                #
+                # 'failed', because the launch never became usable; and the
+                # same observed-stop stamps _wait_until_active writes when it
+                # catches this a few seconds earlier, because the evidence is
+                # identical - the row's own provider answered, and this id
+                # was not in the answer.
+                self.db.update_launch(
+                    launch["id"], status="failed",
+                    error=f"instance {instance_id} disappeared from the "
+                          f"provider while the launch was still "
+                          f"provisioning; it was not terminated by Manifold.",
+                    terminated_at=utcnow(), resolved_at=utcnow(),
+                )
+                self._worklog_instance(
+                    launch, instance_id,
+                    "disappeared from the provider while still provisioning")
+                self.db.record_audit(
+                    "backend", "external_termination_detected",
+                    f"launch {launch['id']}: instance {instance_id} vanished "
+                    f"while still booting; the launch was closed as failed "
+                    f"rather than left counting up forever",
+                )
             elif (status == "failed" and instance is not None
                     and instance.status == "active"):
                 # ORPHAN: the launch gave up (usually a boot timeout) but the
@@ -2549,6 +2622,12 @@ class Orchestrator:
         connected_at, so the gate's budget never starts. Bounding that wait
         here (same budget, wall clock from when we opened the connection)
         keeps such a launch from hanging in 'booting' forever while it bills.
+
+        And the loop itself is bounded by that same budget, unconditionally.
+        Every other outcome is the gate's to decide and the gate writes it to
+        the row, so once the budget is gone there is nothing left for this
+        loop to add - it stops spinning and the telemetry tick, which is the
+        reconciler, carries the row from there.
         """
         policy = self.settings.launch
         loop = asyncio.get_event_loop()
@@ -2561,17 +2640,28 @@ class Orchestrator:
             if conn is None:
                 return          # terminated: its connection was popped
             await self.sweep_provisioning(instance_id, conn)
-            if (not (self.db.get_launch(launch_id) or {}).get("connected_at")
-                    and loop.time() - started
-                    >= policy.provisioning_timeout_seconds):
-                self._fail_provisioning(
-                    launch_id,
-                    f"instance {instance_id} never accepted an SSH connection "
-                    f"within {policy.provisioning_timeout_seconds:.0f}s of "
-                    f"becoming reachable",
-                )
+            if loop.time() - started >= policy.provisioning_timeout_seconds:
+                if not (self.db.get_launch(launch_id) or {}).get("connected_at"):
+                    self._fail_provisioning(
+                        launch_id,
+                        f"instance {instance_id} never accepted an SSH "
+                        f"connection within "
+                        f"{policy.provisioning_timeout_seconds:.0f}s of "
+                        f"becoming reachable",
+                    )
                 return
             await asyncio.sleep(policy.boot_poll_seconds)
+
+    def _provisioning_overdue(self, connected_at: str) -> bool:
+        """Has this launch spent its whole provisioning budget?
+
+        Measured from connected_at, which lives in the ROW: every branch of
+        the gate that can decide to keep waiting asks this one question, and
+        a backend restart resumes the same deadline instead of granting a
+        fresh one.
+        """
+        waited = _interval_seconds(connected_at, utcnow()) or 0.0
+        return waited >= self.settings.launch.provisioning_timeout_seconds
 
     async def sweep_provisioning(self, instance_id: str, conn) -> None:
         """One asker at a time per instance; the work is in _sweep_provisioning.
@@ -2605,6 +2695,10 @@ class Orchestrator:
         client learns a new word.
 
         In order:
+          0. no session right now -> nothing can be asked, so the only
+             question left is the budget: a launch that answered SSH once
+             and then dropped ages out here, because nothing else can. The
+             deadline lives in the row, not in this process.
           1. stamp connected_at the first time SSH is up (the anchor for the
              provisioning budget, and the only new fact this writes early);
           2. ask for the init signal;
@@ -2630,25 +2724,49 @@ class Orchestrator:
         launch = self.db.find_launch_by_instance(instance_id)
         if launch is None or launch.get("status") != "booting":
             return              # adopted boxes have no row and stop here
-        if conn.state != ConnectionState.CONNECTED:
-            return              # not an error: the next tick asks again
         launch_id = launch["id"]
         connected_at = launch.get("connected_at")
+        budget = self.settings.launch.provisioning_timeout_seconds
+        if conn.state != ConnectionState.CONNECTED:
+            # Normally not an error: the next tick asks again. But a
+            # connection that answered ONCE and then dropped has a
+            # connected_at, so `_await_provisioning`'s own bound (which fires
+            # only while connected_at is NULL) no longer applies, and the
+            # supervisor retries forever - the row sat in 'booting' with no
+            # timeout ever written while the box billed. The budget is
+            # anchored in the ROW, so it ages out here whichever tick gets
+            # here first, and it survives a backend restart.
+            if connected_at and self._provisioning_overdue(connected_at):
+                self._fail_provisioning(
+                    launch_id,
+                    f"instance {instance_id} answered SSH and then stopped "
+                    f"answering: its connection has been {conn.state.value} "
+                    f"and the launch did not finish provisioning within "
+                    f"{budget:.0f}s of the first connection")
+            return
         if not connected_at:
             connected_at = utcnow()
             self.db.update_launch(launch_id, connected_at=connected_at)
         signal = await self.provisioning_signal(conn)
         if signal in ("pending", "unknown"):
-            waited = _interval_seconds(connected_at, utcnow()) or 0.0
-            budget = self.settings.launch.provisioning_timeout_seconds
-            if waited >= budget:
+            if self._provisioning_overdue(connected_at):
+                # "pending" and "unknown" both wait, and they are different
+                # facts: one is the box saying "not yet", the other is
+                # Manifold failing to ask it. The row that closes the launch
+                # says which, because the next step differs (read the init
+                # log / look at why the session died).
+                detail = (
+                    f"answered SSH but did not finish provisioning within "
+                    f"{budget:.0f}s (the driver, Docker and the sidecar are "
+                    f"installed by cloud-init after first boot; see "
+                    f"/var/log/manifold-init.log on the box)"
+                    if signal == "pending" else
+                    f"answered SSH, but Manifold could not ask it whether "
+                    f"provisioning had finished within {budget:.0f}s - the "
+                    f"session kept going away mid-question, so what state "
+                    f"the box reached is unknown")
                 self._fail_provisioning(
-                    launch_id,
-                    f"instance {instance_id} answered SSH but did not finish "
-                    f"provisioning within {budget:.0f}s (the driver, Docker "
-                    f"and the sidecar are installed by cloud-init after "
-                    f"first boot; see /var/log/manifold-init.log on the box)",
-                )
+                    launch_id, f"instance {instance_id} {detail}")
             return
         # The volume, BEFORE the docker check on purpose: a redial there
         # drops this session, and mkfs/mount issued into a session that is
@@ -2659,9 +2777,7 @@ class Orchestrator:
             mounted, detail, terminal = await self._prepare_volume(
                 instance_id, volume, conn, allow_format=True)
             if not mounted:
-                waited = _interval_seconds(connected_at, utcnow()) or 0.0
-                budget = self.settings.launch.provisioning_timeout_seconds
-                if terminal or waited >= budget:
+                if terminal or self._provisioning_overdue(connected_at):
                     # Same shape as every other provisioning failure: the row
                     # closes, the box is left alone. `terminal` short-circuits
                     # the budget for a state that provably cannot change by
@@ -2776,6 +2892,68 @@ class Orchestrator:
             return None
         return (launch.get("filesystem") or "") or None
 
+    async def assert_mounted_path(self, instance_id: str, remote_path: str, *,
+                                  refusal: str) -> None:
+        """Refuse to touch `remote_path` unless its volume is really mounted.
+
+        The same guard the job wrapper and the rescue's rsync carry, for the
+        two places a path under /lambda/nfs/<name> is used one command at a
+        time instead of inside a wrapped shell line: the file upload (a
+        write - SFTP CREATES the parent directory, so an unmounted path
+        silently becomes a boot-disk directory and the audit row then asserts
+        a durable location) and the persistent-file browse (a read, where an
+        empty listing of the wrong directory says "this volume holds
+        nothing" about a disk nobody looked at).
+
+        Fail closed, and not only on exit 78: "we could not prove this is a
+        mount" is not permission to write, which is the same rule the guard
+        itself follows when `mountpoint` is missing entirely.
+
+        `refusal` is the caller's own sentence about what did NOT happen -
+        the consequences differ enough (nothing uploaded / nothing listed)
+        that one generic line would be vaguer than either.
+
+        A path with no volume under it (/workspace/ephemeral, or
+        /lambda/nfs itself) has no mount to assert and returns quietly.
+
+        On the upload path this ALSO protects the volume itself: a write
+        that creates /lambda/nfs/<name> on the boot disk makes the mount
+        refuse for good afterwards (mount_command will not mount over a
+        non-empty unmounted directory), which fails every later launch
+        carrying that volume.
+        """
+        name = vol.name_for_path(remote_path)
+        if name is None:
+            return
+        path = vol.mount_path(name)
+        conn = self.connections.get(instance_id)
+        if conn is None:
+            raise LaunchRejected(
+                409, f"No managed connection to {instance_id}, so Manifold "
+                     f"cannot check whether {path} is mounted. {refusal}")
+        try:
+            code, _out, _err = await conn.run(vol.mount_guard(name),
+                                              timeout=60.0)
+        except (ConnectionError, OSError) as exc:
+            raise LaunchRejected(
+                409,
+                f"Manifold could not ask {instance_id} whether {path} is a "
+                f"mounted filesystem ({exc}), so it refused rather than "
+                f"assume. {refusal}") from exc
+        if code == 0:
+            return
+        if code == vol.NOT_A_MOUNT_EXIT:
+            raise LaunchRejected(
+                409,
+                f"{path} is not a mounted filesystem on {instance_id}. "
+                f"{refusal} An unmounted path there is the instance's boot "
+                f"disk, which is deleted with the instance.")
+        raise LaunchRejected(
+            409,
+            f"Manifold could not prove {path} is a mounted filesystem on "
+            f"{instance_id} (the check exited {code}), so it refused rather "
+            f"than assume. {refusal}")
+
     async def _prepare_volume(self, instance_id: str, name: str, conn, *,
                               allow_format: bool) -> tuple[bool, str, bool]:
         """Format (at most once, ever) and mount one volume. The transport.
@@ -2860,9 +3038,11 @@ class Orchestrator:
                 return False, (
                     f"mkfs.{plan.fstype} failed (exit {code}): "
                     f"{err[:200]}. The volume is recorded as formatted and "
-                    f"will not be formatted again; because that record is "
-                    f"written before the format, it provably never held any "
-                    f"of your data - delete it and create another"), True
+                    f"will not be formatted again; that record is written "
+                    f"before the format, so Manifold never mounted this "
+                    f"volume and nothing it ran can have written to it - if "
+                    f"Manifold's records are the whole story, delete it and "
+                    f"create another"), True
 
         try:
             code, _out, err = await conn.run(

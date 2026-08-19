@@ -69,6 +69,7 @@ from .auth import (
     valid_principal_name,
 )
 from . import localmodels
+from . import volumes
 from .dispatcher import Dispatcher, ParameterError, coerce_parameters
 from .model_client import MockModelClient, ModelClientError
 from .notifications import NotificationCenter, os_notify
@@ -741,7 +742,17 @@ def create_app(
     providers = ProviderRegistry()
     providers.register('lambda', LambdaProvider(lambda_client))
     if mock:
-        providers.register('gcp', MockGCPProvider())
+        mock_gcp = MockGCPProvider()
+        providers.register('gcp', mock_gcp)
+        # The demo disk needs Manifold's OWN row to be usable. Without one
+        # it lists as "not created by Manifold - unusable here" and the
+        # launch form disables it, so the zero-credential demo opened on the
+        # blocker the fixture exists to avoid. Mock only (this writes to the
+        # '<stem>-mock.db' the branch above derived), and idempotent.
+        for _name, _disk in mock_gcp.volumes.items():
+            if db.get_volume(_name) is None:
+                db.create_volume(name=_name, zone=_disk["zone"],
+                                 size_gb=int(_disk["size_gb"]))
     else:
         def _local_public_key(_settings=settings) -> str:
             """The local SSH public key, for GCE instance metadata.
@@ -1447,6 +1458,17 @@ def create_app(
         opens the same list. Which rows can actually gate a launch is the
         caller's judgement, not this route's."""
         cloud = orchestrator.providers.get_provider("gcp")
+        # An UNCONFIGURED project first, because that is the path that
+        # actually happens: a Lambda-only install still has a real
+        # RealGCPProvider registered, so it has a gpu_quota method, and that
+        # method returns [] without asking Google when there is no project
+        # id. The 503 below never fired for it and the route answered
+        # `{"quotas": [], "project": ""}` - an empty list standing in for a
+        # question nobody asked, which is what this pair of checks exists to
+        # stop. unconfigured_reason() is the sentence that fixes it.
+        reason = getattr(cloud, "unconfigured_reason", lambda: None)()
+        if reason:
+            raise HTTPException(503, reason)
         fetch = getattr(cloud, "gpu_quota", None)
         if fetch is None:
             # A provider that cannot read quota must not answer with zero.
@@ -2799,11 +2821,21 @@ def create_app(
                           dest: str = Form("inbox/")):
         """Upload a local file to the instance over SFTP. `dest` ending in
         '/' is a directory (keeps the original filename); relative paths
-        land on the persistent filesystem."""
+        land on the persistent filesystem, and are REFUSED when that path is
+        not a mounted filesystem right now."""
         conn = _connected(instance_id)
         target = dest + (file.filename or "upload.bin") if dest.endswith("/") \
             else dest
         remote = _resolve_remote_path(instance_id, target)
+        # The third write site under /lambda/nfs/<name>, guarded like the
+        # other two. sftp_write makedirs the parent, so without this the
+        # upload CREATES the mount point on the boot disk: the bytes die with
+        # the instance while the audit row below records a durable location,
+        # and the volume can never be mounted on that box again.
+        await orchestrator.assert_mounted_path(
+            instance_id, remote,
+            refusal=("Nothing was uploaded and nothing was lost: the file "
+                     "is still on your machine."))
 
         async def chunks():
             while True:
@@ -2910,7 +2942,20 @@ def create_app(
     @app.get("/instances/{instance_id}/files/list")
     async def fs_list(instance_id: str, root_name: str = "persistent",
                       path: str = ""):
-        """One directory level, served by the sidecar (local disk speed)."""
+        """One directory level, served by the sidecar (local disk speed).
+
+        Under the persistent root the volume's mount is asserted first: an
+        instance's `filesystems` list means ATTACHED on GCP, not mounted, so
+        without this an unmounted volume lists the empty boot-disk directory
+        and answers "zero entries" for a disk that may be full. That is an
+        empty list standing in for a failed question, and no caller can tell
+        it from the real thing."""
+        if root_name == "persistent":
+            await orchestrator.assert_mounted_path(
+                instance_id, f"{volumes.MOUNT_ROOT}/{path.strip('/')}",
+                refusal=("Nothing was listed: an empty answer from that path "
+                         "would have said the volume holds nothing, when in "
+                         "fact Manifold never looked at it."))
         try:
             return await _sidecar_or_409(instance_id).list_dir(root_name, path)
         except SidecarError as exc:
@@ -4444,7 +4489,12 @@ def create_app(
 
     @app.get("/volumes")
     async def list_volumes():
-        return await orchestrator.list_volumes()
+        body = await orchestrator.list_volumes()
+        # Self-identifying fixture state, like every sibling route: an agent
+        # in the zero-spend demo would otherwise report disks billing at
+        # $10-20/month that do not exist.
+        body["mock"] = mock
+        return body
 
     @app.post("/volumes", status_code=201)
     async def create_volume(req: CreateVolumeRequest):
@@ -4454,7 +4504,7 @@ def create_app(
         Creation bills immediately and by PROVISIONED size, attached or
         not - unlike a Lambda filesystem, which bills by what it holds."""
         return await orchestrator.create_volume(
-            req.name, req.zone, req.size_gb)
+            req.name, req.zone, req.size_gb, caller=current_principal())
 
     @app.delete("/volumes/{name}")
     async def delete_volume(name: str, confirm_name: str = ""):
@@ -4463,7 +4513,8 @@ def create_app(
         force flag: there is no rescue path for a whole volume, and
         Manifold cannot even read a detached disk to tell you what is on
         it."""
-        return await orchestrator.delete_volume(name, confirm_name=confirm_name)
+        return await orchestrator.delete_volume(
+            name, confirm_name=confirm_name, caller=current_principal())
 
     async def _storage_for(filesystem: str) -> StorageClient:
         filesystems = {fs.name: fs for fs in await lambda_client.list_filesystems()}

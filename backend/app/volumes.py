@@ -14,13 +14,20 @@ mkfs, mount) lives in the orchestrator, which owns the connections. Nothing
 here touches a disk, a database or a network.
 
 THE HAZARD THIS MODULE EXISTS TO PREVENT. Every write to /lambda/nfs/<name>
-- the job wrapper's log directory, the rescue's rsync - is a plain path. If
-the volume is NOT mounted there, those writes silently land on the
-auto-delete boot disk: the rescue then reports everything saved, the
+- the job wrapper's log directory, the rescue's rsync, the file upload - is a
+plain path. If the volume is NOT mounted there, those writes silently land on
+the auto-delete boot disk: the rescue then reports everything saved, the
 termination safety hook waves the destroy through, and the user's data burns
-while the audit log says it was rescued. So every write is preceded by
-`mountpoint -q` (see mount_guard), and a launch carrying a volume is not
-promoted to active until that check passes.
+while the audit log says it was rescued. So every write MANIFOLD ITSELF
+issues to that path is preceded by `mountpoint -q` (see mount_guard), and a
+launch carrying a volume is not promoted to active until that check passes.
+
+The exception, stated rather than hidden: `run_command` / `run_detached` /
+the terminal run the user's own shell line verbatim. Those are the
+documented raw-shell escape hatch, and prefixing a guard to a line somebody
+typed would be Manifold editing their command. A shell there can still write
+to an unmounted path - what it cannot do is get Manifold to report the
+result as saved.
 """
 
 from __future__ import annotations
@@ -34,12 +41,14 @@ from dataclasses import dataclass
 # already builds paths from it.
 MOUNT_ROOT = "/lambda/nfs"
 
-# GCE's own disk-name charset, enforced before a name touches anything.
-# These names are the first user-supplied strings this codebase interpolates
-# into shell commands (the rescue's rsync destination, the dispatcher's log
-# paths) and into a /dev/disk/by-id link. Lambda's names came from Lambda's
+# The disk-name charset, enforced before a name touches anything. These
+# names are the first user-supplied strings this codebase interpolates into
+# shell commands (the rescue's rsync destination, the dispatcher's log paths)
+# and into a /dev/disk/by-id link. Lambda's names came from Lambda's
 # registry; these come from Manifold's own route, so the route is where the
-# charset is proven. The pattern is Google's, not a loosened version of it.
+# charset is proven. Google's charset, TIGHTENED in one place and never
+# loosened: Google allows a bare single letter, this does not, because these
+# names are also a path component and a device link here.
 NAME_PATTERN = re.compile(r"^[a-z][-a-z0-9]{0,61}[a-z0-9]$")
 
 # The one filesystem Manifold ever writes. Recorded per volume rather than
@@ -99,22 +108,41 @@ def validate_name(name: str) -> str | None:
     """Why this volume name is unusable, or None when it is fine.
 
     Checked before the name reaches GCE, a shell command, or a device path.
-    The message states Google's rule rather than paraphrasing it, because
-    the rule is Google's and a paraphrase would drift from the API error.
+    The message states the rule Manifold ENFORCES (2-63), not the rule
+    Google publishes (1-63): the one-character name Google would accept is
+    refused here, and quoting Google's number at someone whose one-letter
+    name was just rejected would send them to argue with the wrong party.
     """
     if not name:
-        return ("A volume needs a name. GCE disk names are 1-63 characters: "
-                "lowercase letters, digits and dashes, starting with a "
-                "letter and ending with a letter or digit.")
+        return ("A volume needs a name: 2-63 characters, lowercase letters, "
+                "digits and dashes, starting with a letter and ending with "
+                "a letter or digit.")
     if not NAME_PATTERN.fullmatch(name):
         return (
-            f"'{name}' is not a usable volume name. GCE disk names are 1-63 "
+            f"'{name}' is not a usable volume name. Volume names are 2-63 "
             f"characters: lowercase letters, digits and dashes, starting "
             f"with a letter and ending with a letter or digit. Manifold "
             f"mounts the volume at {mount_path('<name>')} and builds a "
             f"device path from the same string, so the name has to hold up "
             f"as a path as well as an API argument.")
     return None
+
+
+def name_for_path(path: str) -> str | None:
+    """Whose mount a touch of `path` depends on, or None when nothing's.
+
+    Everything under /lambda/nfs/<name>/ lives or dies with <name>'s mount.
+    Everything else - /workspace/ephemeral, and /lambda/nfs itself, which is
+    an ordinary directory holding the mount points - has no mount to assert,
+    and None says exactly that rather than guessing a name out of it.
+
+    Takes an already-normalised absolute path (the routes normpath before
+    they check their allowlist); it does no traversal handling of its own.
+    """
+    prefix = MOUNT_ROOT + "/"
+    if not path.startswith(prefix):
+        return None
+    return path[len(prefix):].split("/", 1)[0] or None
 
 
 def validate_size_gb(size_gb: int) -> str | None:
@@ -135,11 +163,17 @@ def validate_size_gb(size_gb: int) -> str | None:
 def mount_guard(name: str) -> str:
     """Shell that refuses, loudly, unless /lambda/nfs/<name> is a real mount.
 
-    THE POINT OF THE WHOLE PHASE. Prefixed to every command that writes
-    under that path. Without it an unmounted volume turns the path into an
-    ordinary directory on the auto-delete boot disk, and every writer -
-    the job wrapper, the rescue's rsync - succeeds against storage that
-    dies with the instance.
+    THE POINT OF THE WHOLE PHASE. Prefixed to every command Manifold itself
+    issues that writes under that path - the job wrapper, the rescue's
+    rsync, the file upload - and to the persistent-file browse, where an
+    unmounted path answers "this volume is empty" about a disk nobody
+    looked at. Without it an unmounted volume turns the path into an
+    ordinary directory on the auto-delete boot disk, and every writer
+    succeeds against storage that dies with the instance.
+
+    NOT prefixed to `run_command` / `run_detached` / the terminal: those run
+    the user's own line verbatim and are the documented raw-shell escape
+    hatch. Editing somebody's command is not this function's job.
 
     Unconditional, on Lambda too. There it converts "the NFS quietly fell
     off" from a silent fake-rescue into an honest failure, which is the
@@ -283,11 +317,14 @@ def plan_prepare(*, name: str, known: bool, link_present: bool,
     mid-format safe: the row says formatted, blkid comes back blank, this
     table refuses loudly, and the box is untouched.
 
-    The formatted-but-blank cell can say something unusually strong.
-    formatted_at transitions exactly once, so a volume in that state
-    provably never held user data - nothing was ever mounted on it to write
-    any. Saying so is what makes "delete it and create another" safe advice
-    instead of a shrug.
+    The formatted-but-blank cell says as much as it can and no more.
+    formatted_at transitions exactly once, before the mkfs, so MANIFOLD'S
+    OWN RECORDS show it never mounted that volume and therefore never wrote
+    a byte to it. That is a statement about Manifold's records, not about
+    the disk: a disk formatted, filled, and later wiped externally looks
+    identical from here, and the by-id link can point at a different device
+    than we think (the cell twenty lines below exists for exactly that). So
+    the advice is offered with its premise attached rather than as proof.
     """
     path = mount_path(name)
     if not known:
@@ -336,10 +373,11 @@ def plan_prepare(*, name: str, known: bool, link_present: bool,
                 f"{formatted_at}, but the disk holds no filesystem. That is "
                 f"an interrupted mkfs, and it is indistinguishable from a "
                 f"disk that was never formatted - so Manifold will not run "
-                f"mkfs again and will not mount it. Because the record is "
-                f"written once, before the format, this volume provably "
-                f"never held any of your data: delete it and create "
-                f"another."))
+                f"mkfs again and will not mount it. Manifold's own records "
+                f"say it never mounted this volume, so nothing Manifold ran "
+                f"can have written to it; it cannot speak for anything done "
+                f"to the disk outside Manifold. If those records are the "
+                f"whole story, delete it and create another."))
 
     if formatted_at is None:
         return VolumePlan(

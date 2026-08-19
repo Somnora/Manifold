@@ -113,17 +113,22 @@ persistent and is not. These are the refusals you can actually hit:
 - **"recorded as formatted ... but the disk holds no filesystem"** - a
   format was interrupted. Manifold records the format *before* it runs it,
   precisely so this state is detectable, and it refuses to run mkfs twice.
-  Because that record is written once, such a volume provably never held any
-  of your data: delete it and create another.
+  Because that record is written once, *Manifold* never mounted the volume
+  and so never wrote to it; it cannot speak for anything done to the disk
+  outside Manifold. If its records are the whole story, delete it and create
+  another.
 - **"already exists with files in it and nothing mounted there"** -
   something wrote to `/lambda/nfs/<name>` while the volume was not mounted.
   Mounting would hide those files, and they are evidence. Look at them on
   the instance first.
-- **"is not a mounted filesystem"** on a job or a sync - the box is up but
-  the volume is not mounted (still coming up, or a repair failed). The job
-  did not run and nothing was written; nothing is lost. Manifold refuses
-  every write to that path rather than letting it land on the boot disk,
-  which is deleted with the instance.
+- **"is not a mounted filesystem"** on a job, a sync, an upload or a file
+  listing - the box is up but the volume is not mounted (still coming up, or
+  a repair failed). The job did not run and nothing was written; nothing is
+  lost. Manifold refuses every write *it* issues to that path rather than
+  letting it land on the boot disk, which is deleted with the instance. The
+  exception is `run_command` / `run_detached` / a terminal, which run your
+  own shell line verbatim: a command you type there can still write to an
+  unmounted path.
 
 ### What it is not
 

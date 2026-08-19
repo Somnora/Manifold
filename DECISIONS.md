@@ -6907,13 +6907,28 @@ provisioned, while the job wrapper `mkdir -p`s
 Before this phase that could not happen on GCP, and only by accident:
 `sync_ephemeral` raised honestly ("no filesystem recorded") because the
 column was always empty there. Populating that column for volumes removes
-the accident. So `mountpoint -q` is now asserted before every write to that
-path - in the job wrapper and in `sync_ephemeral` - and it is
-UNCONDITIONAL, Lambda included, where it converts "the NFS quietly fell
-off" from a silent fake-rescue into a loud failure. A refusal leaves
-`unsaved` populated, which is exactly what makes termination stop and ask.
-`wrap_remote_command`'s `require_mount` has no default: every caller states
-out loud whether it is about to write to persistent storage.
+the accident. So `mountpoint -q` is now asserted before every write MANIFOLD
+ITSELF issues to that path - the job wrapper, `sync_ephemeral`, and the file
+upload - and it is UNCONDITIONAL, Lambda included, where it converts "the
+NFS quietly fell off" from a silent fake-rescue into a loud failure. A
+refusal leaves `unsaved` populated, which is exactly what makes termination
+stop and ask. `wrap_remote_command`'s `require_mount` has no default: every
+caller states out loud whether it is about to write to persistent storage.
+
+**The upload was the site this paragraph originally missed** (found in
+review, below). `POST /instances/{id}/files/upload` resolves a relative path
+under `/lambda/nfs/<name>` and `sftp_write` calls `makedirs(parent)`, so an
+upload into an unmounted volume did not merely land on the boot disk while
+the audit row asserted a durable location - it CREATED the mount point, and
+`mount_command` then refuses forever to mount over a non-empty unmounted
+directory, so one upload made the volume unmountable on that box and failed
+every later launch carrying it. Guarded now, through the same
+`mount_guard` / exit-78 mechanism, in one orchestrator helper
+(`assert_mounted_path`) rather than a second copy of the idea in a route.
+The same helper guards the persistent-file BROWSE, where the lie is the
+mirror image: an instance's `filesystems` list means ATTACHED on GCP, not
+mounted, so listing an unmounted volume answered "zero entries" about a disk
+that may be full - an empty list standing in for a failed question.
 
 **One shell detail worth the line, because it was a real bug in the first
 draft.** The guard is its own list, ended with `;`, never joined to the rest
@@ -7033,6 +7048,16 @@ one), volume-aware `list_launch_options` (a target row carries
 enough for an agent), and spend integration. Auto-manage, clusters and
 capacity watches remain Lambda-pinned and needed no work.
 
+And one gap in the guard itself, stated rather than left to be discovered:
+`run_command`, `run_detached` and the terminal run the user's own shell line
+verbatim, and are NOT prefixed with the mount guard. They are the documented
+raw-shell escape hatch, and editing a line somebody typed is not something a
+guard should do. A command typed there can still write to an unmounted path;
+what it cannot do is get Manifold to report the result as saved. `fs_usage`
+and `fs_delete` (the sidecar's recursive-size and delete routes) share the
+browse's exposure and are not guarded yet either - they were not part of the
+review's list and each needs its own copy decision, not a copied one.
+
 **Not verifiable without hardware, stated plainly.** Every decision above is
 pure and pinned by tests, and the transport is not: that `sudo mkfs.ext4 -F`
 and `sudo mount -t ext4 -o discard,defaults` actually work over the managed
@@ -7043,3 +7068,91 @@ deleted instance really does leave the disk intact and detached - all of
 that is real-gate work on a real machine. The mock says exit 0 to everything
 by default, which is precisely the lie this phase exists to stop believing,
 so the tests that matter use a session that answers honestly.
+
+### What four reviewers found afterwards, and what changed
+
+Phases 110/111/112 were audited by four independent adversarial reviewers.
+All four returned FAIL, and every finding below was verified against the
+code before it was fixed. Most of them are this file's own truthful-or-absent
+rule being broken by the very phases that invoked it, which is why they are
+recorded here as corrections to this entry rather than as a new one.
+
+**The claim "every write is preceded by `mountpoint -q`" was false when
+written.** The file upload was unguarded (see the paragraph above, now
+corrected), and so was the persistent-file browse. Both go through
+`assert_mounted_path` now. The docstrings in `volumes.py` that made the
+unqualified claim say what is true instead, and name the raw-shell escape
+hatch as the exception rather than leaving a reader to find it.
+
+**A launch that answered SSH once and then lost the connection never
+settled.** `_sweep_provisioning` returned on a non-CONNECTED connection
+BEFORE any budget check, the telemetry tick skipped the gate entirely for
+such a connection, and `_await_provisioning`'s own bound fires only while
+`connected_at` is NULL - which it is not, once SSH has answered once. The
+row stayed 'booting' forever with no `provisioning_timeout` audit row, the
+card counted up past its own budget, the supervisor retried forever, the
+idle sweep skips 'booting', and the box billed. The budget is anchored in
+the ROW (`connected_at`), so it is now spent by the gate with no session at
+all, the tick runs the gate before its connected check, and the fast-path
+loop is bounded unconditionally instead of only in the never-connected case.
+
+**Queued jobs were dispatched into the provisioning window and killed
+permanently.** `_pick_dispatchable` filtered on the CONNECTION, never on the
+launch, so on GCE - connected minutes before the volume is mounted - queued
+jobs died at the mount guard as a terminal exit-78 failure with no requeue.
+The error text saying "if the box is still coming up, requeue in a minute"
+was the code describing its own bug. Dispatch now skips an instance whose
+launch row is still 'booting'; adopted boxes (no row) are exempt by
+construction, the same rule the gate follows.
+
+**A row that vanished mid-boot was never closed.** `_reconcile_launches`
+closed only `active` rows on a vanished instance, and both other closers work
+through a connection this sweep reaps one loop earlier. 'failed' with the
+observed-stop stamps `_wait_until_active` already writes for the identical
+situation a few seconds earlier.
+
+**Three routes answered a question nobody asked.** `/gcp/quota` returned
+`{"quotas": []}` on every Lambda-only install - the 503 added in Phase 111
+only fired for a provider with no `gpu_quota` method, and the real provider
+always has one and returns `[]` when it has no project id. `GET /volumes`
+and `DELETE /volumes/{name}` asserted knowledge of a Google project they
+never contacted ("No data volume named X in this Google Cloud project", and
+an empty list the page renders as "No data volumes yet" - on the one
+resource that bills whether or not anyone could list it). All three consult
+`unconfigured_reason()` now, which already existed and already said the
+honest sentence. A test that pinned the empty-list answer as correct was
+reversed, with a comment saying so.
+
+**An unprovable claim was attached to destructive advice.** The
+interrupted-mkfs refusal said the volume "provably never held any of your
+data: delete it and create another". The evidence is `formatted_at` set plus
+a blank `blkid` NOW, which is equally consistent with a disk that was
+formatted, filled and later wiped externally, or with a by-id link pointing
+at a different device - a case the module concedes twenty lines later. The
+claim is scoped to Manifold's own records now and the advice keeps its
+premise attached. It also no longer contradicts the delete path, which says
+plainly that Manifold cannot read a detached disk.
+
+**And the smaller ones, each an instance of the same rule.** The
+volume-holder refusal collapsed "could not check the holder" into "the
+holder is running" and then gave advice that only works for a running
+holder; it has three branches now. The delete 404 built its "Have:" list
+from SQLite while the sentence claimed to enumerate the Google project (live,
+it declared a volume absent and then listed that same volume) - it says
+whose list it is reading. `GET /volumes` carries the `mock` flag every
+sibling agent-facing route carries, because the MCP tool relays the body
+verbatim and an agent in the zero-spend demo was reporting disks billing at
+$10-20/month that do not exist. `MockGCPProvider` held REGIONS where the real
+provider yields ZONES, so every option the Volumes panel offered was rejected
+with "'asia-east1' is not a GCE zone" and the phase-112 UI had no working
+end-to-end path that costs nothing; the seeded demo disk had no SQLite row,
+so it rendered as "not created by Manifold - unusable here". Both fixtures
+are fixed, and mock mode writes rows for its own fixture disks. The provider
+`delete_volume` call is wrapped in the same `ProviderUnavailable`/
+`ProviderError` translation as its three siblings (a failed GCE delete was
+an unhandled 500). Volume audit rows carry the real caller. The refusal text
+said "1-63 characters" while the regex requires 2-63. And the
+provisioning-timeout message said "answered SSH but did not finish
+provisioning" for `signal == "unknown"`, which means "we could not ask" - a
+distinction the signal function goes out of its way to preserve and the
+message threw away.

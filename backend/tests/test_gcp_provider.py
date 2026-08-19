@@ -206,13 +206,22 @@ def test_regions_are_provider_scoped(client):
     assert gcp == []
 
 
-def test_quota_route_survives_an_unconfigured_provider(client):
+def test_an_unconfigured_project_refuses_instead_of_answering_none(client):
+    """REVERSED from what this test asserted before (it pinned 200 with
+    `{"quotas": []}` as correct, which was the bug wearing a test's clothes).
+
+    Phase 111 added a 503 for a provider with no gpu_quota method - but in
+    real mode RealGCPProvider is registered unconditionally, always HAS that
+    method, and the method returns [] without contacting Google when there
+    is no project id. So every Lambda-only install got
+    `200 {"quotas": [], "project": ""}`: an empty list standing in for a
+    question nobody asked, which the launch form can only render as "Google
+    says you hold zero GPUs". The provider already knew the honest sentence
+    (unconfigured_reason); the route just never asked it."""
     resp = client.get("/gcp/quota")
-    assert resp.status_code == 200
-    assert resp.json()["quotas"] == []
-    # No project id, no link: the console URL without one opens whichever
-    # project the browser used last, which is not the one being described.
-    assert "request_url" not in resp.json()
+    assert resp.status_code == 503
+    assert "gcloud auth application-default login" in resp.json()["detail"]
+    assert "quotas" not in resp.json()
 
 
 def test_a_provider_that_cannot_read_quota_says_so_instead_of_zero(client):
