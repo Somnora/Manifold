@@ -8,10 +8,25 @@ else to install.
 Manifold.app / Manifold.msi
   [ Tauri shell (~10MB) - native window, spawns and reaps the backend ]
         |
-  [ manifold-backend (PyInstaller, ~40MB) - the entire product:
-      FastAPI backend + templates/ + sidecar + the dashboard baked in,
-      serving http://127.0.0.1:8000 on loopback only ]
+  [ manifold-backend (PyInstaller ONEDIR, ~100MB unpacked) - the entire
+      product: FastAPI backend + templates/ + sidecar + the dashboard
+      baked in, serving http://127.0.0.1:8000 on loopback only ]
 ```
+
+The backend is a PyInstaller **onedir** tree (the binary next to its
+`_internal/` libraries), not a single-file executable: onefile
+re-extracts ~87MB on every spawn and macOS re-assesses each fresh
+extraction, which put multi-second tails on MCP client handshakes and
+leaked temp dirs on every non-graceful exit (numbers in DECISIONS.md,
+phases 106/109). The per-platform layout lives in
+`scripts/stage-sidecar.sh`:
+
+- **macOS**: the tree ships at `Contents/Resources/backend/`; a small C
+  shim (`scripts/backend-shim.c`) stands at the historical sidecar path
+  `Contents/MacOS/manifold-backend` and exec()s the real binary, so
+  every existing MCP client registration keeps working unchanged.
+- **Windows**: the real exe is the sidecar and `_internal/` ships as a
+  resource into the install root beside it - adjacency without a shim.
 
 ## How the pieces map
 
@@ -37,10 +52,10 @@ Manifold.app / Manifold.msi
 ## Building locally (macOS)
 
 ```bash
-./scripts/build-backend.sh          # dashboard export + PyInstaller freeze
+./scripts/build-backend.sh          # dashboard export + PyInstaller freeze (onedir)
+./scripts/stage-sidecar.sh          # compile the shim, stage tree + sidecar
 cd desktop
 npm install
-./scripts/prepare-sidecar.sh        # stage binary as manifold-backend-<triple>
 npx tauri build --bundles dmg       # -> src-tauri/target/release/bundle/dmg/
 ```
 
@@ -48,15 +63,17 @@ Requirements: Node 20+, uv, Rust (`brew install rustup && rustup default
 stable`). The first Tauri build compiles the Rust world (several minutes);
 afterwards it is incremental.
 
-Quick smoke test without the shell: `backend/dist/manifold-backend` is a
-complete standalone product - run it (optionally `MANIFOLD_MOCK=1`) and
-open http://127.0.0.1:8000.
+Quick smoke test without the shell: `backend/dist/manifold-backend/
+manifold-backend` is a complete standalone product - run it (optionally
+`MANIFOLD_MOCK=1`) and open http://127.0.0.1:8000.
 
 ## CI
 
 `.github/workflows/desktop.yml` builds the .dmg (macos-14/arm64) and .msi
 (windows-2022/x64) on every `v*` tag or manual dispatch, and uploads them
-as artifacts.
+as artifacts. On macOS it then spawns the built bundle's own sidecar path
+(the shim) and requires the real MCP JSON-RPC handshake to answer - the
+regression this packaging exists to prevent, proven on every build.
 
 ## Sharing a build: GitHub Releases, not the git tree
 

@@ -35,17 +35,37 @@ jobs:
 
       - name: Stage sidecar for Tauri
         shell: bash
+        # Onedir layouts differ per platform (shim on macOS, adjacency on
+        # Windows) - the script is the single place that knows the shape.
         run: |
           cd desktop && npm ci --no-fund --no-audit
-          triple="$(rustc -vV | sed -n 's/^host: //p')"
-          mkdir -p src-tauri/binaries
-          src=../backend/dist/manifold-backend
-          [ -f "$src.exe" ] && src="$src.exe" && ext=".exe" || ext=""
-          cp "$src" "src-tauri/binaries/manifold-backend-$triple$ext"
+          cd .. && ./scripts/stage-sidecar.sh
 
       - name: Tauri build
         shell: bash
         run: cd desktop && npx tauri build --bundles ${{ matrix.bundles }}
+
+      # The regression this packaging exists to prevent is a bridge that
+      # cannot answer an MCP client. Prove the SHIPPED ARTIFACT end to end:
+      # mount the dmg (Tauri deletes the intermediate .app after packing
+      # it, so the dmg is all that survives the build) and spawn its
+      # sidecar path exactly as Claude Desktop would, requiring the
+      # JSON-RPC handshake to answer. The read-only mount is part of the
+      # test: onedir must run without writing anywhere, which onefile's
+      # extract-to-temp never proved. macOS only - the msi cannot be
+      # installed on the build runner.
+      - name: Handshake against the built dmg (macOS)
+        if: matrix.bundles == 'dmg'
+        shell: bash
+        run: |
+          dmg=$(find desktop/src-tauri/target/release/bundle/dmg -name '*.dmg' | head -1)
+          test -n "$dmg" || { echo "no dmg produced" >&2; exit 1; }
+          mount=$(hdiutil attach -nobrowse -readonly "$dmg" | awk -F'\t' '/\/Volumes\//{print $NF; exit}')
+          test -n "$mount" || { echo "failed to mount $dmg" >&2; exit 1; }
+          rc=0
+          "$mount"/*.app/Contents/MacOS/manifold-backend --doctor --handshake || rc=$?
+          hdiutil detach "$mount" || true
+          exit "$rc"
 
       - uses: actions/upload-artifact@v4
         with:
