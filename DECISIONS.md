@@ -6750,3 +6750,15 @@ what stands between that and a doomed container today, and it is not
 nothing, but it is a 180s bound rather than a gate. Widening dispatch to
 consult the launch status is a separate change with its own failure mode (an
 orphan-repaired box has an 'active' row that proves nothing).
+
+### Addendum (integration review): one asker at a time
+
+The gate ships with two callers - the launch tail's fast-path loop and the
+telemetry tick - and it awaits several SSH probes, so they interleave at
+every one of them. Both could read the row as still booting, both find the
+session locked out of docker, and the SECOND redial would drop the session
+the first had just rebuilt. `sweep_provisioning` is now a guard around
+`_sweep_provisioning` keyed on instance id; a skipped tick loses nothing
+because the other caller is asking the same questions of the same box and
+writes what it learns to the row. Pinned by a test that fails (two redials)
+with the guard removed.

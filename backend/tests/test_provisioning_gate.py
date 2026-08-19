@@ -491,3 +491,18 @@ async def test_the_idle_sweep_leaves_a_provisioning_box_alone(harness):
     assert status["state"] == "booting"
     assert status["busy"] is True
     assert "provisioning" in status["reason"]
+
+
+async def test_two_sweeps_at_once_redial_only_once(tmp_path, db):
+    """Two callers drive this gate - the launch tail's fast-path loop and
+    the telemetry tick - and it awaits several SSH probes, so they interleave
+    at every one of them. Unguarded, both read the row as still booting, both
+    find the session locked out of docker, and the SECOND redial drops the
+    session the first one just rebuilt.
+    """
+    gate = await open_gate(tmp_path, db, Box(init_done=True, docker_ok=False))
+
+    await asyncio.gather(gate.sweep(), gate.sweep())
+
+    assert len(gate.audits("connection_redialled")) == 1
+    assert gate.launch()["status"] == "active"

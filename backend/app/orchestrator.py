@@ -531,6 +531,13 @@ class Orchestrator:
         }
         self.connections: dict[str, ManagedConnection] = {}   # lambda instance id -> conn
         self._launch_tasks: dict[str, asyncio.Task] = {}
+        # Instances a provisioning sweep is currently asking about. TWO
+        # callers drive that gate - the launch tail's fast-path loop and the
+        # telemetry tick - and it awaits several SSH probes, so without this
+        # they interleave: both can read the row as still 'booting', both
+        # find the session cannot reach docker, and the second redial drops
+        # the session the first one just rebuilt.
+        self._provisioning_sweeps: set[str] = set()
         # Evidence from the last instances_with_state() sweep: which ids the
         # cloud listed as running, and which providers actually answered.
         # Kept so read-only consumers (the polled spend routes) can classify
@@ -2230,6 +2237,22 @@ class Orchestrator:
             await asyncio.sleep(policy.boot_poll_seconds)
 
     async def sweep_provisioning(self, instance_id: str, conn) -> None:
+        """One asker at a time per instance; the work is in _sweep_provisioning.
+
+        Skipping rather than queueing is right for a reconciler: the other
+        caller is asking the same questions of the same box right now, and
+        whatever it decides is written to the row. A skipped tick loses
+        nothing - the next one asks again.
+        """
+        if instance_id in self._provisioning_sweeps:
+            return
+        self._provisioning_sweeps.add(instance_id)
+        try:
+            await self._sweep_provisioning(instance_id, conn)
+        finally:
+            self._provisioning_sweeps.discard(instance_id)
+
+    async def _sweep_provisioning(self, instance_id: str, conn) -> None:
         """Promote one still-booting launch once its box is PROVISIONED.
 
         A RECONCILER, in the shape _sweep_bootstrap already uses: it asks
