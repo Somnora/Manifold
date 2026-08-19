@@ -5,6 +5,8 @@ import {
   api,
   ApiError,
   type Filesystem,
+  type GcpQuota,
+  type GcpQuotaRow,
   type InstanceTypeInfo,
   type Region,
 } from "@/lib/api";
@@ -36,6 +38,199 @@ const SCRATCH_ONLY = "__scratch_only__";
 // a fifth pick that would be rejected on submit.
 const MAX_EXTRA_FILESYSTEMS = 4;
 
+// GCE's project-wide GPU cap. It counts every region at once, so it gates a
+// launch no matter which zone is chosen.
+const GLOBAL_GPU_METRIC = "GPUS_ALL_REGIONS";
+
+// us-central1-a -> us-central1. A GCE zone is its region plus one trailing
+// letter; anything not shaped that way (Lambda's region codes) is already a
+// region and passes through untouched. Mirrors gcp_catalog.zone_to_region.
+function regionOfZone(zone: string): string {
+  return zone.replace(/-[a-z]$/, "");
+}
+
+// What the quota rows say about launching THIS shape here. Five outcomes,
+// and keeping them apart is the whole point: "your project has room",
+// "your project does not", and "Manifold could not tell" must never render
+// as one another.
+type QuotaGate =
+  | { state: "unreadable" }                        // nothing was read at all
+  | { state: "no-metric" }                         // shape is not on the shelf
+  | { state: "missing-rows"; missing: string[] }   // the gating row is absent
+  | { state: "blocked"; row: GcpQuotaRow; global: boolean }
+  | { state: "healthy"; regional: GcpQuotaRow; globalRow: GcpQuotaRow };
+
+// The backend returns EVERY GPU quota row Google sent, unfiltered, because
+// an agent asking that question wants the whole answer. Only two of them
+// can gate a launch this form produces, and these are they:
+//   - the selected GPU family's regional metric (NVIDIA_T4_GPUS etc.)
+//   - the global GPUS_ALL_REGIONS cap
+// PREEMPTIBLE_* cannot: the GCE launch path sets no provisioning model, so
+// every Manifold launch is on-demand. COMMITTED_* cannot either: Manifold
+// buys no commitments, and Google fills those rows with the int64 "no limit
+// configured" sentinel, which lands in JavaScript as 9223372036854776000 -
+// a number that was being printed at the user. If spot launches ever ship,
+// PREEMPTIBLE_* becomes gating and this is the function to change.
+function readQuotaGate(
+  quota: GcpQuota | null,
+  type: InstanceTypeInfo | undefined,
+): QuotaGate {
+  if (!quota || !type) return { state: "unreadable" };
+  const need = type.specs.gpus;
+  const metric = type.quota_metric;
+  if (!metric) return { state: "no-metric" };
+  const globalRow = quota.quotas.find(
+    (q) => q.metric === GLOBAL_GPU_METRIC && q.scope === "global",
+  );
+  // One region's rows come back per request, so scope alone identifies the
+  // regional row - and the row's own scope is the region name to print,
+  // rather than one this form derived.
+  const regional = quota.quotas.find(
+    (q) => q.metric === metric && q.scope !== "global",
+  );
+  // A multi-GPU shape needs its whole count: a2-highgpu-8g wants 8, and
+  // "limit above zero" says nothing about whether 8 are free.
+  if (globalRow && globalRow.limit - globalRow.usage < need)
+    return { state: "blocked", row: globalRow, global: true };
+  if (regional && regional.limit - regional.usage < need)
+    return { state: "blocked", row: regional, global: false };
+  if (!globalRow || !regional)
+    return {
+      state: "missing-rows",
+      missing: [
+        ...(globalRow ? [] : [GLOBAL_GPU_METRIC]),
+        ...(regional ? [] : [metric]),
+      ],
+    };
+  return { state: "healthy", regional, globalRow };
+}
+
+// Google's own numbers, labelled as the snapshot they are - never rounded,
+// never restated as a percentage, never turned into a verdict.
+function quotaSnapshot(row: GcpQuotaRow): string {
+  const where = row.scope === "global" ? "" : ` in ${row.scope}`;
+  // A limit of zero is the fresh-project case: "0 of 0 in use" is true but
+  // says the wrong thing about why there is no room.
+  if (row.limit <= 0) return `${row.metric}${where} is 0 as of this check`;
+  return `${row.metric}${where} is ${row.usage} of ${row.limit} in use as of this check`;
+}
+
+const QUOTA_AMBER =
+  "rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-[11px] leading-relaxed text-amber-800";
+const QUOTA_NEUTRAL =
+  "rounded-lg border border-zinc-200 bg-zinc-50 px-3 py-2 text-[11px] leading-relaxed text-zinc-600";
+
+/** The GCP quota note under the provider toggle.
+ *
+ * It reports what Google said and nothing else. It never predicts the
+ * launch in either direction: not "this will fail" (an instance
+ * terminating right now hands the quota back), and not "this will
+ * succeed" (quota is permission to ask - RESOURCE_POOL_EXHAUSTED is a
+ * separate answer Google gives at insert time, with quota to spare).
+ */
+function GcpQuotaNote({
+  gate,
+  failed,
+  typeName,
+  need,
+  requestUrl,
+}: {
+  gate: QuotaGate;
+  failed: boolean;
+  typeName: string;
+  need: number;
+  requestUrl?: string;
+}) {
+  // No project id, no link: a quotas URL without one opens whichever
+  // project the browser used last, which is not the one being described.
+  const consoleLink = (label: string) =>
+    requestUrl ? (
+      <a className="underline" href={requestUrl} target="_blank" rel="noreferrer">
+        {label}
+      </a>
+    ) : (
+      <span>{label} in the Google Cloud console</span>
+    );
+  const answerTime = " Google usually answers small requests in minutes to hours.";
+
+  if (gate.state === "unreadable") {
+    // Silence unless the read actually failed. Amber here was the original
+    // bug: an unasked question rendered as a problem with the project.
+    if (!failed) return null;
+    return (
+      <p className={QUOTA_NEUTRAL}>
+        Manifold could not read this project&rsquo;s GPU quota just now, so it
+        is not saying anything about it either way. Google still checks quota
+        when it creates the machine.
+      </p>
+    );
+  }
+
+  if (gate.state === "no-metric") {
+    return (
+      <p className={QUOTA_NEUTRAL}>
+        Manifold does not know which GPU quota gates {typeName}, so it cannot
+        say what this project holds for it. {consoleLink("See your quotas")}.
+      </p>
+    );
+  }
+
+  if (gate.state === "missing-rows") {
+    return (
+      <p className={QUOTA_NEUTRAL}>
+        Google&rsquo;s quota answer did not include{" "}
+        {gate.missing.join(" or ")}, so Manifold cannot say whether there is
+        room for {typeName}. The number is missing, not zero.{" "}
+        {consoleLink("See your quotas")}.
+      </p>
+    );
+  }
+
+  // Usage above zero is the remedy nobody thinks of: some of it is very
+  // likely this project's own running instances, and terminating one frees
+  // the same room a bigger quota would. Said only when there IS usage -
+  // offering it against a limit of zero would be advice that does nothing.
+  const usageIsYours = (row: GcpQuotaRow) =>
+    row.usage > 0 ? (
+      <>
+        {" "}
+        That usage can be your own running instances - terminating one, or
+        waiting for it to finish, hands the room back.
+      </>
+    ) : null;
+
+  if (gate.state === "blocked" && gate.global) {
+    return (
+      <p className={QUOTA_AMBER}>
+        Your project&rsquo;s global GPU cap: {quotaSnapshot(gate.row)}, and{" "}
+        {typeName} needs {need}. That cap counts every region at once, so
+        another region does not get around it.{usageIsYours(gate.row)}{" "}
+        {consoleLink("Request an increase")}.{answerTime}
+      </p>
+    );
+  }
+
+  if (gate.state === "blocked") {
+    return (
+      <p className={QUOTA_AMBER}>
+        {quotaSnapshot(gate.row)}, and {typeName} needs {need}. GPU quota is
+        per region, so another region has its own.{usageIsYours(gate.row)}{" "}
+        {consoleLink("Request an increase")}.{answerTime}
+      </p>
+    );
+  }
+
+  return (
+    <p className={QUOTA_NEUTRAL}>
+      {gate.regional.metric} in {gate.regional.scope}: {gate.regional.usage} of{" "}
+      {gate.regional.limit} in use as of this check, and {gate.globalRow.usage}{" "}
+      of {gate.globalRow.limit} against the global cap. Room for the {need}{" "}
+      {typeName} needs - room to ask, not a promise that Google has one free
+      in this zone. {consoleLink("Request an increase")}.
+    </p>
+  );
+}
+
 export function LaunchForm({ onLaunched }: { onLaunched: () => void }) {
   const [types, setTypes] = useState<Record<string, InstanceTypeInfo>>({});
   const [regions, setRegions] = useState<Region[]>([]);
@@ -60,10 +255,11 @@ export function LaunchForm({ onLaunched }: { onLaunched: () => void }) {
   // asynchronously, so without this a preference landing a moment after
   // the click would silently move the launch to another cloud.
   const providerPicked = useRef(false);
-  const [gcpQuota, setGcpQuota] = useState<{
-    quotas: { metric: string; limit: number; usage: number; scope: string }[];
-    request_url: string;
-  } | null>(null);
+  const [gcpQuota, setGcpQuota] = useState<GcpQuota | null>(null);
+  // A failed read is its OWN state, never null-and-silent and never zero:
+  // "nobody could ask Google" and "Google said none" are different answers
+  // and the form must be able to tell them apart.
+  const [gcpQuotaFailed, setGcpQuotaFailed] = useState(false);
   const [loadError, setLoadError] = useState("");
 
   useEffect(() => {
@@ -121,12 +317,19 @@ export function LaunchForm({ onLaunched }: { onLaunched: () => void }) {
   useEffect(() => {
     if (provider !== "gcp") {
       setGcpQuota(null);
+      setGcpQuotaFailed(false);
       return;
     }
     api
       .gcpQuota(region || undefined)
-      .then(setGcpQuota)
-      .catch(() => setGcpQuota(null));
+      .then((q) => {
+        setGcpQuota(q);
+        setGcpQuotaFailed(false);
+      })
+      .catch(() => {
+        setGcpQuota(null);
+        setGcpQuotaFailed(true);
+      });
   }, [provider, region]);
 
   const selectedType = types[instanceType];
@@ -170,12 +373,27 @@ export function LaunchForm({ onLaunched }: { onLaunched: () => void }) {
   }, [regions, availableForType, fsRegions]);
 
   // When the GPU changes, keep the region valid for it — preferring a region
-  // where a filesystem already lives.
+  // where a filesystem already lives, then the region the listed prices are
+  // quoted in.
+  //
+  // That second step is GCP's: its zones arrive alphabetically, so the raw
+  // first pick was asia-east1-a sitting beside a us-central1 price. It keys
+  // on price_basis_region, a field only GCP entries carry, so Lambda keeps
+  // exactly the behaviour it had. Nothing is hidden either way: the default
+  // only ever picks from regions_with_capacity, and the dropdown still
+  // lists every region.
   useEffect(() => {
     const avail = selectedType?.regions_with_capacity ?? [];
     if (avail.length === 0) return; // out of capacity: Launch stays disabled
     if (!avail.includes(region)) {
-      setRegion(avail.find((r) => fsRegions.has(r)) ?? avail[0]);
+      const priced = selectedType?.price_basis_region;
+      setRegion(
+        avail.find((r) => fsRegions.has(r)) ??
+          (priced
+            ? avail.find((r) => regionOfZone(r) === priced)
+            : undefined) ??
+          avail[0],
+      );
     }
   }, [instanceType, selectedType, fsRegions]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -211,6 +429,23 @@ export function LaunchForm({ onLaunched }: { onLaunched: () => void }) {
       ),
     [filesystemsInRegion, filesystem, extraFilesystems],
   );
+
+  // Read against the SELECTED GPU (its whole GPU count) and the selected
+  // zone's region - a quota answer about some other shape or some other
+  // place is not an answer about this launch.
+  const quotaGate = useMemo(
+    () => readQuotaGate(gcpQuota, selectedType),
+    [gcpQuota, selectedType],
+  );
+
+  // The listed prices are one region's. When the chosen zone is somewhere
+  // else, say so beside them - the price still shows, because relative
+  // price is how a GPU gets picked and the GPU is picked before a region
+  // exists. Manifold does not have the other region's rate, and will not
+  // invent a multiplier for it.
+  const pricedRegion = selectedType?.price_basis_region;
+  const priceRegionMismatch =
+    !!pricedRegion && !!region && regionOfZone(region) !== pricedRegion;
 
   const outOfCapacity =
     !!selectedType && selectedType.regions_with_capacity.length === 0;
@@ -295,37 +530,25 @@ export function LaunchForm({ onLaunched }: { onLaunched: () => void }) {
 
       {provider === "gcp" && Object.keys(types).length > 0 && (
         <div className="mb-4 space-y-2">
-          <p className="rounded-lg border border-zinc-200 bg-zinc-50 px-3 py-2 text-[11px] leading-relaxed text-zinc-600">
+          <p className={QUOTA_NEUTRAL}>
             {Object.values(types).find((t) => t.price_basis)?.price_basis}
+            {priceRegionMismatch ? (
+              <>
+                {" "}You have {regionOfZone(region)} selected, and Google
+                prices per region - Manifold does not have that
+                region&rsquo;s rate.
+              </>
+            ) : null}
             {" "}Launches are scratch-only for now (no persistent
             filesystems on GCP yet).
           </p>
-          {gcpQuota && (
-            <p className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-[11px] leading-relaxed text-amber-800">
-              {(() => {
-                const rows = gcpQuota.quotas.filter(
-                  (q) => q.scope !== "global" && q.limit > 0);
-                const global = gcpQuota.quotas.find(
-                  (q) => q.metric === "GPUS_ALL_REGIONS");
-                if (global && global.limit === 0)
-                  return "Your project's global GPU quota is 0, so no GPU launch can succeed yet. ";
-                if (rows.length === 0)
-                  return "No regional GPU quota here yet. ";
-                return `GPU quota here: ${rows
-                  .map((q) => `${q.metric} ${q.usage}/${q.limit}`)
-                  .join(", ")}. `;
-              })()}
-              <a
-                className="underline"
-                href={gcpQuota.request_url}
-                target="_blank"
-                rel="noreferrer"
-              >
-                Request an increase
-              </a>{" "}
-              - Google usually answers small requests in minutes to hours.
-            </p>
-          )}
+          <GcpQuotaNote
+            gate={quotaGate}
+            failed={gcpQuotaFailed}
+            typeName={instanceType}
+            need={selectedType?.specs.gpus ?? 0}
+            requestUrl={gcpQuota?.request_url}
+          />
         </div>
       )}
 

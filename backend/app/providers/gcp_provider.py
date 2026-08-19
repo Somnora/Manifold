@@ -105,6 +105,36 @@ class MockGCPProvider(GCPProvider):
     async def ensure_ssh_key(self, public_key: str, name: str) -> str:
         return name
 
+    async def gpu_quota(self, region: str) -> List[Dict]:
+        """Fixture quota rows, shaped exactly like Google's.
+
+        Without this the route had no method to call and answered
+        `{"quotas": []}` - which the launch form could only read as "Google
+        says you hold zero GPUs", so the zero-credential demo opened on a
+        blocker that did not exist. An empty list must mean Google said
+        none, never that nobody asked.
+
+        The rows are deliberately roomy: mock mode has nothing to block on.
+        The COMMITTED_ and PREEMPTIBLE_ rows are here because Google really
+        does return them (COMMITTED_ carries int64 max as its "no limit
+        configured" sentinel), and anything rendering this payload has to
+        cope with that.
+        """
+        return [
+            {"metric": "GPUS_ALL_REGIONS", "limit": 16, "usage": 1,
+             "scope": "global"},
+            {"metric": "NVIDIA_T4_GPUS", "limit": 8, "usage": 0,
+             "scope": region},
+            {"metric": "NVIDIA_L4_GPUS", "limit": 8, "usage": 2,
+             "scope": region},
+            {"metric": "NVIDIA_A100_GPUS", "limit": 4, "usage": 0,
+             "scope": region},
+            {"metric": "PREEMPTIBLE_NVIDIA_T4_GPUS", "limit": 8, "usage": 0,
+             "scope": region},
+            {"metric": "COMMITTED_NVIDIA_T4_GPUS", "limit": 9223372036854775807,
+             "usage": 0, "scope": region},
+        ]
+
 class RealGCPProvider(GCPProvider):
     """GCE over the operator's own Google credentials.
 

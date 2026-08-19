@@ -59,6 +59,9 @@ def test_gpu_description_matches_the_hardware_guide_families():
 def test_zone_to_region():
     assert gcp_catalog.zone_to_region("us-central1-a") == "us-central1"
     assert gcp_catalog.zone_to_region("europe-west4-b") == "europe-west4"
+    # Already a region: unchanged. Blind rsplit made this "us", which then
+    # travelled as a quota row's scope - a place Google does not have.
+    assert gcp_catalog.zone_to_region("us-central1") == "us-central1"
 
 
 # -- the provider, with the SDK faked ----------------------------------------
@@ -200,6 +203,24 @@ def test_quota_route_survives_an_unconfigured_provider(client):
     resp = client.get("/gcp/quota")
     assert resp.status_code == 200
     assert resp.json()["quotas"] == []
+    # No project id, no link: the console URL without one opens whichever
+    # project the browser used last, which is not the one being described.
+    assert "request_url" not in resp.json()
+
+
+def test_a_provider_that_cannot_read_quota_says_so_instead_of_zero(client):
+    """Phase 111. `{"quotas": []}` is indistinguishable from "Google says
+    you hold zero GPUs", and the launch form could only render it as the
+    amber blocker - on a project with ample quota. A provider with no quota
+    support must refuse to answer, not answer with a number."""
+    class QuotalessProvider:
+        pass
+
+    client.app.state.orchestrator.providers.register("gcp",
+                                                     QuotalessProvider())
+    resp = client.get("/gcp/quota")
+    assert resp.status_code == 503
+    assert "cannot say" in resp.json()["detail"]
 
 
 def test_catalog_carries_the_price_label_for_gcp_only(client):
@@ -207,6 +228,59 @@ def test_catalog_carries_the_price_label_for_gcp_only(client):
     label, and Lambda's live prices must never grow one."""
     lam = client.get("/instance-types").json()
     assert all("price_basis" not in t for t in lam.values())
+    # Same for the two fields the launch form joins quota rows on: they are
+    # GCP facts, and Lambda must never grow a hand-written one.
+    assert all("quota_metric" not in t for t in lam.values())
+    assert all("price_basis_region" not in t for t in lam.values())
+
+
+# -- mock mode: the zero-credential demo ---------------------------------------
+
+
+def mock_mode_client(tmp_path, monkeypatch):
+    """A TestClient over a mock-mode app - where GCP is MockGCPProvider and
+    the catalog is non-empty, which the unconfigured real provider is not."""
+    from fastapi.testclient import TestClient
+    from app.main import create_app
+    from tests.conftest import make_settings
+
+    monkeypatch.delenv("MANIFOLD_MOCK_FORCE", raising=False)
+    return TestClient(create_app(make_settings(tmp_path), mock=True))
+
+
+def test_gcp_catalog_carries_its_quota_metric_and_price_region(tmp_path,
+                                                               monkeypatch):
+    """Phase 111. The launch form joins quota rows to the selected GPU on
+    these two fields. Structured, because the alternative is the client
+    parsing "us-central1" out of a prose sentence or keeping a second copy
+    of the accelerator -> metric table that drifts from gcp_catalog."""
+    with mock_mode_client(tmp_path, monkeypatch) as c:
+        types = c.get("/instance-types?provider=gcp").json()
+        assert types, "mock GCP must offer a catalog"
+        shelf = types["n1-standard-8-t4"]
+        assert shelf["quota_metric"] == "NVIDIA_T4_GPUS"
+        assert shelf["price_basis_region"] == gcp_catalog.PRICE_BASIS_REGION
+        assert gcp_catalog.PRICE_BASIS_REGION in shelf["price_basis"]
+        # A shape the shelf does not carry has NO metric rather than one
+        # guessed from its GPU name: the form renders that as "cannot tell".
+        assert "quota_metric" not in types["g2-standard-12"]
+
+
+def test_mock_quota_is_roomy_and_says_it_is_fixture(tmp_path, monkeypatch):
+    """Phase 111. Mock mode had no gpu_quota at all, so the flagship
+    zero-spend demo opened on "no regional GPU quota here yet" with a dead
+    request link. Fixture rows now answer, and say they are fixture."""
+    with mock_mode_client(tmp_path, monkeypatch) as c:
+        body = c.get("/gcp/quota?region=us-central1-a").json()
+        assert body["mock"] is True
+        rows = {q["metric"]: q for q in body["quotas"]}
+        glob = rows["GPUS_ALL_REGIONS"]
+        assert glob["scope"] == "global"
+        assert glob["limit"] - glob["usage"] >= 8
+        t4 = rows["NVIDIA_T4_GPUS"]
+        # Scope is the region asked for, spelled the way Google spells it.
+        assert t4["scope"] == "us-central1"
+        assert t4["limit"] - t4["usage"] >= 1
 
 
 @pytest.mark.asyncio

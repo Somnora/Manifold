@@ -108,11 +108,37 @@ export type InstanceTypeInfo = {
   // Present when the price is a dated list price rather than a live meter
   // (GCP v1). The string IS the honesty label; show it near the number.
   price_basis?: string;
+  // The region price_basis is quoted in ("us-central1"), as a field so no
+  // screen has to parse it out of that sentence. GCP only.
+  price_basis_region?: string;
+  // The provider quota metric a launch of this shape is gated on
+  // ("NVIDIA_T4_GPUS"). GCP only, and absent for a shape whose gating
+  // metric is unknown - never guessed from the GPU name.
+  quota_metric?: string;
   specs: { vcpus: number; memory_gib: number; storage_gib: number; gpus: number };
   regions_with_capacity: string[];
 };
 
 export type Region = { code: string; name: string };
+
+// One provider quota row, verbatim: `scope` is "global" or the region
+// Google reported it for, and limit/usage are Google's own numbers.
+export type GcpQuotaRow = {
+  metric: string;
+  limit: number;
+  usage: number;
+  scope: string;
+};
+
+export type GcpQuota = {
+  quotas: GcpQuotaRow[];
+  project: string;
+  // Absent when the backend has no project id to name in the link. A quota
+  // console URL without one opens whichever project the browser used last,
+  // which is not the project these rows describe.
+  request_url?: string;
+  mock?: boolean;
+};
 
 export type ModelPreset = {
   label: string;
@@ -760,12 +786,10 @@ export const api = {
 
   // Phase 87: the number that actually gates a first GCP launch. Fresh
   // projects hold ZERO GPU quota, so the form shows it before the click.
+  // Every row the provider returned, unfiltered; the caller decides which
+  // of them can gate the launch it is about to make.
   gcpQuota: (region?: string) =>
-    request<{
-      quotas: { metric: string; limit: number; usage: number; scope: string }[];
-      project: string;
-      request_url: string;
-    }>(`/gcp/quota${region ? `?region=${region}` : ""}`),
+    request<GcpQuota>(`/gcp/quota${region ? `?region=${region}` : ""}`),
 
   createFilesystem: (name: string, region: string) =>
     request<Filesystem>("/filesystems", {

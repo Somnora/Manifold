@@ -6762,3 +6762,123 @@ the first had just rebuilt. `sweep_provisioning` is now a guard around
 because the other caller is asking the same questions of the same box and
 writes what it learns to the row. Pinned by a test that fails (two redials)
 with the guard removed.
+
+## 2026-08-19 — Phase 111: the GCP launch form stops making a healthy project look broken
+
+The owner switched the provider toggle to Google Cloud and asked what was
+wrong. Nothing was wrong - he has ample quota - and he was about to go
+request more of what he already had. The region beside it had defaulted to
+asia-east1-a (he is in the US) with a us-central1 price printed next to it.
+Everything below is that one screen.
+
+**The reassuring branch was a lie in exactly the case that mattered.** The
+old strip filtered quota rows on `limit > 0` and listed whatever survived,
+so `NVIDIA_T4_GPUS 8/8` - fully consumed, nothing free - passed the filter
+and read as quota you have. The global check tested only `limit === 0`, so
+`GPUS_ALL_REGIONS 4/4` skipped the blocking state entirely and fell through
+to the same reassuring list. And the threshold was wrong for every
+multi-GPU shape: a2-highgpu-8g needs eight, and "limit above zero" says
+nothing about whether eight are free. The gate is now `limit - usage <
+specs.gpus`, read against the SELECTED GPU and the SELECTED zone's region,
+because a quota answer about another shape or another place is not an
+answer about this launch.
+
+**Five states, and the whole point is that they do not look like each
+other.** No data (nothing rendered, or one neutral line when the read
+actually failed), global blocked, regional blocked, cannot tell, healthy.
+Only the two blocked states are amber. "Cannot tell" is its own neutral
+state - the gating row absent from Google's answer says the number is
+missing, not zero - and healthy is the same zinc as the price-basis note
+beside it, with the request link demoted out of the call-to-action
+position. The old code had three states and two of them could render the
+same sentence for opposite facts.
+
+**It never predicts the launch, in either direction.** Not "this will
+fail": an instance terminating right now hands the quota back, which is why
+the blocked copy names terminating and waiting as remedies beside
+requesting more (and names them only when usage is actually above zero -
+against a limit of 0 that advice does nothing). And not "this will
+succeed": quota is permission to ask. RESOURCE_POOL_EXHAUSTED is a separate
+answer Google gives at insert time with quota to spare, so the healthy copy
+claims room and stops - "room to ask, not a promise that Google has one
+free in this zone".
+
+**Mock mode was rendering a blocker that could not exist.** MockGCPProvider
+had no `gpu_quota` at all, so `/gcp/quota` took its `fetch is None` branch
+and answered `{"quotas": [], "project": ""}` - no request_url, though the
+TypeScript type declared it non-optional. The flagship zero-credential demo
+therefore opened on amber "No regional GPU quota here yet" with
+`<a href={undefined}>`. That is the hard rule's exact forbidden move:
+"nobody asked Google" collapsed into "Google said zero". Both halves are
+fixed. The mock now returns roomy fixture rows shaped like Google's (and
+the route says `mock: true`, as the listing routes already do, because
+agents act on this). A provider that genuinely cannot answer now returns
+503 - the same shape the credential-less path already used, which the form
+already handles - rather than a number it does not have. `request_url` is
+omitted when there is no project id, because that URL without one opens
+whichever project the browser used last, and the copy stands on its own
+without a link.
+
+**The COMMITTED_ rows were printing a number Google never sent.** Google
+fills "no limit configured" with the int64 sentinel 9223372036854775807. It
+survives JSON intact and then rounds in the JavaScript float to
+9223372036854776000 - which is what the banner was showing the user. Those
+rows are gone from the screen (they cannot gate anything anyway), and the
+mock fixture deliberately carries one so anything rendering this payload
+has to cope with it.
+
+**Only two rows can gate a launch this form produces, and the filter says
+why.** PREEMPTIBLE_* cannot, because the GCE launch path sets no
+provisioning model - every Manifold launch is on-demand. COMMITTED_* cannot,
+because Manifold buys no commitments. That leaves the selected family's
+regional metric and the global cap. The comment on the filter names the
+reason rather than the rule, so whoever ships spot launches sees that
+PREEMPTIBLE_* becomes gating on the same screen. The filtering is
+presentation only: `/gcp/quota` still returns every row Google sent, for
+agents and for the console link.
+
+**Two new catalog fields, because the alternative was string parsing.**
+`quota_metric` and `price_basis_region` ride each GCP catalog entry beside
+the existing `price_basis`. The form joins quota rows to the selection on
+them. The alternatives were parsing "us-central1" out of the price_basis
+prose (breaks the first time that sentence is reworded) or keeping a second
+copy of the accelerator -> metric table in TypeScript (drifts from
+`gcp_catalog.quota_metric` the first time Google adds a family). A shape
+that is not on the shelf gets NO metric rather than one guessed from its
+GPU name - the form renders that as "cannot tell", which is what it is.
+
+**The region default gained one step, and Lambda's blast radius is zero.**
+Order is now: a region where a filesystem already lives (unchanged - that
+is Lambda's deliberate and good behaviour), then the region the listed
+prices are quoted in, then the first available. GCP zones arrive sorted, so
+the raw first was asia-east1-a; GCP has no filesystems, so the old fallback
+always won. The new step keys on `price_basis_region`, a field only GCP
+entries carry, and it only ever picks among `regions_with_capacity` - no
+capacity is hidden and the dropdown still lists everything. Reusing the
+dropdown's own sort would NOT have worked: `/regions?provider=gcp` returns
+`name: code`, so its localeCompare is the same alphabetical order.
+
+**The price still shows outside us-central1; one line says so.** When the
+selected zone's region differs from the priced one, the note adds "you have
+asia-east1 selected, and Google prices per region - Manifold does not have
+that region's rate". Suppressing the price was rejected: relative price is
+the primary decision variable, and the GPU dropdown renders before a region
+even exists. Inventing a regional multiplier was never on the table.
+
+**`zone_to_region` no longer truncates a region.** Blind `rsplit("-", 1)`
+turned "us-central1" into "us", which then travelled as the scope label on
+quota rows - a place name Google does not have. It now strips a trailing
+single letter only, and anything already a region comes back untouched. The
+dashboard has the same three-line rule for the same reason.
+
+**Deliberately not built: staleness degradation on the price label.** An
+age threshold that flips PRICES_RECORDED amber after N days would be an
+invented judgement with no evidence stream behind it until the Billing
+Catalog API lands. The printed date is the honest staleness signal.
+
+Verified with the real component in a real browser: the mock backend on
+:8123, the static export on :3000, and playwright substituting Google's
+answer for the states mock mode cannot reach. All five states plus the
+edges (limit 0, no request_url, the int64 sentinel present in the payload,
+an 8-GPU shape against 7 free A100s) render as designed, and the GCP
+default region lands on us-central1-a against an alphabetical zone list.

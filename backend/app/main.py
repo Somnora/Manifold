@@ -1369,9 +1369,21 @@ def create_app(
                 422, f"Unknown provider '{provider}'. Registered: {known}.")
         specs = await cloud.list_instance_types()
         basis = ""
+        basis_region = ""
+        quota_metrics: dict[str, str] = {}
         if provider == "gcp":
-            from .providers.gcp_catalog import PRICE_BASIS
-            basis = PRICE_BASIS
+            from .providers import gcp_catalog
+            basis = gcp_catalog.PRICE_BASIS
+            basis_region = gcp_catalog.PRICE_BASIS_REGION
+            # The regional quota metric each shape is gated on, joined by
+            # catalog name. Structured, because the alternative is the
+            # client re-deriving it from a display string or keeping its own
+            # copy of the accelerator -> metric table, and a second copy
+            # drifts from gcp_catalog.quota_metric the first time Google
+            # adds a family. A shape that is not on the shelf gets NO
+            # metric: absent, never guessed.
+            quota_metrics = {e.name: gcp_catalog.quota_metric(e)
+                             for e in gcp_catalog.SHELF}
         return {
             t.name: {
                 "description": t.description,
@@ -1382,6 +1394,13 @@ def create_app(
                 # Dated list price, not a live meter: the label rides every
                 # entry so no screen can show the number without it.
                 **({"price_basis": basis} if basis else {}),
+                # The region that price is quoted in, as a field rather than
+                # a sentence, so a screen can tell whether the selected zone
+                # is the one being priced.
+                **({"price_basis_region": basis_region} if basis_region
+                   else {}),
+                **({"quota_metric": quota_metrics[t.name]}
+                   if t.name in quota_metrics else {}),
                 # storage size is not part of the cross-provider spec;
                 # 0 is honest here where a guess would not be.
                 "specs": {"vcpus": t.vcpus, "memory_gib": t.ram_gb,
@@ -1413,11 +1432,24 @@ def create_app(
 
         Fresh projects hold ZERO GPU quota, and that - not code - is what
         blocks a first GCP launch. The launch form shows this number before
-        the click; the error after the click links the request page."""
+        the click; the error after the click links the request page.
+
+        Every GPU row Google returned comes back unfiltered - an agent
+        asking this question wants the whole answer, and the console link
+        opens the same list. Which rows can actually gate a launch is the
+        caller's judgement, not this route's."""
         cloud = orchestrator.providers.get_provider("gcp")
         fetch = getattr(cloud, "gpu_quota", None)
         if fetch is None:
-            return {"quotas": [], "project": ""}
+            # A provider that cannot read quota must not answer with zero.
+            # `{"quotas": []}` is indistinguishable from "Google says you
+            # hold none", and that reading turns a healthy project into a
+            # blocker on the launch form. 503 is what the credential-less
+            # path already returns, and callers already handle it.
+            raise HTTPException(
+                503,
+                "This Google Cloud provider cannot read quota, so Manifold "
+                "cannot say what the project holds.")
         from .providers.gcp_catalog import zone_to_region
         target = zone_to_region(region) if region else "us-central1"
         try:
@@ -1426,11 +1458,17 @@ def create_app(
             raise HTTPException(503, str(exc))
         except ProviderError as exc:
             raise HTTPException(502, str(exc))
-        return {"quotas": rows,
-                "project": getattr(cloud, "project_id", ""),
-                "request_url": (
-                    f"https://console.cloud.google.com/iam-admin/quotas"
-                    f"?project={getattr(cloud, 'project_id', '')}")}
+        project = getattr(cloud, "project_id", "")
+        # Agents act on this data: fixture rows must be self-identifying.
+        out = {"quotas": rows, "project": project, "mock": mock}
+        if project:
+            # Without a project id there is no honest link to give: that URL
+            # lands on whichever project the browser used last, which is not
+            # the one these numbers describe.
+            out["request_url"] = (
+                f"https://console.cloud.google.com/iam-admin/quotas"
+                f"?project={project}")
+        return out
 
     @app.get("/launch-options")
     async def launch_options_route(provider: str | None = None):
