@@ -129,6 +129,27 @@ def test_launch_progress_booting_has_countdown():
     assert "i-boot" in out["phase_detail"]
 
 
+def test_launch_progress_reports_provisioning_once_ssh_is_up():
+    """'booting' spans two windows and only the first one has that deadline.
+    Once SSH answers, the boot countdown is measuring a deadline that no
+    longer decides anything, so it goes away and the detail says what is
+    actually happening on the box."""
+    launch = {
+        "status": "booting",
+        "lambda_instance_id": "i-gce",
+        "launched_at": "2026-08-17T00:00:00+00:00",
+        "connected_at": "2026-08-17T00:01:30+00:00",
+    }
+    out = launch_progress(launch, 2400.0, "2026-08-17T00:04:30+00:00", 1200.0)
+
+    assert out["phase"] == "waiting_for_active"      # no new vocabulary
+    assert out["settled"] is False
+    assert "i-gce" in out["phase_detail"]
+    assert "180s of 1200s" in out["phase_detail"]
+    assert "boot_remaining_seconds" not in out
+    assert "boot_elapsed_seconds" not in out
+
+
 def test_launch_progress_booting_clamps_when_past_timeout():
     launch = {
         "status": "booting",
@@ -189,7 +210,14 @@ async def test_resume_finishes_a_still_booting_launch(tmp_path, db):
 
 async def test_resume_marks_active_when_adopt_already_reconnected(tmp_path, db):
     """If the instance finished booting during the downtime, adopt reconnects
-    it and resume just closes out the still-'booting' launch record."""
+    it and resume hands the still-'booting' record to the provisioning gate.
+
+    Phase 110 changed WHO closes this record. It used to be closed here, on
+    the strength of a connection existing - the one path that reached
+    'active' without ever asking the box whether it was set up. Now the same
+    gate the launch pipeline uses does it, and a ready box passes on its
+    first pass, so the outcome is unchanged for an instance that IS ready.
+    """
     settings = make_settings(tmp_path)
     mock = MockLambdaClient()
     mock.instances["i-boot"] = InstanceInfo(
@@ -203,7 +231,10 @@ async def test_resume_marks_active_when_adopt_already_reconnected(tmp_path, db):
     assert "i-boot" in orch.connections
     resumed = await orch.resume_pending_launches()
     assert resumed == 1
-    assert db.get_launch(launch_id)["status"] == "active"
+
+    settled = await orch.wait_for_launch(launch_id, timeout=3.0)
+    assert settled["status"] == "active"
+    assert settled["connected_at"] is not None
 
 
 async def test_resume_fails_booting_launch_with_no_instance(tmp_path, db):

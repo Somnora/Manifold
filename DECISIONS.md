@@ -6617,3 +6617,136 @@ to answer (--doctor --handshake needs no running backend - verified
 against a dead port). What only a real install can settle, as with every
 desktop change: the msi layout on real Windows, and dmg behavior under
 Gatekeeper quarantine (CI-built apps are never quarantined).
+
+## 2026-08-19 — Phase 110: "the provider says active" is not "the machine works"
+
+The three findings from the first real GCP launch, fixed. On Lambda,
+provider-active effectively means sshd is up and the image is already
+provisioned, so the launch pipeline could treat the two as one fact. On a
+stock-Ubuntu GCE box they are six minutes apart: RUNNING at ~36s, sshd at
+~90s, cloud-init done (NVIDIA driver built, Docker, the NVIDIA runtime, the
+sidecar) at ~7 minutes. Everything below follows from separating them.
+
+**The launch row stays 'booting' through the new gate. No new status.** A
+'provisioning' status was designed and rejected: resume_pending_launches
+skips anything that is not 'booting', so a restart would strand every row in
+it; launch_progress would fall through to its empty-detail fallback and lose
+the boot countdown; the dashboard's booting card branches on the phase; and
+the MCP status enumeration would go stale. Keeping 'booting' makes the ROW
+the state, and restart survival comes free - which is the same reason the
+gate is a reconciler rather than a hook.
+
+**connected_at is a new column, and it is the anchor.** Persisted, not held
+in memory, because cloud-init keeps working while the backend is restarting
+- a --reload dev loop that handed every box a fresh window would never
+notice one that is stuck. Deliberately different from _wait_until_active's
+restart-forgiveness (a fresh timeout window per resume), which is right for
+a window measuring OUR polling and wrong for one measuring the box's own
+work. NULL means "we never observed SSH", never "SSH came up at time zero".
+
+**The gate is a reconciler; the launch task drives the same function as a
+fast path.** sweep_provisioning rides the telemetry tick beside
+_sweep_bootstrap, for the same reason Phase 104 gave: three sites open a
+connection (the pipeline, resume-after-downtime, adoption) and at none of
+them is readiness knowable, so nothing fires at a transition. It is also
+awaited in a bounded loop by _establish_connection and by the
+resume-after-downtime path - not as a second implementation (there is one:
+the sweep decides, the row records) but so a ready box is promoted in
+milliseconds instead of up to one telemetry interval, and so wait_for_launch
+still returns a settled launch. Lose that task to a crash and the sweep
+picks the row up exactly where it was.
+
+**A separate provisioning budget, and its expiry never destroys anything.**
+boot_timeout_seconds is 2400s calibrated to the provider-boot worst case
+alone; folding cloud-init's tail into it would make today's successful
+40-minute Lambda boots start failing. launch.provisioning_timeout_seconds
+(1200s) is measured from connected_at. When it runs out the row FAILS with
+the same honest copy the boot timeout uses - it may still be running and
+billing, check the dashboard - and the instance is left alone. Terminating
+here would be the worst possible moment for it: a box whose sidecar never
+came up is a box the rescue can save nothing from, so the tidy-up would be
+pure data loss. The wait for the FIRST connection is bounded by the same
+number, because a box whose sshd never answers never earns a connected_at
+and would otherwise sit in 'booting' forever.
+
+**The init signal moved from /var/run to /var/lib, and finally has a
+reader.** cloud-init has ended with `touch /var/run/manifold-init-done`
+since Phase 5 and nothing ever read it. /var/run is tmpfs: a driver-upgrade
+reboot mid-setup (a documented, normal event on these boxes) erases the
+marker while cloud-init's per-instance stage never runs again, so a rebooted
+box would be waited on forever. It is now /var/lib/manifold/init-done. Under
+`set -e`, reaching that line is the claim that every line above it
+succeeded, which is strictly stronger than cloud-init's own boot-finished -
+a reboot rewrites boot-finished at the end of the NEXT boot while the
+per-instance script stays incomplete. boot-finished is kept as the FALLBACK
+only: marker absent but cloud-init finished promotes the launch with the
+failure recorded on the row and in the audit log, because waiting out a
+20-minute budget on a box that is as done as it will ever be is just money.
+
+**The shipped setfacl fix was a no-op, and `|| true` hid it.** cloud-init
+has run `setfacl -m u:ubuntu:rw /var/run/docker.sock` since the GCE gate,
+correctly placed after the docker restart, precisely to repair the
+already-open SSH session that authenticated before `usermod -aG docker`.
+It never ran: setfacl comes from the `acl` package, stock GCE Ubuntu does
+not ship it, so the line was "command not found" - swallowed by its own
+`|| true`. That is why no template job could run on GCP. The package is now
+installed and BOTH lines echo a WARNING on failure instead of passing
+silently. The general lesson, worth more than the fix: `|| true` on a repair
+converts "this did not work" into "this is fine", and the one image that
+needed the repair is the one image where nobody saw it fail.
+
+**Belt and braces: the gate asks whether THIS session can reach docker.**
+Supplementary groups are fixed when a session is established, so the ACL is
+the only thing that can repair a live connection - and if it did not apply,
+the session is permanently locked out. `test ! -e /var/run/docker.sock ||
+test -w /var/run/docker.sock` asks the question that matters (the ACL
+answers it, a group list does not) and fails open on a box with no socket.
+ONLY on failure does the gate redial, because a redial drops every channel
+on the connection - an open terminal, a streaming job.
+
+**Redial is a new primitive on ManagedConnection, and it is not close().**
+close() is terminal (_closing=True, supervisor cancelled) with no restart,
+and replacing the object in orchestrator.connections would leak a supervisor
+that redials forever. redial() closes only the underlying asyncssh
+connection, which _supervise is already waiting on: it wakes, reconnects
+with the normal backoff, and the object, its state machine, its dict entry
+and its host-key pin all survive. Sidecar and model forwards are per-call,
+so they are unaffected.
+
+**_sweep_bootstrap asks the init signal itself.** Not because the gate
+leaves it false - the gate makes it true for everything it promotes - but
+because orphan repair legitimately flips a FAILED row to active whenever the
+instance is alive, which mints an active row that passed no gate. Without
+its own check, a box that exceeded the provisioning budget would be repaired
+to active and then burn its one exactly-once bootstrap marker on a machine
+with no /workspace/ephemeral. That is exactly what happened on 2026-08-17:
+the script exited 1 with three "No such file or directory" errors, and the
+marker then correctly refused the retry that would have saved it.
+
+**The idle sweep skips booting rows.** It judges every CONNECTED instance
+regardless of launch status, and the per-launch idle floor is 300s - shorter
+than a ~7 minute provision. Premature-active plus the early bootstrap's
+touch_activity had been masking that; under the gate a short idle timeout
+would have reaped a box mid-setup, with nothing rescuable. The boot and
+provisioning budgets own that window; the idle clock starts when the box
+becomes usable.
+
+**The boot countdown stops when the boot does.** launch_progress emits
+boot_elapsed/timeout/remaining only while the instance is still coming up on
+the provider. Once connected_at is set those numbers are counting down a
+deadline that no longer decides anything, so they are omitted and
+phase_detail says what is actually happening ("SSH is up on <id>; installing
+drivers and runtime (180s of 1200s)"). No new phase key and no new payload
+key: the vocabulary is unchanged, the strings are honest. The 'active'
+detail is no longer "SSH is up; the instance is ready" either - that
+sentence names the earlier milestone, and saying it was how a launch
+announced itself ready six minutes early.
+
+**Not done, named so it is a choice and not an oversight:** job dispatch
+still keys on the CONNECTION being CONNECTED, not on the launch being
+active, so a job queued against a provisioning box can still be dispatched
+into it. The first-job GPU preflight (a real `docker run --gpus all`) is
+what stands between that and a doomed container today, and it is not
+nothing, but it is a 180s bound rather than a gate. Widening dispatch to
+consult the launch status is a separate change with its own failure mode (an
+orphan-repaired box has an 'active' row that proves nothing).

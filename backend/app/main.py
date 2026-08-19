@@ -4032,8 +4032,10 @@ def create_app(
     async def list_launches():
         now = utcnow()
         boot_timeout = settings.launch.boot_timeout_seconds
+        provisioning = settings.launch.provisioning_timeout_seconds
         return {"launches": [
-            launch_progress(l, boot_timeout, now) for l in db.list_launches()
+            launch_progress(l, boot_timeout, now, provisioning)
+            for l in db.list_launches()
         ]}
 
     @app.get("/launches/{launch_id}")
@@ -4042,7 +4044,8 @@ def create_app(
         if launch is None:
             raise HTTPException(404, f"launch {launch_id} not found")
         return launch_progress(
-            launch, settings.launch.boot_timeout_seconds, utcnow()
+            launch, settings.launch.boot_timeout_seconds, utcnow(),
+            settings.launch.provisioning_timeout_seconds,
         )
 
     @app.get("/launches/{launch_id}/wait")
@@ -4057,7 +4060,8 @@ def create_app(
         if launch is None:
             raise HTTPException(404, f"launch {launch_id} not found")
         return launch_progress(
-            launch, settings.launch.boot_timeout_seconds, utcnow()
+            launch, settings.launch.boot_timeout_seconds, utcnow(),
+            settings.launch.provisioning_timeout_seconds,
         )
 
     # -- cost/utilization intelligence (read-only; advisory) -----------------------

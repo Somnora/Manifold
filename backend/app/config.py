@@ -75,6 +75,15 @@ class LaunchPolicy:
     # still booting; 2400s (40 min) is the observed ceiling with headroom.
     boot_timeout_seconds: float = 2400.0
     boot_poll_seconds: float = 10.0
+    # Phase 110: the SECOND window, and deliberately not part of the one
+    # above. boot_timeout_seconds covers "the provider says RUNNING"; this
+    # covers "SSH answers" -> "cloud-init finished installing the driver,
+    # Docker, the NVIDIA runtime and the sidecar", anchored at connected_at.
+    # Observed on a stock-Ubuntu GCE T4: RUNNING at ~36s, sshd at ~90s,
+    # cloud-init done at ~7 min. 1200s leaves room for a DKMS driver build
+    # without folding that tail into the boot budget - doing that would make
+    # today's successful 40-minute Lambda boots start failing.
+    provisioning_timeout_seconds: float = 1200.0
     # How often the backend sweeps for active instances it has no managed
     # connection to (launched from the Lambda console or a raw API script,
     # or launched while the backend was down). 0 disables the sweep.
@@ -484,6 +493,8 @@ def load_settings(
             fallback_instance_types=tuple(launch.get("fallback_instance_types") or ()),
             boot_timeout_seconds=float(launch.get("boot_timeout_seconds", 2400)),
             boot_poll_seconds=float(launch.get("boot_poll_seconds", 10)),
+            provisioning_timeout_seconds=float(
+                launch.get("provisioning_timeout_seconds", 1200)),
             adopt_poll_seconds=float(launch.get("adopt_poll_seconds", 30)),
         ),
         tasks=TaskSettings(

@@ -89,7 +89,14 @@ systemctl restart docker || true
 # docker socket forever. An ACL is checked at open() time, not session
 # start, so it fixes the already-open session too. Placed after the docker
 # restart because restarting the daemon recreates the socket.
-setfacl -m u:ubuntu:rw /var/run/docker.sock || true
+#
+# setfacl lives in the `acl` package, which stock GCE Ubuntu does NOT ship.
+# Without this install the line below was "command not found", swallowed by
+# its own `|| true`, on the ONE image the fix was written for - so the fix
+# shipped and never ran. Both lines say so out loud now: a repair that can
+# fail silently is a repair nobody can trust.
+command -v setfacl >/dev/null || apt-get install -y -qq acl || echo "manifold: WARNING acl install failed (docker socket ACL cannot be applied)"
+setfacl -m u:ubuntu:rw /var/run/docker.sock || echo "manifold: WARNING setfacl on the docker socket failed (sessions opened before this may not reach docker)"
 # Boot-time proof that GPU containers work, recorded in this init log (view
 # it from the in-app Terminal: cat /var/log/manifold-init.log). Also warms
 # the base image gpu-smoke uses.
@@ -149,7 +156,20 @@ grep -q '.local/bin' /home/ubuntu/.bashrc 2>/dev/null \
   || echo 'export PATH="$HOME/.local/bin:$PATH"' >> /home/ubuntu/.bashrc
 chown ubuntu:ubuntu /home/ubuntu/.bashrc || true
 {tailscale_block}
-touch /var/run/manifold-init-done
+# --- The init signal -------------------------------------------------------
+# The one thing the backend reads to learn that this machine is PROVISIONED,
+# not merely reachable over SSH (Phase 110). Under `set -e` reaching this
+# line means every line above it succeeded, which is a stronger claim than
+# cloud-init's own boot-finished can make: a reboot rewrites boot-finished at
+# the end of the NEXT boot while the per-instance user-data script stays
+# incomplete.
+#
+# /var/lib, not /var/run: /var/run is tmpfs, so a driver-upgrade reboot
+# mid-setup would erase the marker while cloud-init's per-instance stage
+# never runs again - and the backend would wait for a file that can no
+# longer appear.
+install -d /var/lib/manifold
+touch /var/lib/manifold/init-done
 """
 
 _TAILSCALE_BLOCK = """

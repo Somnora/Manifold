@@ -242,12 +242,19 @@ export type Launch = {
   error: string | null;
   lambda_instance_id: string | null;
   launched_at: string | null;
+  // Phase 110: the first moment SSH answered. Not the same fact as
+  // active_at - a stock-Ubuntu GCE box is reachable minutes before its
+  // drivers and runtime are installed. Null means we never saw it connect.
+  connected_at?: string | null;
   active_at: string | null;
   terminated_at: string | null;
   // Structured progress (backend-computed; see launch_progress).
   phase?: string;
   phase_detail?: string;
   settled?: boolean;
+  // The boot countdown, present only while the instance is still coming up
+  // on the provider. Once connected_at is set that deadline is past and
+  // these stop being sent; phase_detail carries the setup step instead.
   boot_elapsed_seconds?: number;
   boot_timeout_seconds?: number;
   boot_remaining_seconds?: number;

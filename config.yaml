@@ -22,6 +22,20 @@ launch:
   # 900s cut those off mid-boot. 2400s (40 min) covers the observed worst case.
   boot_timeout_seconds: 2400
   boot_poll_seconds: 10
+  # The SECOND window, and a separate budget on purpose. The one above ends
+  # when the provider says the instance is RUNNING; this one covers what
+  # happens next - SSH comes up, then cloud-init installs the NVIDIA driver,
+  # Docker, the container runtime and the sidecar. On a stock-Ubuntu GCE T4
+  # that is RUNNING at ~36s, sshd at ~90s and provisioned at ~7 minutes, so
+  # a launch marked "ready" at 36s handed out a machine that could not run a
+  # single job. Folding this tail into boot_timeout_seconds instead would
+  # make today's successful 40-minute Lambda boots start failing.
+  #
+  # Measured from the first moment SSH answers (connected_at on the launch
+  # row). When it runs out the launch FAILS and says so - the instance is
+  # never destroyed, because a box whose sidecar never came up is a box
+  # nothing can be rescued from.
+  provisioning_timeout_seconds: 1200
   # How often to sweep for active instances with no managed connection
   # (launched from the Lambda console, a raw API script, or while the
   # backend was down) and connect to them. 0 disables the sweep.

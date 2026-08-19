@@ -419,6 +419,15 @@ class Database:
         # "run + 40 minutes" by hand to absorb boot; folklore a platform
         # exists to absorb. NULL = unset, the default.
         self._ensure_column("launches", "max_active_seconds", "REAL")
+        # Phase 110: the first moment SSH answered on this box. NOT the same
+        # fact as active_at - on a stock-Ubuntu GCE image sshd is up minutes
+        # before cloud-init has finished installing the driver and Docker -
+        # and it is the anchor for the provisioning budget, so it lives in
+        # the row rather than in memory: a backend restart must not hand a
+        # half-provisioned box a fresh window. NULL on every historical row
+        # and on any launch we never saw connect, which reads as "we never
+        # observed SSH", not as "SSH came up at time zero".
+        self._ensure_column("launches", "connected_at", "TEXT")
         # Phase 76b: a telemetry sample describes the whole box, not GPU 0.
         # Rows written before this exist and have both columns NULL, which
         # spend.idle_spend reads as "that span was never measured" rather
@@ -612,7 +621,8 @@ class Database:
         allowed = {
             "status", "attempts", "error", "lambda_instance_id",
             "launched_type", "hourly_rate_cents",
-            "launched_at", "active_at", "terminated_at", "keep_alive",
+            "launched_at", "connected_at", "active_at", "terminated_at",
+            "keep_alive",
             "idle_timeout_seconds", "last_seen_at", "resolved_at",
             "max_lifetime_seconds", "max_active_seconds",
         }

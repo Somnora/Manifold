@@ -522,14 +522,15 @@ class Dispatcher:
         inside the launch path, where a crash loses the start with nothing
         recording that it was owed.
 
-        So nothing fires at the transition. This asks four questions on
-        every telemetry tick and starts the bootstrap when all four hold:
+        So nothing fires at the transition. This asks five questions on
+        every telemetry tick and starts the bootstrap when all five hold:
 
           1. the launch row is active,
           2. it carries bootstrap text,
           3. this connection is CONNECTED (the caller has already
              established that - it is why we are in this loop at all),
-          4. no detached row carries this launch's bootstrap note.
+          4. no detached row carries this launch's bootstrap note,
+          5. the box says its own setup finished (Phase 110).
 
         (4) is the exactly-once guarantee, and it is a row in SQLite rather
         than a flag in memory, so a backend restart cannot forget it and a
@@ -538,6 +539,18 @@ class Dispatcher:
         the next tick asks again. An adopted box has no launch row and no-
         ops at question 1; an auto-manage launch carries no script and
         no-ops at question 2.
+
+        (5) is asked HERE and not left to the gate, even though the gate
+        makes it true for every launch it promotes. Orphan repair flips a
+        FAILED row to active whenever the instance is alive, which is right
+        for cost accounting and mints an active row that passed no gate. A
+        GCE box that ran out of provisioning budget would otherwise be
+        repaired to active and burn its one bootstrap start on a machine
+        with no /workspace/ephemeral - which is exactly what happened on
+        2026-08-17: the script exited 1 with three "No such file or
+        directory" errors, and (4) then correctly prevented the retry that
+        would have saved it. The guarantee is this function's, so the
+        question is this function's.
         """
         from . import bootstrap as boot
         from . import detached as det
@@ -556,6 +569,14 @@ class Dispatcher:
         note = boot.note_for(launch["id"])
         if self.db.find_detached_by_note(note) is not None:
             return                      # already started; never start twice
+        # Asked last, so a launch that has already run its bootstrap never
+        # pays for it again. "incomplete" counts as go: cloud-init has
+        # stopped, the marker is never going to appear, and refusing to run
+        # the user's setup script forever on a box that is otherwise up
+        # would lose it as surely as running it too early did.
+        if await self.orchestrator.provisioning_signal(conn) not in (
+                "ready", "incomplete"):
+            return
         started = await det.start_detached(
             conn, self.db, instance_id=instance_id, command=script,
             note=note, created_by=launch.get("created_by"))
@@ -1724,6 +1745,22 @@ class Dispatcher:
 
                 # -- idle verdict. Pinned by a BATCH task only (Phase 90); a
                 # server is judged by whether anyone is using it, below.
+                if (launch or {}).get("status") == "booting":
+                    # Still provisioning (Phase 110). SSH answers minutes
+                    # before cloud-init finishes on a stock-Ubuntu image, so
+                    # this box is CONNECTED and doing nothing Manifold can
+                    # see - and the per-launch idle floor is 300s, shorter
+                    # than a ~7 minute GCE provision. Judging it here would
+                    # reap a machine mid-setup, with nothing rescuable
+                    # because its sidecar is not up yet. The boot and
+                    # provisioning budgets own this window; the idle clock
+                    # starts when the box becomes usable.
+                    self._note_activity(
+                        instance_id, "booting", True,
+                        "still provisioning (installing drivers and "
+                        "runtime); the idle timeout does not start until "
+                        "the launch is active")
+                    continue
                 if instance_id in auto_owned:
                     self._note_activity(
                         instance_id, "auto_managed", True,
@@ -2609,6 +2646,19 @@ class Dispatcher:
         for instance_id, conn in list(self.orchestrator.connections.items()):
             if conn.state != ConnectionState.CONNECTED:
                 continue
+            # The provisioning gate (Phase 110) goes first: it is what turns
+            # a still-'booting' launch into an active one, and the bootstrap
+            # sweep below only fires on an active launch. Same shape and the
+            # same reason - three paths open a connection and none of them
+            # is a moment at which readiness could be decided, so this asks
+            # the row and the box on every tick instead.
+            try:
+                await self.orchestrator.sweep_provisioning(instance_id, conn)
+            except Exception:   # noqa: BLE001 - a gate that could not run
+                # must never break telemetry. The launch stays 'booting',
+                # which is the truth, and the next tick asks again.
+                logger.exception("provisioning sweep failed for %s",
+                                 instance_id)
             # The launch bootstrap (Phase 104), before the probe rather
             # than after it, so a script started on this tick is confirmed
             # alive on this tick and protects its box immediately. Nothing

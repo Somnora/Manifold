@@ -426,10 +426,13 @@ async def get_launch_status(launch_id: str, note: str = "") -> dict:
     -> booting -> active | failed. Returns a stable `phase`
     (requesting_capacity | retrying_capacity | waiting_for_active | ready |
     failed | terminated), a human `phase_detail`, and `settled` (true once
-    nothing more will change). While booting it also returns
-    boot_elapsed_seconds / boot_timeout_seconds / boot_remaining_seconds.
-    For a slow boot, prefer wait_for_launch: one blocking call instead of a
-    poll loop."""
+    nothing more will change). While it waits for the instance to boot it
+    also returns boot_elapsed_seconds / boot_timeout_seconds /
+    boot_remaining_seconds; once SSH is up those stop (that deadline is
+    past) and phase_detail reports the setup step instead - a box is not
+    'active' until its drivers and runtime are installed, so a job started
+    before then would fail. For a slow boot, prefer wait_for_launch: one
+    blocking call instead of a poll loop."""
     return await _call(
         "get_launch_status", "GET", f"/launches/{launch_id}",
         note=note, args={"launch_id": launch_id},

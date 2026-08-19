@@ -23,6 +23,10 @@ Control flow for a launch:
 6. CONNECT    ask the launch's ConnectionManager for the dial target (the
               only mode-specific step) and start a ManagedConnection, which
               keeps itself alive with reconnect+backoff from then on.
+7. PROVISION  the launch stays "booting" until the box says its own setup
+              finished (cloud-init: driver, Docker, runtime, sidecar). Only
+              then does it become "active". SSH answering is not the same
+              fact as the machine being usable - see sweep_provisioning.
 """
 
 from __future__ import annotations
@@ -93,6 +97,37 @@ MAX_EXTRA_FILESYSTEMS = 4
 NVIDIA_SMI_METRICS = (
     "nvidia-smi --query-gpu=name,memory.used,memory.total,utilization.gpu "
     "--format=csv,noheader,nounits"
+)
+
+# -- the provisioning gate's three questions (Phase 110) -----------------------
+#
+# "The provider says RUNNING" is not "the machine is ready". On Lambda the two
+# nearly coincide; on a stock-Ubuntu GCE image sshd answers minutes before
+# cloud-init has finished building the NVIDIA driver, installing Docker and
+# starting the sidecar. These are the cheapest questions that tell the
+# difference, asked over the managed connection.
+
+# 1. Did OUR cloud-init run to completion? The script sets -e, so the marker
+#    exists only if every line before it succeeded. Durable path on purpose
+#    (see cloud_init.py): /var/run is tmpfs and a reboot would erase it.
+INIT_MARKER_PROBE = "test -f /var/lib/manifold/init-done"
+
+# 2. If not: has cloud-init itself given up the boot? Weaker evidence - a
+#    reboot rewrites boot-finished at the end of the NEXT boot while the
+#    per-instance user-data script stays incomplete - so it is only ever the
+#    fallback that stops us waiting forever on a billing box.
+CLOUD_INIT_DONE_PROBE = "test -f /var/lib/cloud/instance/boot-finished"
+
+# 3. Can THIS SSH session use the docker socket? Supplementary groups are
+#    fixed when a session is established, so a connection opened before
+#    cloud-init ran `usermod -aG docker ubuntu` is locked out of Docker for
+#    its whole life - which is exactly how a live GCE box ended up unable to
+#    run any template job. `test -w` honours the POSIX ACL cloud-init sets,
+#    so a box the ACL already repaired answers yes and is not redialled. A
+#    box with no socket at all answers yes too: there is nothing a redial
+#    could fix there (same fail-open rule as the dispatcher's GPU probe).
+DOCKER_ACCESS_PROBE = (
+    "test ! -e /var/run/docker.sock || test -w /var/run/docker.sock"
 )
 
 
@@ -199,28 +234,49 @@ _LAUNCH_PHASES = {
                   "No capacity yet; backing off and retrying"),
     "booting":   ("waiting_for_active",
                   "Instance created; waiting for it to boot and get an IP"),
-    "active":    ("ready", "SSH is up; the instance is ready"),
+    # Not "SSH is up" any more: SSH being up is the milestone BEFORE this
+    # one, and saying so here was how a launch announced itself ready six
+    # minutes early on GCE (Phase 110).
+    "active":    ("ready", "Set up and ready to use"),
     "failed":    ("failed", "Launch did not complete"),
     "terminated": ("terminated", "Instance has been terminated"),
 }
 
 
 def launch_progress(launch: dict, boot_timeout_seconds: float,
-                    now_iso: str) -> dict:
+                    now_iso: str,
+                    provisioning_timeout_seconds: float | None = None) -> dict:
     """Return `launch` enriched with structured progress fields.
 
     Pure (the caller supplies `now_iso`): `phase` is a stable machine label,
     `phase_detail` a one-line human summary, and `settled` tells a poller it
-    can stop. While booting we add `boot_elapsed_seconds` / `boot_timeout_
-    seconds` / `boot_remaining_seconds` so a client renders a countdown rather
-    than a blank.
+    can stop. While the instance is still coming up on the provider we add
+    `boot_elapsed_seconds` / `boot_timeout_seconds` / `boot_remaining_seconds`
+    so a client renders a countdown rather than a blank.
+
+    'booting' spans TWO windows (Phase 110), and the countdown belongs to the
+    first one only. Once connected_at is set the boot wait is over and the
+    box is provisioning itself; leaving the boot countdown on screen would
+    keep ticking down a deadline that no longer decides anything, so the
+    fields are dropped and phase_detail says what is actually happening. The
+    phase label does not change: a client that branches on it keeps working,
+    and a launch that is not usable yet keeps saying so.
     """
     status = launch.get("status", "")
     phase, detail = _LAUNCH_PHASES.get(status, (status or "unknown", ""))
     enriched = dict(launch)
     enriched["phase"] = phase
     enriched["settled"] = status in SETTLED_LAUNCH_STATUSES
-    if status == "booting" and launch.get("launched_at"):
+    if status == "booting" and launch.get("connected_at"):
+        elapsed = _interval_seconds(launch["connected_at"], now_iso)
+        inst = launch.get("lambda_instance_id") or "instance"
+        detail = f"SSH is up on {inst}; installing drivers and runtime"
+        if elapsed is not None:
+            elapsed = max(0.0, elapsed)
+            budget = ("" if provisioning_timeout_seconds is None
+                      else f" of {round(provisioning_timeout_seconds)}s")
+            detail += f" ({round(elapsed)}s{budget})"
+    elif status == "booting" and launch.get("launched_at"):
         try:
             elapsed = (datetime.fromisoformat(now_iso)
                        - datetime.fromisoformat(launch["launched_at"])
@@ -2117,8 +2173,202 @@ class Orchestrator:
     async def _establish_connection(
         self, plan: LaunchPlan, instance: InstanceInfo
     ) -> None:
+        """Open the managed connection, then hand the launch to the gate.
+
+        This used to stamp active right here, one line after conn.start() -
+        which is asynchronous and returns while the supervisor is still
+        CONNECTING. So a launch reported "SSH is up; the instance is ready"
+        before any SSH session existed, and on GCE it said that roughly six
+        minutes before the box could run anything. Worse, active_at is the
+        anchor of the max_active budget, whose contract explicitly excludes
+        boot: ~500s of a 1800s budget was being spent booting.
+
+        Nothing is stamped here now. The row stays 'booting' and the gate
+        (sweep_provisioning) promotes it, from the row's own state, so a
+        backend restart in the middle costs nothing.
+        """
         self._open_connection(plan.connection_mode, instance)
-        self.db.update_launch(plan.launch_id, status="active", active_at=utcnow())
+        await self._await_provisioning(plan.launch_id, instance.id)
+
+    async def _await_provisioning(self, launch_id: str,
+                                  instance_id: str) -> None:
+        """Drive the gate for one launch until it settles.
+
+        The gate is a reconciler and the dispatcher calls the same function
+        on its telemetry tick; this loop is only the fast path, so a launch
+        does not sit in 'booting' for up to one telemetry interval after its
+        box is ready. Everything it decides, it decides in sweep_provisioning
+        and writes to the row - lose this task to a crash or a restart and
+        the sweep picks the launch up exactly where it was.
+
+        The one thing it owns alone: a box whose SSH NEVER answers has no
+        connected_at, so the gate's budget never starts. Bounding that wait
+        here (same budget, wall clock from when we opened the connection)
+        keeps such a launch from hanging in 'booting' forever while it bills.
+        """
+        policy = self.settings.launch
+        loop = asyncio.get_event_loop()
+        started = loop.time()
+        while True:
+            launch = self.db.get_launch(launch_id)
+            if launch is None or launch["status"] != "booting":
+                return          # promoted, failed, or terminated by someone
+            conn = self.connections.get(instance_id)
+            if conn is None:
+                return          # terminated: its connection was popped
+            await self.sweep_provisioning(instance_id, conn)
+            if (not (self.db.get_launch(launch_id) or {}).get("connected_at")
+                    and loop.time() - started
+                    >= policy.provisioning_timeout_seconds):
+                self._fail_provisioning(
+                    launch_id,
+                    f"instance {instance_id} never accepted an SSH connection "
+                    f"within {policy.provisioning_timeout_seconds:.0f}s of "
+                    f"becoming reachable",
+                )
+                return
+            await asyncio.sleep(policy.boot_poll_seconds)
+
+    async def sweep_provisioning(self, instance_id: str, conn) -> None:
+        """Promote one still-booting launch once its box is PROVISIONED.
+
+        A RECONCILER, in the shape _sweep_bootstrap already uses: it asks
+        questions of the row and the box on every tick and acts when they
+        all hold, rather than firing at a transition. Three code paths open
+        a connection (the launch pipeline, resume-after-downtime, adoption)
+        and at every one of them the supervisor is still CONNECTING, so
+        there is no moment at which "it is ready" could be decided.
+
+        The launch stays in 'booting' throughout - no new status. The row IS
+        the state, so a backend restart resumes the gate for free, the boot
+        countdown and the dashboard's booting card keep working, and no
+        client learns a new word.
+
+        In order:
+          1. stamp connected_at the first time SSH is up (the anchor for the
+             provisioning budget, and the only new fact this writes early);
+          2. ask for the init signal;
+          3. present -> check this session can reach docker, redial if it
+             cannot, then promote to active;
+          4. absent but cloud-init says it finished -> promote with the
+             failure recorded: waiting forever on a billing box is worse
+             than an active box carrying a warning;
+          5. absent and the budget is spent -> fail the row, and never
+             terminate. A box whose sidecar never came up is a box a rescue
+             cannot save anything from, so destroying it here would destroy
+             data to tidy up a status field.
+        """
+        launch = self.db.find_launch_by_instance(instance_id)
+        if launch is None or launch.get("status") != "booting":
+            return              # adopted boxes have no row and stop here
+        if conn.state != ConnectionState.CONNECTED:
+            return              # not an error: the next tick asks again
+        launch_id = launch["id"]
+        connected_at = launch.get("connected_at")
+        if not connected_at:
+            connected_at = utcnow()
+            self.db.update_launch(launch_id, connected_at=connected_at)
+        signal = await self.provisioning_signal(conn)
+        if signal in ("pending", "unknown"):
+            waited = _interval_seconds(connected_at, utcnow()) or 0.0
+            budget = self.settings.launch.provisioning_timeout_seconds
+            if waited >= budget:
+                self._fail_provisioning(
+                    launch_id,
+                    f"instance {instance_id} answered SSH but did not finish "
+                    f"provisioning within {budget:.0f}s (the driver, Docker "
+                    f"and the sidecar are installed by cloud-init after "
+                    f"first boot; see /var/log/manifold-init.log on the box)",
+                )
+            return
+        # Only on failure: a redial destroys every channel on the session,
+        # and an unconditional cycle would kill a terminal somebody opened.
+        if await self._docker_access_ok(conn) is False:
+            conn.redial()
+            self.db.record_audit(
+                "backend", "connection_redialled",
+                f"{instance_id}: this SSH session could not use the docker "
+                f"socket (it was opened before cloud-init added the group), "
+                f"so it was dropped for a fresh one")
+        # Re-read before writing: a terminate that landed while we were
+        # asking must not be overwritten back to active.
+        current = self.db.get_launch(launch_id)
+        if current is None or current["status"] != "booting":
+            return
+        fields: dict = {"status": "active", "active_at": utcnow()}
+        if signal == "incomplete":
+            fields["error"] = (
+                "cloud-init finished but Manifold's setup did not complete: "
+                "the driver, Docker, the NVIDIA runtime or the sidecar may "
+                "be missing. Jobs may fail; /var/log/manifold-init.log on "
+                "the instance says which step it was.")
+            self.db.record_audit(
+                "backend", "provisioning_incomplete",
+                f"launch {launch_id}: instance {instance_id} promoted to "
+                f"active with cloud-init finished and Manifold's init marker "
+                f"absent - the box is up, its setup is not proven")
+        self.db.update_launch(launch_id, **fields)
+
+    def _fail_provisioning(self, launch_id: str, detail: str) -> None:
+        """Close a launch that never became usable, WITHOUT touching the box.
+
+        Same honest copy as the boot timeout: the instance is probably still
+        running and still billing, and only a human can decide whether that
+        is worth keeping. If it is alive, the reconcile sweep's orphan repair
+        will flip this row back to active so its cost keeps being counted -
+        which is exactly why the bootstrap sweep checks the init signal
+        itself rather than trusting a row that says active.
+        """
+        launch = self.db.get_launch(launch_id)
+        if launch is None or launch["status"] != "booting":
+            return
+        self.db.update_launch(
+            launch_id, status="failed",
+            error=f"{detail}; it may still be running and billing; check the "
+                  f"dashboard and terminate it if unwanted.",
+        )
+        self.db.record_audit(
+            "backend", "provisioning_timeout",
+            f"launch {launch_id}: {detail}; the instance was NOT terminated")
+
+    async def provisioning_signal(self, conn) -> str:
+        """What the box says about its own setup, in one word.
+
+        "ready"      Manifold's init marker is there: cloud-init ran our
+                     script to the last line, so everything it installs is
+                     installed.
+        "incomplete" cloud-init has finished but the marker is absent: the
+                     script stopped somewhere. The box is as done as it will
+                     ever be, and waiting longer only costs money.
+        "pending"    neither: still working. Ask again next tick.
+        "unknown"    the connection went away mid-question. Kept separate
+                     from "pending" even though both callers wait: "we could
+                     not ask" and "we asked and the box said no" are
+                     different answers, and a caller that wanted to treat
+                     them differently should not have to guess which it got.
+        """
+        try:
+            code, _out, _err = await conn.run(INIT_MARKER_PROBE, timeout=30.0)
+            if code == 0:
+                return "ready"
+            code, _out, _err = await conn.run(
+                CLOUD_INIT_DONE_PROBE, timeout=30.0)
+            return "incomplete" if code == 0 else "pending"
+        except (ConnectionError, OSError):
+            return "unknown"
+
+    async def _docker_access_ok(self, conn) -> bool | None:
+        """Can this SSH SESSION use the docker socket? None = could not ask.
+
+        None is not False: a redial is a real cost (it drops every channel on
+        the connection), and "we could not tell" is never grounds for paying
+        it.
+        """
+        try:
+            code, _out, _err = await conn.run(DOCKER_ACCESS_PROBE, timeout=30.0)
+        except (ConnectionError, OSError):
+            return None
+        return code == 0
 
     def _open_connection(self, connection_mode: str, instance: InstanceInfo) -> None:
         """Build and start a ManagedConnection for a live instance. Shared by
@@ -2217,11 +2467,11 @@ class Orchestrator:
         boot-waiter died with the old process. Without this, the instance boots
         to 'active' and nothing dials SSH or closes out the launch: it hangs in
         'booting' forever while it bills. We re-attach - instances that adopt
-        already reconnected are marked ready; ones still booting get a fresh
-        wait-then-connect task (a fresh timeout window, so a restart never
-        shortens a genuine boot). Best-effort; never blocks startup. Call it
-        AFTER adopt_running_instances so already-active launches are settled,
-        not re-dialed.
+        already reconnected go straight to the provisioning gate; ones still
+        booting get a fresh wait-then-connect task (a fresh timeout window, so
+        a restart never shortens a genuine boot). Best-effort; never blocks
+        startup. Call it AFTER adopt_running_instances so already-active
+        launches are settled, not re-dialed.
         """
         resumed = 0
         for launch in self.db.list_launches():
@@ -2254,9 +2504,14 @@ class Orchestrator:
                 continue
             if instance_id in self.connections:
                 # adopt_running_instances already reconnected this one, so the
-                # boot finished during the downtime; just close the record.
-                self.db.update_launch(
-                    launch["id"], status="active", active_at=utcnow())
+                # boot finished during the downtime. It does NOT follow that
+                # the machine is provisioned: on GCE sshd answers minutes
+                # before cloud-init is done, so closing the record here used
+                # to be the one path that bypassed the gate entirely. Hand it
+                # to the gate instead - which, finding a box that IS ready,
+                # closes the record on its first pass anyway.
+                self._launch_tasks[launch["id"]] = asyncio.create_task(
+                    self._await_provisioning(launch["id"], instance_id))
                 resumed += 1
                 continue
             plan = self._plan_from_launch(launch)

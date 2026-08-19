@@ -113,6 +113,41 @@ def test_docker_socket_acl_covers_the_already_open_session():
         < script.index("setfacl -m u:ubuntu:rw")
 
 
+def test_the_acl_fix_is_installed_and_never_fails_quietly():
+    """The fix above shipped and did nothing on the only image that needed
+    it: `setfacl` comes from the `acl` package, stock GCE Ubuntu does not
+    ship it, so the line was "command not found" - swallowed by its own
+    `|| true`. A repair that can no-op silently is a repair nobody can
+    trust, so the package is installed and both lines say so out loud."""
+    script = build_user_data()
+    setfacl = next(l for l in script.splitlines()
+                   if l.startswith("setfacl -m u:ubuntu:rw"))
+    assert not setfacl.endswith("|| true")
+    assert "WARNING" in setfacl
+    install = next(l for l in script.splitlines()
+                   if "apt-get install -y -qq acl" in l)
+    assert "WARNING" in install
+    assert script.index(install) < script.index(setfacl)
+    # Skipped where setfacl already exists (Lambda), so the loud path only
+    # runs when an install was actually attempted.
+    assert install.startswith("command -v setfacl >/dev/null ||")
+
+
+def test_the_init_marker_is_durable_and_last():
+    """The signal the backend reads to learn a box is PROVISIONED rather
+    than merely reachable. It must be the final line (under set -e, reaching
+    it is the claim that every line above succeeded) and it must survive a
+    reboot: /var/run is tmpfs, and cloud-init's per-instance stage never
+    runs a second time, so a marker there could be erased and never rewritten
+    - a box that rebooted mid-setup would be waited on forever."""
+    script = build_user_data()
+    assert "install -d /var/lib/manifold" in script
+    assert "touch /var/lib/manifold/init-done" in script
+    assert "manifold-init-done" not in script          # the old tmpfs marker
+    body = [l for l in script.splitlines() if l.strip()]
+    assert body[-1] == "touch /var/lib/manifold/init-done"
+
+
 def test_shell_dollar_braces_survive_the_format_call():
     """_TEMPLATE goes through str.format, which eats single braces - a shell
     ${VAR} would crash the build or, worse, silently vanish. The driver
