@@ -72,9 +72,11 @@ desktop app or a dev backend must be running). GET /health confirms it.
 
 - **Instance**: a rented GPU box. Costs money every hour it exists.
   Manifold maintains one managed SSH connection to each.
-- **Persistent filesystem**: NFS storage that survives termination. It is
-  region-locked: an instance can only mount a filesystem in its own region.
-  Anything not on it (home dir, /workspace/ephemeral) dies with the box.
+- **Persistent filesystem**: storage that survives termination, mounted at
+  /lambda/nfs/&lt;name&gt;. On Lambda it is an NFS filesystem, region-locked.
+  On Google Cloud it is a data volume (a persistent disk), ZONE-locked and
+  attachable to one instance at a time. Anything not on it (home dir,
+  /workspace/ephemeral) dies with the box.
 - **Job**: a Docker container run from a template (vllm-serve,
   whisper-batch, axolotl-finetune, sdxl-generate, script-run,
   llm-synthesize, gpu-smoke, ...). Jobs stream logs, record exit codes,
@@ -155,6 +157,20 @@ launch, and then take the instance type and region from
 do not carry across providers. If a response carries
 `unavailable_reason`, that cloud is not set up yet - report the sentence
 instead of reading the empty target list as "no capacity".
+
+Persistent storage differs between the two, and `launch_gpu`'s
+`filesystem` carries both. On Lambda it is a filesystem from
+`list_filesystems`, region-locked. On Google Cloud it is a **data volume**
+from `list_volumes`, and three things change: pass the volume's own `zone`
+as `region` (a volume is zonal and cannot attach from anywhere else),
+attach exactly one (`extra_filesystems` is refused - a disk attaches to one
+instance at a time), and expect the launch to spend a little longer before
+it reports active, because Manifold formats a new volume and mounts it
+first. `list_launch_options` does not know about volumes, so its GCP
+targets all say `filesystem: null`; read `list_volumes` and pass the name
+yourself. A launch whose volume cannot be mounted FAILS rather than coming
+up with a path that looks persistent - and a job on a box whose volume is
+not mounted refuses instead of writing to a disk that dies with the box.
 
 ### Serve a model (vLLM)
 

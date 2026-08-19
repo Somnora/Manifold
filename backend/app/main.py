@@ -348,6 +348,14 @@ class CreateFilesystemRequest(BaseModel):
     region: str
 
 
+class CreateVolumeRequest(BaseModel):
+    """A GCP data volume (Phase 112). `zone` and not `region`: a Persistent
+    Disk is zonal and can only attach to an instance in its own zone."""
+    name: str
+    zone: str
+    size_gb: int
+
+
 class WatchRequest(BaseModel):
     instance_type: str
     region: str
@@ -1494,9 +1502,15 @@ def create_app(
             types = await lambda_client.list_instance_types()
             filesystems = await lambda_client.list_filesystems()
         else:
-            # Persistent filesystems are a Lambda feature, and request_launch
-            # refuses one on any other provider - so every target here is
-            # honestly scratch-only rather than pretending co-location.
+            # DELIBERATELY EMPTY, still (Phase 112). GCP now has persistent
+            # storage - data volumes - but a target row carries
+            # filesystem_bytes_used, and a Persistent Disk cannot report one
+            # from outside the instance: a 0 there would assert "empty"
+            # about a disk that may be full, and the ranking would then sort
+            # on that invention. So GCP targets stay honestly storage-less
+            # and a caller that wants a volume reads GET /volumes and passes
+            # the name itself. Making these rows volume-aware needs a target
+            # shape that can say "size unknown" first.
             filesystems = []
             try:
                 specs = await cloud.list_instance_types()
@@ -4416,6 +4430,40 @@ def create_app(
         there is no rescue path for a whole filesystem."""
         return await orchestrator.delete_filesystem(
             name, confirm_name=confirm_name)
+
+    # -- GCP data volumes (Phase 112) ------------------------------------------------
+    #
+    # Deliberately NOT part of /filesystems. That route is Lambda's registry
+    # and every field on it (mount_point from Lambda, is_in_use, bytes_used)
+    # is something Lambda can answer and a detached Persistent Disk cannot.
+    # A volume that appeared there carrying bytes_used=0 would assert "empty"
+    # about a disk that may be full, which is the truthful-or-absent rule's
+    # exact forbidden move. Volumes get their own route, their own fields,
+    # and no invented ones. `_storage_for` will 404 a volume name for the
+    # same reason - an honest refusal, not a gap.
+
+    @app.get("/volumes")
+    async def list_volumes():
+        return await orchestrator.list_volumes()
+
+    @app.post("/volumes", status_code=201)
+    async def create_volume(req: CreateVolumeRequest):
+        """Create a GCP data volume: a Persistent Disk that survives the
+        instances it is attached to, mounted at /lambda/nfs/<name>.
+
+        Creation bills immediately and by PROVISIONED size, attached or
+        not - unlike a Lambda filesystem, which bills by what it holds."""
+        return await orchestrator.create_volume(
+            req.name, req.zone, req.size_gb)
+
+    @app.delete("/volumes/{name}")
+    async def delete_volume(name: str, confirm_name: str = ""):
+        """Permanently delete a data volume. Refuses while GCE reports it
+        attached, and (428) until confirm_name repeats the exact name. No
+        force flag: there is no rescue path for a whole volume, and
+        Manifold cannot even read a detached disk to tell you what is on
+        it."""
+        return await orchestrator.delete_volume(name, confirm_name=confirm_name)
 
     async def _storage_for(filesystem: str) -> StorageClient:
         filesystems = {fs.name: fs for fs in await lambda_client.list_filesystems()}

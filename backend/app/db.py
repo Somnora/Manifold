@@ -305,6 +305,29 @@ CREATE TABLE IF NOT EXISTS detached_commands (
 CREATE INDEX IF NOT EXISTS idx_detached_instance
     ON detached_commands(instance_id);
 
+-- Phase 112: GCP data volumes - MANIFOLD'S PRIVATE FACTS ONLY. The disk
+-- itself lives at Google, and everything Google can answer (does it exist,
+-- how big is it, who is it attached to) is asked of Google: a disk bills for
+-- its provisioned size whether attached or not, so a SQLite-sourced list
+-- would let a disk bill invisibly forever if this file were ever lost.
+--
+-- What only Manifold can answer is here. formatted_at is the load-bearing
+-- one: NULL means Manifold has never issued mkfs against this disk, and it
+-- is written BEFORE the mkfs command, never after. That ordering is what
+-- makes a crash mid-format safe - the row says formatted, blkid comes back
+-- blank, and volumes.plan_prepare refuses loudly instead of formatting a
+-- disk twice. Because it transitions exactly once, a volume in that state
+-- provably never held user data. fstype records WHAT was written, so a
+-- later mount can verify it is looking at the disk it thinks it is.
+CREATE TABLE IF NOT EXISTS volumes (
+    name            TEXT PRIMARY KEY,
+    zone            TEXT NOT NULL,
+    size_gb         INTEGER NOT NULL,
+    created_at      TEXT NOT NULL,
+    formatted_at    TEXT,
+    fstype          TEXT
+);
+
 CREATE TABLE IF NOT EXISTS watches (
     id              TEXT PRIMARY KEY,
     created_at      TEXT NOT NULL,
@@ -1026,6 +1049,52 @@ class Database:
             (instance_id,),
         )
         return cur.rowcount
+
+    # -- volumes (Phase 112): Manifold's private facts about a GCP disk ----
+
+    def create_volume(self, *, name: str, zone: str, size_gb: int) -> dict:
+        """Record a volume Manifold just created at Google.
+
+        formatted_at stays NULL: this row exists from the moment the disk
+        does, and NULL is the permission slip for exactly one mkfs later.
+        """
+        self._execute(
+            """INSERT INTO volumes (name, zone, size_gb, created_at)
+               VALUES (?, ?, ?, ?)""",
+            (name, zone, size_gb, utcnow()),
+        )
+        return self.get_volume(name)
+
+    def get_volume(self, name: str) -> dict | None:
+        row = self._execute(
+            "SELECT * FROM volumes WHERE name = ?", (name,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def list_volumes(self) -> list[dict]:
+        rows = self._execute(
+            "SELECT * FROM volumes ORDER BY created_at DESC"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def mark_volume_formatted(self, name: str, fstype: str) -> bool:
+        """Claim the ONE format this volume will ever get. False = taken.
+
+        Written BEFORE mkfs is issued, never after, and conditional on
+        formatted_at still being NULL so the claim is atomic. A caller that
+        gets False must not run mkfs: somebody else already did, and a
+        second one would destroy whatever the first wrote.
+        """
+        cur = self._execute(
+            """UPDATE volumes SET formatted_at = ?, fstype = ?
+                WHERE name = ? AND formatted_at IS NULL""",
+            (utcnow(), fstype, name),
+        )
+        return cur.rowcount > 0
+
+    def delete_volume(self, name: str) -> bool:
+        cur = self._execute("DELETE FROM volumes WHERE name = ?", (name,))
+        return cur.rowcount > 0
 
     # -- research keys (Phase 100): metadata only, never values ------------
 

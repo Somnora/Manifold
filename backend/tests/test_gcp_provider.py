@@ -115,12 +115,17 @@ async def test_catalog_failure_degrades_to_empty_not_invented(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_launch_refuses_filesystems_and_unknown_types():
+async def test_launch_refuses_a_second_volume_and_unknown_types():
+    """Phase 112 replaced the blanket scratch-only refusal with the rule
+    that actually holds: ONE data volume per instance. A Persistent Disk
+    attaches to one machine at a time and Manifold mounts one persistent
+    home, so a second name is refused here as well as at admission. Both
+    refusals land before the SDK is ever touched."""
     p = configured(public_key_fn=lambda: "ssh-ed25519 AAAA test")
     with pytest.raises(ProviderError) as exc:
         await p.launch_instance("us-central1-a", "g2-standard-4",
-                                [], ["somefs"])
-    assert "scratch-only" in str(exc.value)
+                                [], ["vol-a", "vol-b"])
+    assert "at most one data volume" in str(exc.value)
     with pytest.raises(ProviderError) as exc:
         await p.launch_instance("us-central1-a", "gpu_1x_a10", [], [])
     assert "not on the GCP shelf" in str(exc.value)
@@ -179,15 +184,17 @@ async def test_terminate_of_a_missing_instance_is_idempotent(monkeypatch):
 # -- the seams (mock mode / test app) ----------------------------------------
 
 
-def test_gcp_launch_with_filesystem_is_refused_before_money(client):
-    """The orchestrator refuses provider+filesystem combinations before a
-    launch row exists - the message names the fix, not a stack trace."""
+def test_gcp_launch_with_a_volume_is_refused_before_money(client):
+    """Phase 112 opened this door for GCP volumes; it did not open it for a
+    project nobody has set up. The refusal still lands before a launch row
+    exists, and it names the command that fixes it rather than a stack
+    trace or a disk error."""
     resp = client.post("/instances", json={
         "provider": "gcp", "instance_type": "g2-standard-4",
         "region": "us-central1-a", "filesystem": "manifold-data",
     })
     assert resp.status_code == 400
-    assert "scratch-only" in resp.json()["detail"]
+    assert "gcloud auth application-default login" in resp.json()["detail"]
 
 
 def test_regions_are_provider_scoped(client):

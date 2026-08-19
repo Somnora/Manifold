@@ -189,15 +189,19 @@ def test_extras_without_a_primary_are_refused(client, mock_client):
 
 
 def test_gcp_with_extras_is_refused_honestly(client, mock_client):
-    """GCP is scratch-only, so the guard covers the attach list too - and it
-    says why rather than failing later at a provider that cannot mount it."""
+    """GCP gained persistent storage in Phase 112, but only ONE volume per
+    box: a Persistent Disk attaches to one instance at a time. The attach
+    list is still refused, and it says why rather than failing later at a
+    provider that cannot mount it."""
     resp = client.post("/instances", json={
         "provider": "gcp", "instance_type": "g2-standard-4",
         "region": "us-central1-a", "filesystem": "",
         "extra_filesystems": ["crop-archive"],
     })
     assert resp.status_code == 400, resp.text
-    assert "scratch-only" in resp.json()["detail"]
+    detail = resp.json()["detail"]
+    assert "exactly one data volume" in detail
+    assert "crop-archive" in detail
     assert mock_client.launch_calls == []
 
 

@@ -324,6 +324,20 @@ async def launch_gpu(
     the instance type and region from list_launch_options for that same
     cloud - types and regions do not carry across providers.
 
+    `filesystem` means TWO different things depending on the cloud, and the
+    same field carries both because they behave identically once mounted -
+    /lambda/nfs/<name>, where jobs, sync_outputs and relative paths resolve.
+    On Lambda it is a Lambda filesystem from list_filesystems. On GCP it is
+    a DATA VOLUME from list_volumes, and three GCP-only rules apply: pass
+    the volume's own `zone` as `region` (a volume is zonal and cannot attach
+    from anywhere else), attach exactly one (a disk attaches to one instance
+    at a time, so extra_filesystems is refused), and expect the launch to
+    take slightly longer to report active - Manifold formats a new volume
+    and mounts it before promoting the launch, and FAILS the launch rather
+    than reporting active over an unmounted path. list_launch_options does
+    not know about volumes yet, so its GCP targets all say filesystem: null;
+    read list_volumes and pass the name yourself.
+
     `max_lifetime_seconds` is an optional hard ceiling on the instance's TOTAL
     lifetime, timed from the moment the provider accepts the launch, so it
     includes boot (15-40 minutes on a big box) — the backend rejects a value
@@ -937,6 +951,33 @@ async def list_filesystems(note: str = "") -> dict:
     """Persistent filesystems with their regions. Filesystems are
     region-locked: an instance can only mount one in its own region."""
     return await _call("list_filesystems", "GET", "/filesystems", note=note)
+
+
+@mcp.tool()
+async def list_volumes(note: str = "") -> dict:
+    """GCP data volumes: persistent disks that survive the instance they are
+    attached to, mounted at /lambda/nfs/<name> exactly like a Lambda
+    filesystem. READ ONLY here - creating and deleting a volume is a
+    dashboard action, because a volume bills from the moment it exists (by
+    PROVISIONED size, attached or not) and deleting one is unrecoverable.
+
+    Three things a volume is NOT, and they matter when you plan:
+      - it is ZONAL. `zone` on each row is the only zone an instance can
+        attach it from, so passing it to launch_gpu pins the region too.
+        GPU capacity varies by zone, so a volume can end up somewhere the
+        GPU you want is unavailable - that is a real trap, not a hint.
+      - it attaches to ONE instance at a time. `attached_to` names the
+        holder; a launch naming a held volume is refused, not queued.
+      - it has NO bytes_used, on purpose. Nothing outside the instance can
+        read a detached disk, and a 0 there would claim it is empty.
+        `size_gb` is what was provisioned, which is also what bills.
+
+    To use one, pass its name as launch_gpu's `filesystem` with
+    provider="gcp" and its own `zone` as the region. Manifold formats it on
+    first use and mounts it before the launch reports active; a launch whose
+    volume could not be mounted FAILS rather than coming up with an
+    unmounted path that looks persistent."""
+    return await _call("list_volumes", "GET", "/volumes", note=note)
 
 
 @mcp.tool()

@@ -6882,3 +6882,164 @@ answer for the states mock mode cannot reach. All five states plus the
 edges (limit 0, no request_url, the int64 sentinel present in the payload,
 an 8-GPU shape against 7 free A100s) render as designed, and the GCP
 default region lands on us-central1-a against an alphabetical zone list.
+
+## 2026-08-19 — Phase 112: GCP gets persistent storage, and the fake rescue is closed
+
+The owner's GCP boxes were scratch-only: everything died with the machine.
+This attaches a Compute Engine Persistent Disk as a data volume, mounted at
+`/lambda/nfs/<name>` exactly like a Lambda filesystem. The feature is small.
+The thing that had to be built first is not.
+
+**THE FAKE-RESCUE VECTOR, which is the most important paragraph here.**
+`sync_ephemeral` ran `mkdir -p <dest> && rsync -a /workspace/ephemeral/
+<dest>` with no check that `<dest>` was a mount. `rescue()` sets
+`unsaved = []` the moment `synced_to` is set, and the termination safety
+hook reads `unsaved` to decide whether destroying a box is safe. So an
+UNMOUNTED `/lambda/nfs/<name>` meant: rsync silently creates an ordinary
+directory on the auto-delete boot disk, the rescue reports everything saved,
+the hook waves the terminate through, and the user's data burns while the
+audit log records a successful rescue. The same hazard sat on the job path -
+`_pick_dispatchable` dispatches to any CONNECTED instance without consulting
+launch status, and on GCE a box is CONNECTED minutes before it is
+provisioned, while the job wrapper `mkdir -p`s
+`/lambda/nfs/<fs>/task-logs`.
+
+Before this phase that could not happen on GCP, and only by accident:
+`sync_ephemeral` raised honestly ("no filesystem recorded") because the
+column was always empty there. Populating that column for volumes removes
+the accident. So `mountpoint -q` is now asserted before every write to that
+path - in the job wrapper and in `sync_ephemeral` - and it is
+UNCONDITIONAL, Lambda included, where it converts "the NFS quietly fell
+off" from a silent fake-rescue into a loud failure. A refusal leaves
+`unsaved` populated, which is exactly what makes termination stop and ask.
+`wrap_remote_command`'s `require_mount` has no default: every caller states
+out loud whether it is about to write to persistent storage.
+
+**One shell detail worth the line, because it was a real bug in the first
+draft.** The guard is its own list, ended with `;`, never joined to the rest
+with `&&`. Everything after it is one AND-OR list ending in `&`, and `&`
+binds the whole list - so `guard && mkdir ... &` backgrounds the guard too,
+its `exit` leaves only the background subshell, and the outer shell sails on
+into the `while [ ! -f <exit file> ]` wait that nothing will ever satisfy.
+A hung SSH command instead of a refusal. The real-shell wrapper tests hang
+when this regresses, so they carry a subprocess timeout.
+
+**The launch row's existing `filesystem` column carries the volume name.**
+That column never meant "a Lambda filesystem"; it means "the name under
+`/lambda/nfs/` where this launch's persistent home is mounted", which a
+mounted PD satisfies identically. Ten-plus consumers therefore needed no
+change at all: dispatch, task readoption after a restart, the rescue,
+relative file routes, resume-after-restart. A separate `volume` column was
+rejected for the reason Phase 103 rejected reshaping this column - every
+missed fork produces a box claiming persistence it does not have.
+
+**A volume is still not a "filesystem kind".** It never appears in
+`/filesystems` (Lambda's registry, left alone), never backs the Storage
+page's browser, and never carries a `bytes_used`. Those are things a Lambda
+filesystem can answer and a detached Persistent Disk cannot; a `0` there
+would assert "empty" about a disk that may be full. `_storage_for` 404s a
+volume name, which is an honest refusal rather than a gap.
+
+**`auto_delete=False` is the whole of the attach.** GCE preserves and
+detaches a non-auto-delete disk when the instance is deleted, so terminate
+needs no provider change and no explicit detach - an explicit pre-delete
+detach would only add a window where the instance is alive and
+half-detached. The field is set explicitly even though proto3's bool default
+is already False. `device_name` is the volume's name because
+`/dev/disk/by-id/google-<device_name>` is built from it, and that link -
+never `/dev/sdb`, which is enumeration-ordered - is the only device path the
+format path will touch.
+
+**The format/mount decision table is a pure module (`volumes.py`), in
+data_safety.py's shape.** Inputs: `formatted_at` from SQLite, and one probe
+on the box. Two invariants hold it up. mkfs requires BOTH a blank blkid and
+a NULL `formatted_at`, read in the same session immediately before the
+command. And `formatted_at` is written BEFORE mkfs is issued, atomically
+(the UPDATE is conditional on it still being NULL) - which is what makes a
+backend restart mid-format safe: the row says formatted, blkid comes back
+blank, the table refuses loudly, and the box is untouched. blkid-empty is
+the AMBIGUOUS cell, not the safe one, and that refusal can say something
+unusually strong: because the record transitions exactly once, such a volume
+provably never held user data, which is what makes "delete it and create
+another" advice rather than a shrug. A filesystem Manifold has no record of
+writing is refused in both directions - mounting it read-write corrupts
+foreign data, formatting destroys it - and so is a disk with no volumes row
+at all, which is the restored-SQLite case wearing a different hat. `blkid`
+exiting 2 ("no signature") is separated from every other nonzero exit,
+because `|| true` there would turn "we could not look" into "it is blank"
+and then mkfs a disk holding data. That is the same move Phase 110 caught
+in cloud-init's setfacl line.
+
+**The gate promotes a volume launch only with `mountpoint -q` verified.**
+`_sweep_provisioning`'s existing "promote on incomplete with a warning"
+trade is right for a plain box - the warning is the whole cost - and it
+INVERTS here: an active row over an unmounted volume is fake persistence,
+and jobs would write outputs to the boot disk believing them safe. If the
+mount cannot be achieved the launch fails the way `_fail_provisioning`
+already does: box untouched, still billing, said out loud. Two additions to
+that shape. The volume step runs BEFORE the docker-access check, because a
+redial there drops the session and mkfs issued into a session being torn
+down would raise out of the gate; a mount is a kernel fact and survives the
+redial. And a refusal the table marks TERMINAL fails the launch immediately
+rather than billing out the whole provisioning budget to re-learn a state
+that provably cannot change by waiting.
+
+**A mount-heal sweep rides the telemetry tick, and it never formats.**
+`_reconcile_launches`' orphan repair flips a failed row to active whenever
+the instance is alive - right for cost accounting - minting an active row
+that passed no gate, and the gate will not re-enter because it exits on
+`status != "booting"`. A reboot is the other way in: the mount is
+deliberately not in fstab. So the sweep runs the mount half only.
+`_prepare_volume(allow_format=...)` has no default, so the two callers say
+which they are. A box the heal cannot fix is NOT hidden: the row stays
+active because it is alive and billing, an audit row says so, and every job
+and sync on it refuses at the mount guard rather than writing to a disk that
+dies with the box.
+
+**Admission asks Google, not SQLite.** One aggregated disk lookup answers
+exists / which zone / who holds it. The whole history of the provisioning
+work is rows drifting from boxes, so a local "attached to X" must never
+refuse a launch when X is already gone - if `users` is empty the disk is
+free, whatever any row says (pinned by a test with a deliberately stale
+row). The remaining race - two launches both reading `users=[]` - cannot be
+closed from there and is not pretended away: `RESOURCE_IN_USE_BY_ANOTHER_
+RESOURCE` gets its own named refusal instead of the generic error tail. A
+refusal names the holder plus that launch row's purpose and creator; GCE's
+`TERMINATED` means STOPPED, and a stopped instance keeps its disks, so that
+case gets its own sentence rather than "terminate the holder", which would
+read as nonsense about a box the dashboard does not show.
+
+**Names are validated against GCE's own charset before they touch
+anything.** These are the first user-supplied strings this codebase
+interpolates unquoted into shell commands (the rsync destination, the
+dispatcher's log paths) and into a device path. Lambda's names arrived from
+Lambda's registry; these arrive from Manifold's own route, so the route is
+where the charset is proven.
+
+**GET /volumes is sourced from GCE with SQLite as an overlay.** A disk bills
+for its PROVISIONED size whether attached or not, so a SQLite-sourced list
+would let one bill invisibly forever the first time the data dir was lost.
+A disk with no row still appears, flagged as one Manifold has no record of.
+The list price is labelled and dated; it is deliberately not wired into
+spend.py.
+
+**Deferred on purpose, so the gaps are choices:** resize, snapshots,
+attaching existing or unformatted disks, multiple volumes per instance,
+Storage-page browsing of a volume (nothing outside the instance can read
+one), volume-aware `list_launch_options` (a target row carries
+`filesystem_bytes_used`, and a PD cannot report one - a 0 would assert
+"empty" and the ranking would then sort on the invention), MCP create/delete
+(a volume bills from creation and deletion is unrecoverable; reading is
+enough for an agent), and spend integration. Auto-manage, clusters and
+capacity watches remain Lambda-pinned and needed no work.
+
+**Not verifiable without hardware, stated plainly.** Every decision above is
+pure and pinned by tests, and the transport is not: that `sudo mkfs.ext4 -F`
+and `sudo mount -t ext4 -o discard,defaults` actually work over the managed
+connection on a GCE box, that the guest agent creates
+`/dev/disk/by-id/google-<name>` under the device_name the attach set, that
+`blkid -p` and `mountpoint` behave as assumed on that image, and that a
+deleted instance really does leave the disk intact and detached - all of
+that is real-gate work on a real machine. The mock says exit 0 to everything
+by default, which is precisely the lie this phase exists to stop believing,
+so the tests that matter use a session that answers honestly.

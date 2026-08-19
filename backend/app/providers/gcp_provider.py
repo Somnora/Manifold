@@ -19,6 +19,18 @@ class GCPProvider(CloudProvider):
 class MockGCPProvider(GCPProvider):
     def __init__(self):
         self.instances: Dict[str, CloudInstanceInfo] = {}
+        # Volume fixtures (Phase 112), keyed by name. One pre-seeded so the
+        # zero-credential demo has something to pick in the launch form; the
+        # rest arrive through create_volume like they would at Google. `users`
+        # is the same field GCE returns - the list of instances holding the
+        # disk - because the launch admission check reads exactly that.
+        self.volumes: Dict[str, Dict] = {
+            "manifold-vol-demo": {
+                "name": "manifold-vol-demo", "zone": "us-central1-a",
+                "size_gb": 200, "users": [], "status": "READY",
+                "disk_type": "pd-balanced",
+            },
+        }
         self._regions = ["us-central1", "us-east1", "us-west1", "europe-west4", "asia-east1"]
         self._types = {
             "g2-standard-4": CloudInstanceTypeSpec(
@@ -92,15 +104,52 @@ class MockGCPProvider(GCPProvider):
             status="active",
             created_at=datetime.now(timezone.utc),
             price_cents_per_hour=ts.price_cents_per_hour,
-            ssh_key_name=ssh_key_names[0] if ssh_key_names else None
+            ssh_key_name=ssh_key_names[0] if ssh_key_names else None,
+            file_system_names=list(filesystem_names),
         )
+        # The attach the real provider makes, in the one way that matters to
+        # every later check: the disk now names a holder, so a second launch
+        # against it is refused exactly as GCE would refuse it.
+        for volume in filesystem_names:
+            disk = self.volumes.get(volume)
+            if disk is not None and instance_id not in disk["users"]:
+                disk["users"].append(instance_id)
         return instance_id
 
     async def terminate_instance(self, instance_id: str) -> bool:
         if instance_id in self.instances:
             self.instances[instance_id].status = "terminated"
+            # auto_delete=False means GCE PRESERVES and detaches the data
+            # disk when the instance goes; only the holder entry clears.
+            for disk in self.volumes.values():
+                if instance_id in disk["users"]:
+                    disk["users"].remove(instance_id)
             return True
         return False
+
+    # -- volumes (Phase 112) ---------------------------------------------------
+
+    async def list_volumes(self) -> List[Dict]:
+        return [dict(v) for v in self.volumes.values()]
+
+    async def find_volume(self, name: str) -> Optional[Dict]:
+        disk = self.volumes.get(name)
+        return dict(disk) if disk else None
+
+    async def create_volume(self, *, name: str, zone: str,
+                            size_gb: int) -> Dict:
+        if name in self.volumes:
+            raise ProviderError(f"A disk named '{name}' already exists.")
+        self.volumes[name] = {
+            "name": name, "zone": zone, "size_gb": size_gb, "users": [],
+            "status": "READY", "disk_type": "pd-balanced",
+        }
+        return dict(self.volumes[name])
+
+    async def delete_volume(self, name: str, *, zone: str) -> bool:
+        # Idempotent like terminate_instance: already gone is success.
+        self.volumes.pop(name, None)
+        return True
 
     async def ensure_ssh_key(self, public_key: str, name: str) -> str:
         return name
@@ -341,6 +390,14 @@ class RealGCPProvider(GCPProvider):
             gpu_description=(gcp_catalog.gpu_description(shelf)
                              if shelf else ""),
             gpu_type=(shelf.gpu_type if shelf else None),
+            # Data volumes ATTACHED to this instance (Phase 112), read from
+            # Google rather than from a launch row - same meaning the field
+            # has always had on Lambda, and the same limit: attached is not
+            # mounted. Nothing acts on this destructively (every write to
+            # /lambda/nfs/<name> asserts the mount itself), and a launch is
+            # not active until its volume is verifiably mounted.
+            file_system_names=[d.device_name for d in inst.disks
+                               if not d.boot and d.device_name],
         )
 
     async def _find(self, instance_id: str):
@@ -399,10 +456,15 @@ class RealGCPProvider(GCPProvider):
             raise ProviderError(
                 "No GCP project configured. Set GCP_PROJECT_ID in .env (and "
                 "authenticate with `gcloud auth application-default login`).")
-        if filesystem_names:
+        if len(filesystem_names) > 1:
+            # The orchestrator already refuses extra_filesystems on GCP; this
+            # is the provider saying the same thing for any caller that got
+            # past it. One data volume per instance in v1.
             raise ProviderError(
-                "GCP launches are scratch-only for now: Filestore is not "
-                "wired up. Launch without a filesystem.")
+                f"A GCP launch attaches at most one data volume, and this "
+                f"one names {len(filesystem_names)}: "
+                f"{', '.join(filesystem_names)}.")
+        volume = filesystem_names[0] if filesystem_names else ""
         entry = gcp_catalog.BY_NAME.get(instance_type)
         if entry is None:
             raise ProviderError(
@@ -432,6 +494,28 @@ class RealGCPProvider(GCPProvider):
                 source_image=self.IMAGE, disk_size_gb=self.BOOT_DISK_GB,
                 disk_type=f"zones/{zone}/diskTypes/pd-balanced")
             inst.disks = [disk]
+            if volume:
+                # THE DATA-LOSS CELL. auto_delete=False is the single field
+                # that makes this disk survive the instance: GCE preserves
+                # and DETACHES a non-auto-delete disk when the instance is
+                # deleted, which is also why terminate needs no provider
+                # change and no explicit detach (an explicit pre-delete
+                # detach would only open a window where the instance is
+                # alive and half-detached). Set explicitly even though
+                # proto3's bool default is already False - a field this
+                # load-bearing should not be true-by-omission-of-a-mistake.
+                #
+                # device_name is the volume's name because that is what
+                # /dev/disk/by-id/google-<device_name> is built from, and
+                # that link - never /dev/sdb, which is enumeration-ordered -
+                # is the only device path the format/mount path will touch.
+                data = compute.AttachedDisk()
+                data.boot = False
+                data.auto_delete = False
+                data.device_name = volume
+                data.mode = "READ_WRITE"
+                data.source = f"zones/{zone}/disks/{volume}"
+                inst.disks.append(data)
             nic = compute.NetworkInterface()
             nic.access_configs = [compute.AccessConfig(
                 name="External NAT", type_="ONE_TO_ONE_NAT")]
@@ -464,6 +548,20 @@ class RealGCPProvider(GCPProvider):
         except Exception as exc:
             text = str(exc)
             upper = text.upper()
+            if "RESOURCE_IN_USE_BY_ANOTHER_RESOURCE" in upper:
+                # The race the admission check cannot close: two launches
+                # both read users=[] and both asked for the same disk. Named
+                # rather than left to the generic tail below, because the
+                # generic message ("GCE launch failed: ...") reads like a
+                # broken launch path when it is in fact a second instance
+                # holding the volume. A PD attaches to one instance at a
+                # time; there is nothing to retry until that one is gone.
+                raise ProviderError(
+                    f"The data volume '{volume}' is already attached to "
+                    f"another instance, so this launch could not take it. A "
+                    f"Persistent Disk attaches to one instance at a time - "
+                    f"terminate or detach the holder, then launch again. "
+                    f"({text[:200]})") from exc
             if "RESOURCE_POOL_EXHAUSTED" in upper or "does not have enough resources" in text:
                 raise ProviderCapacityError(
                     f"GCE has no {entry.gpu_type} capacity in {zone} right "
@@ -503,6 +601,144 @@ class RealGCPProvider(GCPProvider):
         # per-instance metadata at launch. Accepting the call keeps the
         # orchestrator provider-agnostic.
         return name
+
+    # -- volumes (Phase 112) --------------------------------------------------------
+
+    @staticmethod
+    def _disk_dict(disk, zone: str) -> Dict:
+        """One GCE disk, reduced to the facts Manifold reads.
+
+        `users` is the whole attachment story and it comes from Google, not
+        from SQLite: a row saying "attached to X" drifts the moment X is
+        deleted outside Manifold, and a stale row would refuse a launch that
+        is perfectly fine. Instance URLs are reduced to bare names because
+        that is the id every other surface here uses.
+        """
+        return {
+            "name": disk.name,
+            "zone": zone,
+            "size_gb": int(disk.size_gb or 0),
+            "users": [u.rsplit("/", 1)[-1] for u in (disk.users or [])],
+            "status": disk.status,
+            "disk_type": (disk.type_ or "").rsplit("/", 1)[-1],
+        }
+
+    async def list_volumes(self) -> List[Dict]:
+        """Every manifold-labelled disk in the project, ASKED OF GOOGLE.
+
+        Deliberately not sourced from SQLite: a disk bills for its
+        provisioned size whether it is attached to anything or not, so a
+        list built from a local database would let a disk bill invisibly
+        forever if that database were ever lost. SQLite is the overlay
+        (created_at, formatted_at), never the source of truth.
+        """
+        if not self.project_id:
+            return []
+        compute = self._compute()
+
+        def fetch():
+            client = compute.DisksClient()
+            found = []
+            request = compute.AggregatedListDisksRequest(
+                project=self.project_id,
+                filter=f'labels.{self.LABEL_KEY} = "true"')
+            for zone_path, scoped in client.aggregated_list(request=request):
+                zone = zone_path.rsplit("/", 1)[-1]
+                for disk in (scoped.disks or []):
+                    found.append((disk, zone))
+            return found
+
+        pairs = await self._run(fetch)
+        return [self._disk_dict(d, z) for d, z in pairs]
+
+    async def find_volume(self, name: str) -> Optional[Dict]:
+        """One manifold-labelled disk by name, or None.
+
+        Aggregated by name rather than fetched from a remembered zone, for
+        the same reason instances are: the caller then learns the disk's
+        REAL zone and can say "that volume lives in us-central1-b" instead
+        of "no such volume", which is the difference between a fix and a
+        dead end.
+        """
+        if not self.project_id:
+            return None
+        compute = self._compute()
+
+        def fetch():
+            client = compute.DisksClient()
+            request = compute.AggregatedListDisksRequest(
+                project=self.project_id, filter=f'name = "{name}"')
+            for zone_path, scoped in client.aggregated_list(request=request):
+                for disk in (scoped.disks or []):
+                    if disk.labels.get(self.LABEL_KEY) == "true":
+                        return disk, zone_path.rsplit("/", 1)[-1]
+            return None
+
+        pair = await self._run(fetch)
+        return self._disk_dict(*pair) if pair else None
+
+    async def create_volume(self, *, name: str, zone: str,
+                            size_gb: int) -> Dict:
+        """Create a labelled pd-balanced disk and wait the operation out.
+
+        Labelled manifold=true for the same reason instances are: Manifold
+        must only ever see, list or delete disks it created. A user's own
+        unrelated disk in the same project stays invisible here, and DELETE
+        can never name one.
+        """
+        if not self.project_id:
+            raise ProviderError("No GCP project configured.")
+        compute = self._compute()
+
+        def create():
+            disk = compute.Disk()
+            disk.name = name
+            disk.size_gb = size_gb
+            disk.type_ = f"zones/{zone}/diskTypes/pd-balanced"
+            disk.labels = {self.LABEL_KEY: "true"}
+            op = compute.DisksClient().insert(
+                project=self.project_id, zone=zone, disk_resource=disk)
+            # Same reason the instance insert waits: a name returned for a
+            # disk that will never exist would be admitted by the launch
+            # path minutes later.
+            op.result(timeout=180)
+            return True
+
+        try:
+            await self._run(create)
+        except ProviderError:
+            raise
+        except Exception as exc:
+            text = str(exc)
+            if "already exists" in text.lower():
+                raise ProviderError(
+                    f"A disk named '{name}' already exists in this project. "
+                    f"Disk names are unique per zone; pick another name."
+                ) from exc
+            raise ProviderError(
+                f"Creating the volume failed: {text[:300]}") from exc
+        created = await self.find_volume(name)
+        if created is None:
+            # The insert operation succeeded and the disk is not listable:
+            # say that, rather than fabricating the record we expected.
+            raise ProviderError(
+                f"Google accepted the disk '{name}' but it is not listable "
+                f"yet, so Manifold cannot confirm what was created. Check "
+                f"the Google Cloud console before creating it again.")
+        return created
+
+    async def delete_volume(self, name: str, *, zone: str) -> bool:
+        if not self.project_id:
+            raise ProviderError("No GCP project configured.")
+        compute = self._compute()
+
+        def delete():
+            op = compute.DisksClient().delete(
+                project=self.project_id, zone=zone, disk=name)
+            op.result(timeout=180)
+            return True
+
+        return await self._run(delete)
 
     # -- quota --------------------------------------------------------------------
 

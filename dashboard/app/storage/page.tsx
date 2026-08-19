@@ -9,6 +9,7 @@ import {
   type StoredFile,
 } from "@/lib/api";
 import { formatBytes, formatDate } from "@/lib/format";
+import { VolumesPanel } from "@/components/VolumesPanel";
 
 // Browse and delete files on a persistent filesystem via the backend's S3
 // adapter endpoints. Works with no instance running: that is the point.
@@ -395,6 +396,12 @@ export default function StoragePage() {
         ) : (
           <p className="text-xs text-zinc-400">File count unavailable.</p>
         ))}
+
+      {/* GCP data volumes, below everything above and separate from it: a
+          volume is not a filesystem kind, and the browser above cannot show
+          one. Its own panel is what keeps the two from being read as the
+          same thing with a different label. */}
+      <VolumesPanel />
     </div>
   );
 }

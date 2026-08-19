@@ -28,6 +28,10 @@ def test_wrap_remote_command_propagates_container_exit_code(tmp_path):
     cmd = wrap_remote_command(
         "echo boom && exit 7", str(log),
         ensure_dirs=[str(tmp_path / "task-logs")],
+        # No mount guard here: this test is about the exit code surviving the
+        # pipe, and tmp_path is not a mount point on anybody's machine. The
+        # guard has its own tests in test_volumes.py.
+        require_mount=None,
     )
     result = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True)
     assert result.returncode == 7          # the container's code, not tee's
@@ -39,6 +43,7 @@ def test_wrap_remote_command_success_still_zero(tmp_path):
     cmd = wrap_remote_command(
         "echo all-good", str(log),
         ensure_dirs=[str(tmp_path / "task-logs")],
+        require_mount=None,
     )
     result = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True)
     assert result.returncode == 0

@@ -41,6 +41,7 @@ from .orchestrator import LaunchRejected, Orchestrator, TerminationBlocked
 from .subagent_engine import engine as subagent_engine
 from .task_queue import TaskQueue
 from .templates import JobTemplate, PERSISTENT_TOKEN
+from . import volumes
 
 logger = logging.getLogger("manifold.dispatcher")
 
@@ -264,15 +265,32 @@ def render_docker_command(
 
 
 def wrap_remote_command(docker_cmd: str, remote_log: str, *,
-                        ensure_dirs: list[str]) -> str:
-    """Wrap a docker command for remote dispatch: create the dirs it needs,
-    tee all output to a persistent log, and — critically — propagate the
-    CONTAINER's exit code through the pipe.
+                        ensure_dirs: list[str],
+                        require_mount: str | None) -> str:
+    """Wrap a docker command for remote dispatch: prove the persistent home
+    is really mounted, create the dirs it needs, tee all output to a
+    persistent log, and — critically — propagate the CONTAINER's exit code
+    through the pipe.
 
     Without `set -o pipefail` a pipeline's exit code is the LAST command's
     (tee, which always exits 0), so every job would report "succeeded" no
     matter what the container did. Found on real hardware at the Phase 15
     gate: two crashed vllm-serve jobs showed green.
+
+    `require_mount` is the filesystem/volume name whose mount this command
+    depends on, and it has NO DEFAULT on purpose: every caller has to
+    decide, out loud, whether it is about to write to persistent storage.
+    Pass None only for a command that touches none.
+
+    The guard matters because `mkdir -p /lambda/nfs/<name>/task-logs` on an
+    UNMOUNTED path silently makes an ordinary directory on the instance's
+    auto-delete boot disk. The job then runs, writes its outputs and its
+    log there, reports success - and all of it dies with the box. On GCP a
+    volume is mounted by Manifold after the instance is already CONNECTED,
+    so there is a real window in which that is the state; on Lambda the
+    same thing happens if the NFS mount ever falls off. Both refuse here
+    instead, with exit code volumes.NOT_A_MOUNT_EXIT and a message saying
+    which path was not a mount.
     """
     mkdirs = " ".join(shlex.quote(d) for d in ensure_dirs)
     # The job must SURVIVE the streaming SSH session. A backend restart (or
@@ -289,7 +307,16 @@ def wrap_remote_command(docker_cmd: str, remote_log: str, *,
     log_q = shlex.quote(remote_log)
     exit_q = shlex.quote(remote_log.rsplit(".", 1)[0] + ".exit")
     runner = f"({docker_cmd}) > {log_q} 2>&1; echo $? > {exit_q}"
+    # The guard is its OWN list, ended with `;` and never joined with `&&`.
+    # Everything below is one AND-OR list ending in `&`, and `&` binds the
+    # whole list - so `guard && mkdir ... &` backgrounds the guard too, its
+    # `exit` leaves only the background subshell, and the outer shell sails
+    # on into the `while [ ! -f <exit file> ]` wait that nothing will ever
+    # satisfy: a hung SSH command instead of a refusal. Caught by the
+    # real-shell test, which hangs when this is a `&&`.
+    guard = f"{volumes.mount_guard(require_mount)}; " if require_mount else ""
     return (
+        f"{guard}"
         f"mkdir -p {mkdirs} && rm -f {exit_q} && : > {log_q} && "
         f"nohup bash -c {shlex.quote(runner)} < /dev/null > /dev/null 2>&1 & "
         f"tail -n +1 -F {log_q} 2>/dev/null & TAILPID=$!; "
@@ -1479,6 +1506,12 @@ class Dispatcher:
             docker_cmd, remote_log,
             ensure_dirs=["/workspace/ephemeral",
                          f"/lambda/nfs/{filesystem}/task-logs"],
+            # Dispatch keys on the CONNECTION being connected, not on the
+            # launch being active, so a job can be handed to a box whose
+            # volume Manifold has not mounted yet (on GCE that window is
+            # minutes long). The guard is what makes that safe: the job
+            # refuses instead of writing its outputs to the boot disk.
+            require_mount=filesystem,
         )
 
         for attempt in (1, 2):
@@ -1522,6 +1555,27 @@ class Dispatcher:
 
         for line in stderr.splitlines():
             self.queue.append_log(task_id, f"[stderr] {line}")
+        if exit_code == volumes.NOT_A_MOUNT_EXIT:
+            # The mount guard refused before the container ever started, so
+            # NOTHING ran and nothing was written. Said in the job's own
+            # words rather than as "container exited 78", because the
+            # difference between "your job crashed" and "Manifold would not
+            # let it write to a disk that dies with the box" is the whole
+            # reason the guard exists.
+            self.queue.append_log(
+                task_id,
+                f"[manifold] refused: {volumes.mount_path(filesystem)} is not "
+                f"a mounted filesystem on {instance_id}; the job did not run")
+            self._finish_task(
+                task_id, exit_code=exit_code, output_paths=[],
+                error=(
+                    f"{volumes.mount_path(filesystem)} is not mounted on "
+                    f"{instance_id}, so this job would have written its "
+                    f"outputs to the instance's boot disk, which is deleted "
+                    f"with the instance. Nothing ran. If the box is still "
+                    f"coming up, requeue in a minute; otherwise check the "
+                    f"volume on the Volumes page."))
+            return
         self.queue.append_log(
             task_id,
             f"[manifold] exited {exit_code}; log archived at {remote_log}",
@@ -2658,6 +2712,18 @@ class Dispatcher:
                 # must never break telemetry. The launch stays 'booting',
                 # which is the truth, and the next tick asks again.
                 logger.exception("provisioning sweep failed for %s",
+                                 instance_id)
+            # The volume mount-heal (Phase 112), between the two: the gate
+            # above only looks at 'booting' rows, and orphan repair mints
+            # ACTIVE rows that never passed it. Runs the mount half only -
+            # never mkfs - and no-ops on every box that is not a GCP launch
+            # carrying a volume, which is almost all of them.
+            try:
+                await self.orchestrator.sweep_volume_mount(instance_id, conn)
+            except Exception:   # noqa: BLE001 - a heal that could not run
+                # must never break telemetry. An unmounted volume is not
+                # silent damage: every writer refuses at the mount guard.
+                logger.exception("volume mount sweep failed for %s",
                                  instance_id)
             # The launch bootstrap (Phase 104), before the probe rather
             # than after it, so a script started on this tick is confirmed

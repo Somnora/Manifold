@@ -18,7 +18,7 @@ from tests.conftest import make_settings, mock_connect_fn
 def test_wrap_persists_the_exit_code():
     wrapped = wrap_remote_command(
         "docker run --rm x", "/lambda/nfs/fs/task-logs/abc.log",
-        ensure_dirs=["/workspace/ephemeral"])
+        ensure_dirs=["/workspace/ephemeral"], require_mount="fs")
     assert "/lambda/nfs/fs/task-logs/abc.exit" in wrapped
     assert "nohup bash -c" in wrapped          # container detached from session
     assert "exit $rc" in wrapped               # code still propagates
