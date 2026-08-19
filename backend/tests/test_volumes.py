@@ -1454,3 +1454,58 @@ def test_launch_options_still_offers_gcp_no_filesystems(tmp_path, monkeypatch):
         options = c.get("/launch-options?provider=gcp").json()
         assert options["provider"] == "gcp"
         assert all(t["filesystem"] is None for t in options["targets"])
+
+
+def test_the_cleanup_view_refuses_to_measure_an_unmounted_volume(client):
+    """`files/usage` exists to decide what to delete, so an empty answer
+    from the wrong directory is worse than no answer: it says the volume
+    holds nothing worth keeping about a disk nobody looked at.
+
+    Asked INSIDE a volume, which is how the cleanup view is used. The
+    /lambda/nfs root itself belongs to no one volume - it is the ordinary
+    directory the mount points live in - so the guard stays out of its way,
+    exactly as it does for files/list.
+    """
+    instance_id = launch_connected(client)
+    unmount(client, instance_id)
+
+    resp = client.get(
+        f"/instances/{instance_id}/files/usage?path=manifold-data")
+
+    assert resp.status_code == 409, resp.text
+    assert "Nothing was measured" in resp.json()["detail"]
+
+
+def test_a_delete_on_an_unmounted_volume_refuses_instead_of_reporting_success(
+        client):
+    """The destructive one. Unguarded, this deletes whatever the boot disk
+    holds at that path and answers as though the volume had been cleaned -
+    so somebody freeing space frees none, is told it worked, and finds the
+    volume just as full next time."""
+    instance_id = launch_connected(client)
+    unmount(client, instance_id)
+
+    resp = client.delete(
+        f"/instances/{instance_id}/files"
+        f"?root_name=persistent&path=old-checkpoints&recursive=true")
+
+    assert resp.status_code == 409, resp.text
+    assert "Nothing was deleted" in resp.json()["detail"]
+    # And no audit row claiming the volume was cleaned.
+    entries = client.get("/audit").json()["entries"]
+    assert all(e["action"] != "file_delete" for e in entries)
+
+
+def test_an_archive_of_an_unmounted_volume_refuses_instead_of_shipping_empty(
+        client):
+    """People take an archive right before terminating a box. Unguarded,
+    this returns a valid, well-formed, EMPTY tar.gz of the data they were
+    trying to save, and nothing tells them until they need it."""
+    instance_id = launch_connected(client)
+    unmount(client, instance_id)
+
+    resp = client.get(
+        f"/instances/{instance_id}/files/archive?path=outputs")
+
+    assert resp.status_code == 409, resp.text
+    assert "Nothing was archived" in resp.json()["detail"]

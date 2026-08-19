@@ -7053,10 +7053,21 @@ And one gap in the guard itself, stated rather than left to be discovered:
 verbatim, and are NOT prefixed with the mount guard. They are the documented
 raw-shell escape hatch, and editing a line somebody typed is not something a
 guard should do. A command typed there can still write to an unmounted path;
-what it cannot do is get Manifold to report the result as saved. `fs_usage`
-and `fs_delete` (the sidecar's recursive-size and delete routes) share the
-browse's exposure and are not guarded yet either - they were not part of the
-review's list and each needs its own copy decision, not a copied one.
+what it cannot do is get Manifold to report the result as saved.
+
+`fs_usage`, `fs_delete` and `fs_archive` were deferred out of that list and
+are now guarded too, because reading their purposes made the case: usage is
+the view people DELETE from, so measuring the boot disk says "nothing here
+is worth keeping" about a disk nobody looked at; delete both destroys and
+reports success, so a person freeing space would free none and be told it
+worked; and an archive is what people take right before terminating a box -
+unguarded it hands back a valid, well-formed, EMPTY tar.gz of the data they
+were trying to save, and nothing tells them until they need it. Each got its
+own refusal sentence rather than a copied one.
+
+The guard is scoped to a path INSIDE a volume. `/lambda/nfs` itself belongs
+to no one volume - it is the ordinary directory the mount points live in -
+so a listing of the root is not guarded, the same scoping `fs_list` has.
 
 **Not verifiable without hardware, stated plainly.** Every decision above is
 pure and pinned by tests, and the transport is not: that `sudo mkfs.ext4 -F`

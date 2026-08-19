@@ -2964,7 +2964,18 @@ def create_app(
     @app.get("/instances/{instance_id}/files/usage")
     async def fs_usage(instance_id: str, root_name: str = "persistent",
                        path: str = ""):
-        """Recursive child sizes, heaviest first — the cleanup view."""
+        """Recursive child sizes, heaviest first — the cleanup view.
+
+        Mount asserted for the same reason fs_list asserts it, with a
+        sharper edge: this view exists to decide what to DELETE. An
+        unmounted volume measures the empty boot-disk directory and reports
+        a volume with nothing worth keeping in it."""
+        if root_name == "persistent":
+            await orchestrator.assert_mounted_path(
+                instance_id, f"{volumes.MOUNT_ROOT}/{path.strip('/')}",
+                refusal=("Nothing was measured: sizes from that path would "
+                         "have described the boot disk, not the volume, and "
+                         "this is the view people delete from."))
         try:
             return await _sidecar_or_409(instance_id).usage(root_name, path)
         except SidecarError as exc:
@@ -2974,7 +2985,20 @@ def create_app(
     async def fs_delete(instance_id: str, root_name: str, path: str,
                         recursive: bool = False):
         """Delete a file or directory on the instance. Destructive and
-        audited; directories require recursive=true (the UI confirms)."""
+        audited; directories require recursive=true (the UI confirms).
+
+        The mount assertion matters most here, because this route both
+        destroys and reports success. Against an unmounted volume it would
+        delete whatever the boot disk happens to hold at that path and
+        answer as though the volume had been cleaned - so somebody freeing
+        space would free none, be told it worked, and find the volume just
+        as full next time. Refusing is the only honest answer available."""
+        if root_name == "persistent":
+            await orchestrator.assert_mounted_path(
+                instance_id, f"{volumes.MOUNT_ROOT}/{path.strip('/')}",
+                refusal=("Nothing was deleted: that path is not the volume "
+                         "right now, so the delete would have hit the boot "
+                         "disk and reported the volume cleaned."))
         try:
             result = await _sidecar_or_409(instance_id).delete_path(
                 root_name, path, recursive
@@ -2993,12 +3017,23 @@ def create_app(
     async def fs_archive(instance_id: str, path: str):
         """Download a whole directory as one .tar.gz: tar runs ON the
         instance (compression where bandwidth is cheap), the archive is
-        streamed down over SFTP, and the temp file is removed after."""
+        streamed down over SFTP, and the temp file is removed after.
+
+        Mount asserted because of what this archive is FOR: people take one
+        before terminating a box. Against an unmounted volume it would tar
+        the empty boot-disk directory and hand back a valid, well-formed,
+        empty archive of the data they were trying to save - and they would
+        have no way to tell until they needed it."""
         import hashlib
         import posixpath
         from fastapi.responses import StreamingResponse
         conn = _connected(instance_id)
         remote = _resolve_remote_path(instance_id, path)
+        await orchestrator.assert_mounted_path(
+            instance_id, remote,
+            refusal=("Nothing was archived: that path is not the volume "
+                     "right now, so the archive would have held the boot "
+                     "disk's contents under the volume's name."))
         parent, name = posixpath.dirname(remote), posixpath.basename(remote)
         if not name:
             raise HTTPException(400, "cannot archive a filesystem root")
