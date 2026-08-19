@@ -35,17 +35,28 @@ jobs:
 
       - name: Stage sidecar for Tauri
         shell: bash
+        # Onedir layouts differ per platform (shim on macOS, adjacency on
+        # Windows) - the script is the single place that knows the shape.
         run: |
           cd desktop && npm ci --no-fund --no-audit
-          triple="$(rustc -vV | sed -n 's/^host: //p')"
-          mkdir -p src-tauri/binaries
-          src=../backend/dist/manifold-backend
-          [ -f "$src.exe" ] && src="$src.exe" && ext=".exe" || ext=""
-          cp "$src" "src-tauri/binaries/manifold-backend-$triple$ext"
+          cd .. && ./scripts/stage-sidecar.sh
 
       - name: Tauri build
         shell: bash
         run: cd desktop && npx tauri build --bundles ${{ matrix.bundles }}
+
+      # The regression this packaging exists to prevent is a bridge that
+      # cannot answer an MCP client. Prove the BUILT bundle end to end on
+      # the runner: spawn the app's own sidecar path (the shim) exactly as
+      # Claude Desktop would and require the JSON-RPC handshake to answer.
+      # macOS only - the msi cannot be installed on the build runner.
+      - name: Handshake against the built bundle (macOS)
+        if: matrix.bundles == 'dmg'
+        shell: bash
+        run: |
+          app=$(find desktop/src-tauri/target/release/bundle/macos -maxdepth 1 -name '*.app' | head -1)
+          test -n "$app" || { echo "no .app produced" >&2; exit 1; }
+          "$app/Contents/MacOS/manifold-backend" --doctor --handshake
 
       - uses: actions/upload-artifact@v4
         with:

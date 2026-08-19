@@ -6578,3 +6578,42 @@ needs the same bounded-wait shape as wait_for_launch. The reconcile
 sweep then labeled Manifold's own in-flight delete
 "external_termination_detected"; an in-flight terminate should suppress
 that conclusion for its instance.
+
+## 2026-08-19 — Phase 109: the backend loads in place (onedir), and the old path still answers
+
+The frozen backend moves from PyInstaller --onefile to --onedir. The
+onefile binary re-extracted 87MB (2,206 files, 76 dylibs) into a fresh
+temp dir on EVERY spawn, and macOS re-assesses every fresh extraction:
+under load that put 12-30s tails on the MCP handshake (3 misses of a 30s
+deadline in 20 spawns) and leaked a _MEI dir per non-graceful exit
+(~2.5GB found and swept on 2026-08-18). Onedir loads in place: no
+extraction, no per-spawn assessment, nothing to leak. The lazy-import
+work (phase 106) had already matched onedir's MEDIAN on onefile - this
+phase is for the TAIL and the leak, and the honest framing is
+reliability hardening, not speed.
+
+The path every MCP client is registered against
+(Contents/MacOS/manifold-backend) cannot move, and Tauri resources land
+in Contents/Resources - so on macOS a 34KB C shim
+(scripts/backend-shim.c) stands at the old path and exec()s the real
+binary in Resources/backend/. exec, not spawn: the client's pid IS the
+backend, stdio passes through, kills land on the real process, and the
+parent-death watch is untouched. argv[0] is rewritten so
+sys.executable-relative logic (doctor --handshake respawns itself)
+resolves inside the bundle. On Windows no shim: externalBin and
+resources both land in the install root, so the real exe and _internal/
+sit adjacent by construction. One staging script
+(scripts/stage-sidecar.sh) owns both layouts;
+desktop/scripts/prepare-sidecar.sh (a drifting duplicate of the old
+workflow step) is deleted.
+
+Measured on the assembled bundle layout (this machine, arm64): 30
+spawns, initialize 275-377ms, worst 377ms, zero outliers - vs the
+installed onefile's 473ms median with the documented tails. The server
+path boots and serves the dashboard through the shim (mock, :8123). The
+desktop workflow now proves the built bundle on every macOS build: it
+spawns the .app's own sidecar path and requires the JSON-RPC handshake
+to answer (--doctor --handshake needs no running backend - verified
+against a dead port). What only a real install can settle, as with every
+desktop change: the msi layout on real Windows, and dmg behavior under
+Gatekeeper quarantine (CI-built apps are never quarantined).
