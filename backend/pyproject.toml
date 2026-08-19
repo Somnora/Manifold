@@ -1,6 +1,6 @@
 [project]
 name = "manifold-backend"
-version = "0.2.14"
+version = "0.2.15"
 description = "Local orchestrator for Lambda Cloud GPU instances"
 license = "MIT"
 requires-python = ">=3.11"
