@@ -99,28 +99,29 @@ jobs:
         run: npm ci --no-fund --no-audit && npm run build
       - name: Install a browser
         working-directory: dashboard
-        # This one step hung FOUR times in 24 hours (2026-08-18/19); twice it
-        # ran until a whole job budget was gone, once holding a release
-        # commit's run open for GitHub's full 6 hours. The cause is not
-        # playwright: `--with-deps` shells out to apt, apt waits forever on
-        # the dpkg lock by default, and the runner's own unattended-upgrades
-        # holds that lock for the first minute of a job. So stand the lock
-        # holder down, bound each attempt so a stall becomes a failure
-        # instead of a wait, and retry once. A genuinely broken install still
-        # fails the job - only the lock race is absorbed.
-        env:
-          DEBIAN_FRONTEND: noninteractive
+        # This step hung or failed FIVE times in 24 hours (2026-08-18/19),
+        # twice until a whole job budget was gone and once holding a release
+        # commit's run open for GitHub's full 6 hours.
+        #
+        # The cause is `--with-deps`, and it took two tries to name it. It
+        # shells out to apt to install FONTS - fonts-ipafont-gothic,
+        # fonts-freefont-ttf, fonts-wqy-zenhei, xfonts-* - and the Ubuntu
+        # mirror serves them slowly enough to look like a hang: one 3.5MB
+        # package took three minutes on 2026-08-19. The first fix here blamed
+        # the dpkg lock and added `timeout` plus a retry, which made it worse:
+        # `timeout` kills npx but not the apt-get it spawned, so the orphan
+        # kept the lock and the retry died instantly on "Could not get lock
+        # /var/lib/dpkg/lock-frontend. It is held by process 2762".
+        #
+        # So do not call apt at all. The runner image already carries the
+        # shared libraries headless chromium needs; the fonts only matter for
+        # rendering non-Latin text, which no check here does. If a library
+        # ever IS missing, the very next step launches chromium and fails
+        # immediately with a clear loader error - a fast, honest failure
+        # instead of a five-minute download that might not end.
         run: |
           npm i --no-save --no-fund --no-audit playwright@1.62
-          sudo pkill -f unattended-upgr || true
-          install_browser() {
-            timeout 300 npx playwright install --with-deps chromium
-          }
-          install_browser || {
-            echo "browser install stalled or failed; retrying once" >&2
-            sleep 15
-            install_browser
-          }
+          npx playwright install chromium
       - name: Serve it and check the dialog escapes its parent
         working-directory: dashboard
         run: |
