@@ -99,9 +99,28 @@ jobs:
         run: npm ci --no-fund --no-audit && npm run build
       - name: Install a browser
         working-directory: dashboard
+        # This one step hung FOUR times in 24 hours (2026-08-18/19); twice it
+        # ran until a whole job budget was gone, once holding a release
+        # commit's run open for GitHub's full 6 hours. The cause is not
+        # playwright: `--with-deps` shells out to apt, apt waits forever on
+        # the dpkg lock by default, and the runner's own unattended-upgrades
+        # holds that lock for the first minute of a job. So stand the lock
+        # holder down, bound each attempt so a stall becomes a failure
+        # instead of a wait, and retry once. A genuinely broken install still
+        # fails the job - only the lock race is absorbed.
+        env:
+          DEBIAN_FRONTEND: noninteractive
         run: |
           npm i --no-save --no-fund --no-audit playwright@1.62
-          npx playwright install --with-deps chromium
+          sudo pkill -f unattended-upgr || true
+          install_browser() {
+            timeout 300 npx playwright install --with-deps chromium
+          }
+          install_browser || {
+            echo "browser install stalled or failed; retrying once" >&2
+            sleep 15
+            install_browser
+          }
       - name: Serve it and check the dialog escapes its parent
         working-directory: dashboard
         run: |
