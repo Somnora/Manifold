@@ -50,11 +50,101 @@ are dated on-demand list prices, and every entry carries that label -
 your bill is Google's meter. The Billing Catalog API is the planned
 upgrade.
 
+## Data volumes: a persistent home for a GCP box
+
+Without one, a GCP instance is scratch-only: everything on it dies with the
+box (termination's data-rescue can still download files to your machine, but
+that is a net, not a home). A **data volume** is a Compute Engine Persistent
+Disk that Manifold creates, attaches, and mounts at `/lambda/nfs/<name>` -
+the same path a Lambda filesystem lands on, so jobs, `{persistent}` template
+mounts, `sync_outputs`, the Files browser and relative paths all work
+identically.
+
+Create one on the Storage page (name, zone, size), then pick it as the
+volume on the launch form. Agents can read the list with the MCP tool
+`list_volumes` and pass a name as `launch_gpu`'s `filesystem`; creating and
+deleting is deliberately a human action.
+
+### A volume is ZONAL, and that is the trap
+
+A Persistent Disk lives in one zone and can only attach to an instance in
+that same zone. GPU capacity varies by zone - `us-central1-a` may have L4s
+today and `us-central1-b` may not - so **it is possible to end up with your
+data in a zone where the GPU you want is unavailable**. When that happens
+Manifold refuses rather than quietly moving the zone and launching without
+your data; the launch form says which GPU is missing where, and the choice
+of what to change is yours.
+
+There is no resize and no snapshot in this version. Snapshot-and-restore
+into another zone is the standard escape hatch and is not built here; today
+the ways out are copying the data off over the instance, or creating a
+second volume in the zone you want.
+
+### What it costs
+
+A volume bills for its **provisioned** size from the moment it exists,
+attached or not - unlike a Lambda filesystem, which bills for what it
+holds. Manifold shows Google's dated list price per volume and does not
+pretend to meter it. A volume you stopped using is a volume still billing:
+delete it.
+
+Manifold never reports a `bytes_used` for a volume, anywhere. Nothing
+outside the instance can read a detached disk, and a `0` there would claim
+it is empty. To see what is on one, launch a box with it attached and use
+the Files panel.
+
+### Every way a volume can refuse, and what it means
+
+Manifold would rather fail a launch than come up with a path that looks
+persistent and is not. These are the refusals you can actually hit:
+
+- **"attached to \<instance\>"** - a disk attaches to one instance at a
+  time. Terminate the holder (Manifold saves its files first, and the volume
+  survives) and launch again. If Google reports that instance as *stopped*
+  rather than deleted, it still holds its disks: delete it, or detach the
+  disk in the console.
+- **"Zone mismatch"** - the volume is in another zone. Launch there, or go
+  without it.
+- **"already holds a filesystem that Manifold has no record of writing"** -
+  the disk was formatted outside Manifold, or this install's database is not
+  the one that created it. Manifold will not mount it (a job pointed at
+  someone else's data corrupts it) and will not format it (that destroys
+  it). Attaching pre-existing disks is not supported.
+- **"recorded as formatted ... but the disk holds no filesystem"** - a
+  format was interrupted. Manifold records the format *before* it runs it,
+  precisely so this state is detectable, and it refuses to run mkfs twice.
+  Because that record is written once, *Manifold* never mounted the volume
+  and so never wrote to it; it cannot speak for anything done to the disk
+  outside Manifold. If its records are the whole story, delete it and create
+  another.
+- **"already exists with files in it and nothing mounted there"** -
+  something wrote to `/lambda/nfs/<name>` while the volume was not mounted.
+  Mounting would hide those files, and they are evidence. Look at them on
+  the instance first.
+- **"is not a mounted filesystem"** on a job, a sync, an upload or a file
+  listing - the box is up but the volume is not mounted (still coming up, or
+  a repair failed). The job did not run and nothing was written; nothing is
+  lost. Manifold refuses every write *it* issues to that path rather than
+  letting it land on the boot disk, which is deleted with the instance. The
+  exception is `run_command` / `run_detached` / a terminal, which run your
+  own shell line verbatim: a command you type there can still write to an
+  unmounted path.
+
+### What it is not
+
+A volume is not a "filesystem" anywhere in Manifold: it does not appear
+under `/filesystems`, it does not back the Storage page's file browser, and
+it never carries a size-used it cannot know. Those are all things a Lambda
+filesystem can answer and a Persistent Disk cannot, and giving a volume a
+plausible-looking value for them would be worse than not showing it.
+
 ## Honest limits, v1
 
-- **Scratch-only.** Persistent filesystems are a Lambda feature; GCP
-  Filestore is not wired up. Termination's data-rescue can still download
-  files to your machine.
+- **One volume per instance**, and only on GCP - `extra_filesystems` is
+  refused there. A Persistent Disk attaches to one machine at a time.
+- **No resize, no snapshots, no attaching a disk Manifold did not create.**
+- **The volume is not in `/etc/fstab`.** Manifold re-mounts it if it finds
+  an active box with it unmounted; it never formats on that path.
 - **Boot installs the NVIDIA driver.** GCE Ubuntu images ship none, so
   first boot takes several extra minutes; the GPU-readiness probe holds
   jobs until a container can actually see the card.

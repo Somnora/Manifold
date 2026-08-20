@@ -29,8 +29,13 @@ from dataclasses import dataclass, field
 # Stamped into every entry's price_basis. Update it when refreshing prices.
 PRICES_RECORDED = "2026-08-14"
 
+# The region every price below is quoted in. Travels to the client as its
+# own field (price_basis_region) so the launch form can compare it with the
+# selected zone instead of parsing the prose sentence beneath it.
+PRICE_BASIS_REGION = "us-central1"
+
 PRICE_BASIS = (
-    f"Google's on-demand list price for us-central1 as recorded "
+    f"Google's on-demand list price for {PRICE_BASIS_REGION} as recorded "
     f"{PRICES_RECORDED}, not a live meter. Your bill is Google's; spot, "
     f"sustained-use and regional differences all move it."
 )
@@ -132,5 +137,13 @@ def quota_metric(entry: GCPShelfEntry) -> str:
 
 def zone_to_region(zone: str) -> str:
     """us-central1-a -> us-central1. Pure string math; a zone is always
-    region + '-' + letter."""
-    return zone.rsplit("-", 1)[0]
+    region + '-' + letter.
+
+    A value that is already a region comes back untouched. Blind rsplit
+    turned "us-central1" into "us", which then travelled as the scope label
+    on quota rows - a place name Google never uses.
+    """
+    head, _, tail = zone.rpartition("-")
+    if head and len(tail) == 1 and tail.isalpha():
+        return head
+    return zone

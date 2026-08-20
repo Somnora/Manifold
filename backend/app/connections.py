@@ -363,6 +363,26 @@ class ManagedConnection:
         finally:
             sftp.exit()
 
+    def redial(self) -> None:
+        """Drop the current SSH session; the supervisor opens a new one.
+
+        NOT close(): close() is terminal (it sets _closing and cancels the
+        supervisor, and there is no restart primitive), so a caller that
+        wanted a fresh session and reached for it would end the connection
+        for good. This only closes the underlying asyncssh connection, which
+        is what _supervise is already waiting on: it wakes, reconnects with
+        the normal backoff, and this object, its state machine, its entry in
+        the orchestrator's connections dict, and its host-key pin all
+        survive.
+
+        The one thing a redial DOES destroy is every channel on the old
+        session: an open terminal PTY, a running job's stream. So callers
+        ask for it only on evidence that the session itself is broken (see
+        the provisioning gate's docker-access check), never on a schedule.
+        """
+        if self._conn is not None:
+            self._conn.close()
+
     async def close(self) -> None:
         self._closing = True
         if self._supervisor:

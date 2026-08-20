@@ -183,6 +183,54 @@ async def test_observed_stop_stamps_both_columns(settings, db, mock_client):
 
 
 @pytest.mark.asyncio
+async def test_a_booting_row_whose_instance_vanished_is_closed(
+        settings, db, mock_client):
+    """Nobody else closes this row, and it counted up forever.
+
+    The boot wait and the provisioning gate both work through a connection,
+    and this same sweep reaps that connection one loop earlier - so a launch
+    whose box was terminated from the console mid-boot kept rendering
+    "installing drivers and runtime" on a machine that no longer existed,
+    and the idle sweep skips 'booting', so nothing ever said the box might
+    still be billing. 'failed' because it never became usable; observed
+    stamps because the evidence is the same one the active branch acts on
+    (the row's own provider answered, and this id was not in the answer).
+    """
+    lid = _seed(db, "i-vanished-mid-boot", "booting",
+                launched_at="2026-08-10T20:00:00+00:00")
+    orch = _orchestrator(settings, db, mock_client)
+
+    await orch.instances_with_state()
+
+    row = db.get_launch(lid)
+    assert row["status"] == "failed"
+    assert "still provisioning" in row["error"]
+    assert "not terminated by Manifold" in row["error"]
+    assert row["terminated_at"] is not None
+    assert row["resolved_at"] is not None
+    assert any(e["action"] == "external_termination_detected"
+               for e in db.list_audit())
+    await orch.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_a_booting_row_whose_instance_is_alive_is_left_alone(
+        settings, db, mock_client):
+    """The other half: a box mid-provision is exactly where a launch is
+    SUPPOSED to sit, and closing it would fail every healthy GCE launch
+    (~7 minutes of cloud-init) on its first poll."""
+    instance_id = await _live_instance(mock_client, status="booting")
+    lid = _seed(db, instance_id, "booting",
+                launched_at="2026-08-10T20:00:00+00:00")
+    orch = _orchestrator(settings, db, mock_client)
+
+    await orch.instances_with_state()
+
+    assert db.get_launch(lid)["status"] == "booting"
+    await orch.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_orphaned_failed_row_is_repaired_when_its_instance_is_alive(
         settings, db, mock_client):
     """The boot-timeout case: the row gave up, the instance came up anyway and

@@ -23,6 +23,10 @@ Control flow for a launch:
 6. CONNECT    ask the launch's ConnectionManager for the dial target (the
               only mode-specific step) and start a ManagedConnection, which
               keeps itself alive with reconnect+backoff from then on.
+7. PROVISION  the launch stays "booting" until the box says its own setup
+              finished (cloud-init: driver, Docker, runtime, sidecar). Only
+              then does it become "active". SSH answering is not the same
+              fact as the machine being usable - see sweep_provisioning.
 """
 
 from __future__ import annotations
@@ -65,6 +69,7 @@ from .lambda_api import (
     LambdaClient,
 )
 from .model_client import ModelClient, RealModelClient
+from . import volumes as vol
 from .sidecar_client import RealSidecarClient, SidecarClient, SidecarError
 from .ide_attach import remove_ssh_config_block
 from .providers import ProviderRegistry
@@ -93,6 +98,37 @@ MAX_EXTRA_FILESYSTEMS = 4
 NVIDIA_SMI_METRICS = (
     "nvidia-smi --query-gpu=name,memory.used,memory.total,utilization.gpu "
     "--format=csv,noheader,nounits"
+)
+
+# -- the provisioning gate's three questions (Phase 110) -----------------------
+#
+# "The provider says RUNNING" is not "the machine is ready". On Lambda the two
+# nearly coincide; on a stock-Ubuntu GCE image sshd answers minutes before
+# cloud-init has finished building the NVIDIA driver, installing Docker and
+# starting the sidecar. These are the cheapest questions that tell the
+# difference, asked over the managed connection.
+
+# 1. Did OUR cloud-init run to completion? The script sets -e, so the marker
+#    exists only if every line before it succeeded. Durable path on purpose
+#    (see cloud_init.py): /var/run is tmpfs and a reboot would erase it.
+INIT_MARKER_PROBE = "test -f /var/lib/manifold/init-done"
+
+# 2. If not: has cloud-init itself given up the boot? Weaker evidence - a
+#    reboot rewrites boot-finished at the end of the NEXT boot while the
+#    per-instance user-data script stays incomplete - so it is only ever the
+#    fallback that stops us waiting forever on a billing box.
+CLOUD_INIT_DONE_PROBE = "test -f /var/lib/cloud/instance/boot-finished"
+
+# 3. Can THIS SSH session use the docker socket? Supplementary groups are
+#    fixed when a session is established, so a connection opened before
+#    cloud-init ran `usermod -aG docker ubuntu` is locked out of Docker for
+#    its whole life - which is exactly how a live GCE box ended up unable to
+#    run any template job. `test -w` honours the POSIX ACL cloud-init sets,
+#    so a box the ACL already repaired answers yes and is not redialled. A
+#    box with no socket at all answers yes too: there is nothing a redial
+#    could fix there (same fail-open rule as the dispatcher's GPU probe).
+DOCKER_ACCESS_PROBE = (
+    "test ! -e /var/run/docker.sock || test -w /var/run/docker.sock"
 )
 
 
@@ -199,28 +235,49 @@ _LAUNCH_PHASES = {
                   "No capacity yet; backing off and retrying"),
     "booting":   ("waiting_for_active",
                   "Instance created; waiting for it to boot and get an IP"),
-    "active":    ("ready", "SSH is up; the instance is ready"),
+    # Not "SSH is up" any more: SSH being up is the milestone BEFORE this
+    # one, and saying so here was how a launch announced itself ready six
+    # minutes early on GCE (Phase 110).
+    "active":    ("ready", "Set up and ready to use"),
     "failed":    ("failed", "Launch did not complete"),
     "terminated": ("terminated", "Instance has been terminated"),
 }
 
 
 def launch_progress(launch: dict, boot_timeout_seconds: float,
-                    now_iso: str) -> dict:
+                    now_iso: str,
+                    provisioning_timeout_seconds: float | None = None) -> dict:
     """Return `launch` enriched with structured progress fields.
 
     Pure (the caller supplies `now_iso`): `phase` is a stable machine label,
     `phase_detail` a one-line human summary, and `settled` tells a poller it
-    can stop. While booting we add `boot_elapsed_seconds` / `boot_timeout_
-    seconds` / `boot_remaining_seconds` so a client renders a countdown rather
-    than a blank.
+    can stop. While the instance is still coming up on the provider we add
+    `boot_elapsed_seconds` / `boot_timeout_seconds` / `boot_remaining_seconds`
+    so a client renders a countdown rather than a blank.
+
+    'booting' spans TWO windows (Phase 110), and the countdown belongs to the
+    first one only. Once connected_at is set the boot wait is over and the
+    box is provisioning itself; leaving the boot countdown on screen would
+    keep ticking down a deadline that no longer decides anything, so the
+    fields are dropped and phase_detail says what is actually happening. The
+    phase label does not change: a client that branches on it keeps working,
+    and a launch that is not usable yet keeps saying so.
     """
     status = launch.get("status", "")
     phase, detail = _LAUNCH_PHASES.get(status, (status or "unknown", ""))
     enriched = dict(launch)
     enriched["phase"] = phase
     enriched["settled"] = status in SETTLED_LAUNCH_STATUSES
-    if status == "booting" and launch.get("launched_at"):
+    if status == "booting" and launch.get("connected_at"):
+        elapsed = _interval_seconds(launch["connected_at"], now_iso)
+        inst = launch.get("lambda_instance_id") or "instance"
+        detail = f"SSH is up on {inst}; installing drivers and runtime"
+        if elapsed is not None:
+            elapsed = max(0.0, elapsed)
+            budget = ("" if provisioning_timeout_seconds is None
+                      else f" of {round(provisioning_timeout_seconds)}s")
+            detail += f" ({round(elapsed)}s{budget})"
+    elif status == "booting" and launch.get("launched_at"):
         try:
             elapsed = (datetime.fromisoformat(now_iso)
                        - datetime.fromisoformat(launch["launched_at"])
@@ -475,6 +532,13 @@ class Orchestrator:
         }
         self.connections: dict[str, ManagedConnection] = {}   # lambda instance id -> conn
         self._launch_tasks: dict[str, asyncio.Task] = {}
+        # Instances a provisioning sweep is currently asking about. TWO
+        # callers drive that gate - the launch tail's fast-path loop and the
+        # telemetry tick - and it awaits several SSH probes, so without this
+        # they interleave: both can read the row as still 'booting', both
+        # find the session cannot reach docker, and the second redial drops
+        # the session the first one just rebuilt.
+        self._provisioning_sweeps: set[str] = set()
         # Evidence from the last instances_with_state() sweep: which ids the
         # cloud listed as running, and which providers actually answered.
         # Kept so read-only consumers (the polled spend routes) can classify
@@ -596,18 +660,41 @@ class Orchestrator:
         # row itself, must be about the cloud this launch will really use.
         provider = self.resolve_provider(provider)
 
-        # Checked before the catalog call: this refusal costs nothing, needs
-        # no API, and is the more actionable message when both would apply.
-        # Extras land in the same refusal (Phase 103): they are the same
-        # Lambda-only feature, and enforcing here rather than in a client
-        # means every caller - dashboard, MCP, autopilot - hits one wall.
-        if (filesystem or extra_filesystems) and provider != 'lambda':
+        # THE PERSISTENT-STORAGE FORK (Phase 112). `filesystem` has never
+        # meant "a Lambda filesystem" - it means the name under /lambda/nfs/
+        # where this launch's persistent home is mounted, which a mounted GCP
+        # data volume satisfies identically. That is why every consumer
+        # downstream (dispatch, task readoption, the rescue, the relative
+        # file routes, resume-after-restart) needed no change at all: they
+        # were already reading the right fact. So GCP no longer refuses a
+        # primary name; it validates it as a volume instead.
+        #
+        # Checked before the catalog call, where a refusal costs nothing and
+        # needs no API: the name's SHAPE here, the disk itself further down
+        # once the provider is known to be configured. Enforcing here rather
+        # than in a client means every caller - dashboard, MCP, autopilot -
+        # hits one wall.
+        if (filesystem or extra_filesystems) and provider not in (
+                'lambda', 'gcp'):
             raise LaunchRejected(
                 400,
-                f"{provider} launches are scratch-only for now: persistent "
-                f"filesystems are a Lambda feature (GCP Filestore is not "
-                f"wired up). Launch without a filesystem "
+                f"{provider} launches are scratch-only: persistent storage "
+                f"is wired up for Lambda filesystems and GCP data volumes "
+                f"only. Launch without a filesystem "
                 f"(extra_filesystems included).")
+        if extra_filesystems and provider == 'gcp':
+            raise LaunchRejected(
+                400,
+                f"A GCP launch mounts exactly one data volume, and this one "
+                f"asks for {len(extra_filesystems)} more "
+                f"({', '.join(extra_filesystems)}). A Persistent Disk "
+                f"attaches to one instance at a time, and Manifold mounts "
+                f"one per box; pass the volume this run needs as "
+                f"`filesystem`.")
+        if filesystem and provider == 'gcp':
+            problem = vol.validate_name(filesystem)
+            if problem:
+                raise LaunchRejected(422, problem)
 
         # Extras attach ALONGSIDE a primary; they never stand in for one.
         # Admitting extras onto a scratch-only box would produce an instance
@@ -686,7 +773,7 @@ class Orchestrator:
         # {persistent} refuse to run, sync has nowhere to go, and the
         # termination rescue can only save files by downloading them here.
         # The launch form says all of this before the user clicks.
-        if filesystem and self.client:
+        if filesystem and provider == 'lambda' and self.client:
             filesystems = {fs.name: fs
                            for fs in await self.client.list_filesystems()}
             if filesystem not in filesystems:
@@ -732,6 +819,14 @@ class Orchestrator:
                         f"Drop '{extra}', or launch in {extra_fs.region} if "
                         f"that is where the data lives.",
                     )
+
+        # The GCP half of the same question. Down here rather than at the
+        # fork above because it costs a round trip to Google, and asking
+        # Google anything before unconfigured_reason has had its say turns
+        # "run `gcloud auth application-default login`" into a disk error.
+        if filesystem and provider == 'gcp':
+            await self._admit_gcp_volume(
+                filesystem, zone=region, cloud_provider=cloud_provider)
 
         # SSH key: per-launch choice wins, config.yaml is the fallback. The
         # name must be registered with Lambda or the launch call would fail
@@ -1031,6 +1126,326 @@ class Orchestrator:
             "region": fs.region, "is_in_use": fs.is_in_use,
             "bytes_used": fs.bytes_used,
         }
+
+    # -- GCP data volumes (Phase 112) ---------------------------------------
+
+    def _gcp_volumes(self, cloud_provider=None):
+        """The GCP provider, if it can do volumes at all. None otherwise.
+
+        Asked by capability rather than by class, the way GET /gcp/quota
+        already asks: a provider stub registered under 'gcp' by a test or a
+        future implementation must be able to say "not me" instead of
+        raising an AttributeError from inside a launch.
+        """
+        if cloud_provider is None:
+            try:
+                cloud_provider = self.providers.get_provider('gcp')
+            except ValueError:
+                return None
+        return (cloud_provider
+                if hasattr(cloud_provider, "find_volume") else None)
+
+    async def _admit_gcp_volume(self, name: str, *, zone: str,
+                                cloud_provider) -> None:
+        """Admit (or refuse) one data volume for a launch, ASKING GOOGLE.
+
+        Three questions, all answered by GCE and none by SQLite: does the
+        disk exist, is it in the zone this launch is going to, and is
+        anything holding it. SQLite is never the authority here - the whole
+        history of the provisioning work is rows drifting from boxes, and a
+        stale local "attached to X" would refuse a launch that is fine the
+        moment X is gone. A disk Google reports with an empty `users` is
+        free, whatever any row says.
+
+        The remaining race - two launches both reading users=[] - cannot be
+        closed from here, and is not pretended away: GCE answers the second
+        insert with RESOURCE_IN_USE_BY_ANOTHER_RESOURCE, which the provider
+        maps to its own named refusal.
+        """
+        provider = self._gcp_volumes(cloud_provider)
+        if provider is None:
+            raise LaunchRejected(
+                400,
+                f"This Google Cloud provider cannot read data volumes, so "
+                f"Manifold cannot attach '{name}'. Launch without a volume "
+                f"(scratch only).",
+                reason_code="provider")
+        try:
+            disk = await provider.find_volume(name)
+        except ProviderUnavailable as exc:
+            raise LaunchRejected(503, str(exc), reason_code="provider") from exc
+        except ProviderError as exc:
+            raise LaunchRejected(502, str(exc), reason_code="provider") from exc
+
+        if disk is None:
+            known = ", ".join(sorted(v["name"] for v in self.db.list_volumes()))
+            raise LaunchRejected(
+                400,
+                f"No data volume named '{name}' in this Google Cloud "
+                f"project. Volumes Manifold has created: {known or '(none)'}"
+                f" - or launch without one (scratch only).")
+        if disk["zone"] != zone:
+            raise LaunchRejected(
+                400,
+                f"Zone mismatch: volume '{name}' lives in {disk['zone']} but "
+                f"the launch requests {zone}. A Persistent Disk is ZONAL and "
+                f"can only attach to an instance in its own zone. Launch in "
+                f"{disk['zone']} instead, or launch without a volume "
+                f"(scratch only).")
+        users = disk.get("users") or []
+        if users:
+            raise LaunchRejected(
+                409, await self._volume_holder_detail(name, users[0],
+                                                      cloud_provider))
+
+    async def _volume_holder_detail(self, name: str, holder: str,
+                                    cloud_provider) -> str:
+        """Why an attached volume is refused, decorated with WHO holds it.
+
+        The launch row behind the holder (purpose, creator) is what turns
+        "in use" into a decision the reader can make. A STOPPED instance
+        gets its own sentence: GCE's TERMINATED means stopped, not deleted,
+        and a stopped instance keeps its disks attached - so the box the
+        user cannot see on the dashboard is exactly the one holding their
+        volume, and "terminate the holder" would read as nonsense without
+        saying so.
+        """
+        detail = (f"Volume '{name}' is attached to instance {holder}. A "
+                  f"Persistent Disk attaches to one instance at a time.")
+        launch = self.db.find_launch_by_instance(holder)
+        if launch:
+            purpose = (launch.get("purpose") or "").strip()
+            owner = (launch.get("created_by") or "").strip()
+            if purpose:
+                detail += f" That box is for: {purpose}."
+            if owner:
+                detail += f" It was launched by {owner}."
+        # THREE outcomes, not two. "We could not check" is not "it is
+        # running": the advice for a running holder (terminate it) is the
+        # wrong move for a stopped one, so an unread state gets its own
+        # sentence rather than borrowing the running one. None covers both
+        # ways of not knowing - the call failed, or Google does not show us
+        # that instance at all (it may not be one Manifold launched).
+        holder_state: str | None = None
+        try:
+            info = await cloud_provider.get_instance(holder)
+            if info is not None:
+                holder_state = ("stopped" if info.status == "terminated"
+                                else "running")
+        except Exception:   # noqa: BLE001 - a decoration, never a blocker.
+            # We already know the answer (refuse); failing to enrich it must
+            # not turn a clean 409 into a 500.
+            holder_state = None
+        if holder_state == "stopped":
+            detail += (" Google reports that instance as stopped rather than "
+                       "running - a stopped instance keeps its disks, so it "
+                       "will not release this one by itself. Delete it, or "
+                       "detach the disk in the Google Cloud console.")
+        elif holder_state == "running":
+            detail += (" Terminate that instance (Manifold saves its files "
+                       "first, and the volume survives), then launch again.")
+        else:
+            detail += (" Manifold could not read that instance's state, so "
+                       "it cannot say which move frees the volume: a RUNNING "
+                       "holder releases it when terminated (Manifold saves "
+                       "its files first, and the volume survives), while a "
+                       "STOPPED one keeps its disks and has to be deleted, "
+                       "or the disk detached, in the Google Cloud console.")
+        return detail
+
+    def _configured_gcp_volumes(self, doing: str):
+        """The GCP provider, or a refusal that names what is missing.
+
+        THE ONE PLACE the volume CRUD asks "is Google set up here at all".
+        A provider with no project id answers every read with an empty list
+        and every lookup with None - so without this, GET /volumes returns
+        `{"volumes": []}` and DELETE returns "no such volume in this Google
+        Cloud project" about a project nobody ever contacted. Both are the
+        forbidden move: an empty answer standing in for an unasked question,
+        on a resource that bills whether anyone could list it or not.
+        """
+        provider = self._gcp_volumes()
+        if provider is None:
+            raise LaunchRejected(
+                400, f"Google Cloud is not set up here, so Manifold cannot "
+                     f"{doing}.", reason_code="provider")
+        # By capability, like _gcp_volumes itself: a stub registered under
+        # 'gcp' says "not me" instead of raising an AttributeError.
+        unconfigured = getattr(provider, "unconfigured_reason",
+                               lambda: None)()
+        if unconfigured:
+            raise LaunchRejected(400, unconfigured, reason_code="provider")
+        return provider
+
+    async def create_volume(self, name: str, zone: str, size_gb: int, *,
+                            caller: str = "dashboard") -> dict:
+        """Create a GCP data volume through the guarded gateway.
+
+        The name is validated against GCE's own charset BEFORE it touches
+        anything, because from here on it is interpolated into shell
+        commands (the rescue's rsync destination, the dispatcher's log
+        paths) and into a /dev/disk/by-id link. Lambda's filesystem names
+        arrived from Lambda's registry already; these arrive from this
+        route, so this route is where the charset is proven.
+
+        The disk is created at Google FIRST and the row written second: a
+        row for a disk that does not exist would let a launch be admitted
+        against nothing, while a disk with no row simply refuses to be
+        formatted (which is the safe direction, and is what
+        volumes.plan_prepare says).
+        """
+        name = (name or "").strip()
+        problem = vol.validate_name(name) or vol.validate_size_gb(size_gb)
+        if problem:
+            raise LaunchRejected(422, problem)
+        if not zone or zone.count("-") < 2:
+            raise LaunchRejected(
+                422,
+                f"'{zone}' is not a GCE zone. A volume is ZONAL and must be "
+                f"created in the zone you will launch in, e.g. "
+                f"us-central1-a.")
+        provider = self._configured_gcp_volumes("create a data volume")
+        if self.db.get_volume(name) is not None:
+            raise LaunchRejected(
+                409,
+                f"Manifold already has a volume named '{name}'. Pick another "
+                f"name, or delete that one first.")
+        try:
+            disk = await provider.create_volume(
+                name=name, zone=zone, size_gb=size_gb)
+        except ProviderUnavailable as exc:
+            raise LaunchRejected(503, str(exc), reason_code="provider") from exc
+        except ProviderError as exc:
+            raise LaunchRejected(502, str(exc), reason_code="provider") from exc
+        row = self.db.create_volume(name=name, zone=disk["zone"],
+                                    size_gb=int(disk["size_gb"]))
+        self.db.record_audit(
+            caller, "volume_created",
+            f"{name}: {disk['size_gb']} GiB in {disk['zone']}")
+        return self._volume_payload(disk, row)
+
+    async def list_volumes(self) -> dict:
+        """Every Manifold data volume, SOURCED FROM GOOGLE.
+
+        Not from SQLite, and the reason is money: a disk bills for its
+        provisioned size whether it is attached to anything or not, so a
+        list built from the local database would let a disk bill invisibly
+        forever the first time that database was lost or replaced. SQLite is
+        the overlay - created_at, formatted_at, the fstype - and a disk with
+        no row still appears, marked as one Manifold has no record of.
+
+        An unconfigured project REFUSES rather than answering `[]`. The
+        provider would hand back an empty list without contacting Google,
+        and "you have no volumes" about a project nobody asked is the exact
+        reading that lets a disk bill invisibly - which is the same money
+        argument that put this list on GCE rather than on SQLite.
+        """
+        provider = self._configured_gcp_volumes("list data volumes")
+        try:
+            disks = await provider.list_volumes()
+        except ProviderUnavailable as exc:
+            raise LaunchRejected(503, str(exc), reason_code="provider") from exc
+        except ProviderError as exc:
+            raise LaunchRejected(502, str(exc), reason_code="provider") from exc
+        rows = {r["name"]: r for r in self.db.list_volumes()}
+        return {
+            "volumes": [self._volume_payload(d, rows.get(d["name"]))
+                        for d in disks],
+            "price_basis": vol.PRICE_BASIS,
+        }
+
+    @staticmethod
+    def _volume_payload(disk: dict, row: dict | None) -> dict:
+        """One volume as a client sees it: Google's facts plus our overlay.
+
+        No bytes_used and no "is it empty": a Persistent Disk cannot report
+        either from outside the instance, and a 0 there would assert
+        "empty" about a disk that may be full. The absent field is the
+        honest answer. What IS knowable is the provisioned size, which is
+        also what bills, so the estimate is exact given the labelled rate.
+        """
+        size_gb = int(disk["size_gb"])
+        payload = {
+            "name": disk["name"],
+            "zone": disk["zone"],
+            "size_gb": size_gb,
+            "status": disk.get("status"),
+            "attached_to": list(disk.get("users") or []),
+            "mount_point": vol.mount_path(disk["name"]),
+            "list_price_usd_per_month": round(
+                size_gb * vol.PRICE_USD_PER_GB_MONTH, 2),
+            # Absent, never false: "Manifold has no row for this disk" and
+            # "this disk was never formatted" are different facts, and the
+            # first one is what makes a volume unusable rather than fresh.
+            "known_to_manifold": row is not None,
+        }
+        if row is not None:
+            payload["created_at"] = row["created_at"]
+            payload["formatted_at"] = row["formatted_at"]
+            payload["fstype"] = row["fstype"]
+        return payload
+
+    async def delete_volume(self, name: str, *, confirm_name: str = "",
+                            caller: str = "dashboard") -> dict:
+        """Permanently delete a data volume, with the data-safety dance.
+
+        The same philosophy as delete_filesystem, for the same reason:
+        deleting destroys every byte and there is no rescue path for a whole
+        volume, so the only honest options are "type the name" or "keep it".
+        No force flag.
+
+        Whether it is in use is asked of GOOGLE, not of a launch row - a row
+        can say attached about an instance that no longer exists, and a
+        disk GCE reports free is free.
+        """
+        provider = self._configured_gcp_volumes("delete a data volume")
+        try:
+            disk = await provider.find_volume(name)
+        except ProviderUnavailable as exc:
+            raise LaunchRejected(503, str(exc), reason_code="provider") from exc
+        except ProviderError as exc:
+            raise LaunchRejected(502, str(exc), reason_code="provider") from exc
+        if disk is None:
+            # The list is SQLite's, so the sentence says so. It said "Have:"
+            # under a sentence about the Google project, and then listed the
+            # very name it had just called absent - Manifold's row for a disk
+            # deleted in the console. Same wording the launch path uses.
+            known = ", ".join(sorted(v["name"] for v in self.db.list_volumes()))
+            raise LaunchRejected(
+                404,
+                f"No data volume named '{name}' in this Google Cloud "
+                f"project. Volumes Manifold has created: {known or '(none)'}"
+                f" - that is Manifold's own record, and a disk it lists may "
+                f"already be gone from Google.")
+        users = disk.get("users") or []
+        if users:
+            raise LaunchRejected(
+                409,
+                f"Volume '{name}' is attached to instance {users[0]}. Google "
+                f"will not delete an attached disk; terminate that instance "
+                f"first (Manifold saves its files before it does).")
+        if confirm_name != name:
+            raise LaunchRejected(
+                428,
+                f"Deleting '{name}' permanently destroys the whole "
+                f"{disk['size_gb']} GiB disk in {disk['zone']}. There is no "
+                f"undo and no rescue - Manifold cannot read a detached disk, "
+                f"so it cannot tell you what is on it. To proceed, repeat "
+                f"the exact volume name in confirm_name.")
+        try:
+            await provider.delete_volume(name, zone=disk["zone"])
+        except ProviderUnavailable as exc:
+            raise LaunchRejected(503, str(exc), reason_code="provider") from exc
+        except ProviderError as exc:
+            # The disk is still there and still billing; an unhandled 500
+            # would have said nothing about which.
+            raise LaunchRejected(502, str(exc), reason_code="provider") from exc
+        self.db.delete_volume(name)
+        self.db.record_audit(
+            caller, "volume_deleted",
+            f"{name}: {disk['size_gb']} GiB in {disk['zone']} destroyed")
+        return {"deleted": name, "zone": disk["zone"],
+                "size_gb": int(disk["size_gb"])}
 
     async def launch_cluster(
         self,
@@ -1630,7 +2045,25 @@ class Orchestrator:
 
     async def sync_ephemeral(self, instance_id: str) -> dict:
         """rsync ephemeral scratch to the persistent filesystem, over the
-        managed connection. Destination: <mount>/ephemeral-backup/."""
+        managed connection. Destination: <mount>/ephemeral-backup/.
+
+        THE MOUNT ASSERTION IS LOAD-BEARING, and it is why this function can
+        be trusted at all. `rescue` sets unsaved=[] the moment synced_to is
+        set, and the termination safety hook reads unsaved to decide whether
+        destroying the box is safe. So if /lambda/nfs/<name> is NOT a mount,
+        a bare `mkdir -p && rsync` silently creates an ordinary directory on
+        the auto-delete boot disk, the rescue reports everything saved, the
+        hook waves the terminate through, and the data burns while the audit
+        log says it was rescued.
+
+        Before Phase 112 that could not happen on GCP only because this
+        function raised honestly ("no filesystem recorded"). Populating the
+        column for GCP volumes removes that accident, so the protection is
+        now explicit - and unconditional, Lambda included, where it turns
+        "the NFS quietly fell off" from a silent fake-rescue into a loud
+        failure. A refusal here leaves unsaved populated, which is exactly
+        what makes termination stop and ask.
+        """
         conn = self.connections.get(instance_id)
         if conn is None:
             raise LaunchRejected(409, f"no managed connection to {instance_id}")
@@ -1644,9 +2077,19 @@ class Orchestrator:
         # rsync of scratch can legitimately move a lot of data; bound it
         # generously (10 min) rather than at the default command timeout.
         exit_status, stdout, stderr = await conn.run(
-            f"mkdir -p {dest} && rsync -a --info=stats1 /workspace/ephemeral/ {dest}",
+            f"{vol.mount_guard(filesystem)} && mkdir -p {dest} && "
+            f"rsync -a --info=stats1 /workspace/ephemeral/ {dest}",
             timeout=600,
         )
+        if exit_status == vol.NOT_A_MOUNT_EXIT:
+            raise LaunchRejected(
+                409,
+                f"{vol.mount_path(filesystem)} is not a mounted filesystem "
+                f"on {instance_id}, so nothing was copied. Writing there "
+                f"would have put the files on the instance's boot disk, "
+                f"which is deleted with the instance - and reported them as "
+                f"saved. Nothing was moved and nothing was lost; the files "
+                f"are still on the instance.")
         if exit_status != 0:
             raise LaunchRejected(
                 502, f"sync failed (rsync exit {exit_status}): {stderr[:300]}"
@@ -1867,6 +2310,36 @@ class Orchestrator:
                     "backend", "external_termination_detected",
                     f"launch {launch['id']}: instance {instance_id} is no "
                     f"longer running; connection reaped and history closed",
+                )
+            elif status == "booting" and instance is None:
+                # It vanished mid-boot: terminated from the provider's
+                # console, or it never came up at all. NOBODY else closes
+                # this row - the boot wait and the provisioning gate both
+                # work through a connection that this sweep has just reaped,
+                # so the card counted up forever ("installing drivers and
+                # runtime") on a box that no longer exists, and the idle
+                # sweep skips 'booting' so nothing else ever said a word.
+                #
+                # 'failed', because the launch never became usable; and the
+                # same observed-stop stamps _wait_until_active writes when it
+                # catches this a few seconds earlier, because the evidence is
+                # identical - the row's own provider answered, and this id
+                # was not in the answer.
+                self.db.update_launch(
+                    launch["id"], status="failed",
+                    error=f"instance {instance_id} disappeared from the "
+                          f"provider while the launch was still "
+                          f"provisioning; it was not terminated by Manifold.",
+                    terminated_at=utcnow(), resolved_at=utcnow(),
+                )
+                self._worklog_instance(
+                    launch, instance_id,
+                    "disappeared from the provider while still provisioning")
+                self.db.record_audit(
+                    "backend", "external_termination_detected",
+                    f"launch {launch['id']}: instance {instance_id} vanished "
+                    f"while still booting; the launch was closed as failed "
+                    f"rather than left counting up forever",
                 )
             elif (status == "failed" and instance is not None
                     and instance.status == "active"):
@@ -2117,8 +2590,537 @@ class Orchestrator:
     async def _establish_connection(
         self, plan: LaunchPlan, instance: InstanceInfo
     ) -> None:
+        """Open the managed connection, then hand the launch to the gate.
+
+        This used to stamp active right here, one line after conn.start() -
+        which is asynchronous and returns while the supervisor is still
+        CONNECTING. So a launch reported "SSH is up; the instance is ready"
+        before any SSH session existed, and on GCE it said that roughly six
+        minutes before the box could run anything. Worse, active_at is the
+        anchor of the max_active budget, whose contract explicitly excludes
+        boot: ~500s of a 1800s budget was being spent booting.
+
+        Nothing is stamped here now. The row stays 'booting' and the gate
+        (sweep_provisioning) promotes it, from the row's own state, so a
+        backend restart in the middle costs nothing.
+        """
         self._open_connection(plan.connection_mode, instance)
-        self.db.update_launch(plan.launch_id, status="active", active_at=utcnow())
+        await self._await_provisioning(plan.launch_id, instance.id)
+
+    async def _await_provisioning(self, launch_id: str,
+                                  instance_id: str) -> None:
+        """Drive the gate for one launch until it settles.
+
+        The gate is a reconciler and the dispatcher calls the same function
+        on its telemetry tick; this loop is only the fast path, so a launch
+        does not sit in 'booting' for up to one telemetry interval after its
+        box is ready. Everything it decides, it decides in sweep_provisioning
+        and writes to the row - lose this task to a crash or a restart and
+        the sweep picks the launch up exactly where it was.
+
+        The one thing it owns alone: a box whose SSH NEVER answers has no
+        connected_at, so the gate's budget never starts. Bounding that wait
+        here (same budget, wall clock from when we opened the connection)
+        keeps such a launch from hanging in 'booting' forever while it bills.
+
+        And the loop itself is bounded by that same budget, unconditionally.
+        Every other outcome is the gate's to decide and the gate writes it to
+        the row, so once the budget is gone there is nothing left for this
+        loop to add - it stops spinning and the telemetry tick, which is the
+        reconciler, carries the row from there.
+        """
+        policy = self.settings.launch
+        loop = asyncio.get_event_loop()
+        started = loop.time()
+        while True:
+            launch = self.db.get_launch(launch_id)
+            if launch is None or launch["status"] != "booting":
+                return          # promoted, failed, or terminated by someone
+            conn = self.connections.get(instance_id)
+            if conn is None:
+                return          # terminated: its connection was popped
+            await self.sweep_provisioning(instance_id, conn)
+            if loop.time() - started >= policy.provisioning_timeout_seconds:
+                if not (self.db.get_launch(launch_id) or {}).get("connected_at"):
+                    self._fail_provisioning(
+                        launch_id,
+                        f"instance {instance_id} never accepted an SSH "
+                        f"connection within "
+                        f"{policy.provisioning_timeout_seconds:.0f}s of "
+                        f"becoming reachable",
+                    )
+                return
+            await asyncio.sleep(policy.boot_poll_seconds)
+
+    def _provisioning_overdue(self, connected_at: str) -> bool:
+        """Has this launch spent its whole provisioning budget?
+
+        Measured from connected_at, which lives in the ROW: every branch of
+        the gate that can decide to keep waiting asks this one question, and
+        a backend restart resumes the same deadline instead of granting a
+        fresh one.
+        """
+        waited = _interval_seconds(connected_at, utcnow()) or 0.0
+        return waited >= self.settings.launch.provisioning_timeout_seconds
+
+    async def sweep_provisioning(self, instance_id: str, conn) -> None:
+        """One asker at a time per instance; the work is in _sweep_provisioning.
+
+        Skipping rather than queueing is right for a reconciler: the other
+        caller is asking the same questions of the same box right now, and
+        whatever it decides is written to the row. A skipped tick loses
+        nothing - the next one asks again.
+        """
+        if instance_id in self._provisioning_sweeps:
+            return
+        self._provisioning_sweeps.add(instance_id)
+        try:
+            await self._sweep_provisioning(instance_id, conn)
+        finally:
+            self._provisioning_sweeps.discard(instance_id)
+
+    async def _sweep_provisioning(self, instance_id: str, conn) -> None:
+        """Promote one still-booting launch once its box is PROVISIONED.
+
+        A RECONCILER, in the shape _sweep_bootstrap already uses: it asks
+        questions of the row and the box on every tick and acts when they
+        all hold, rather than firing at a transition. Three code paths open
+        a connection (the launch pipeline, resume-after-downtime, adoption)
+        and at every one of them the supervisor is still CONNECTING, so
+        there is no moment at which "it is ready" could be decided.
+
+        The launch stays in 'booting' throughout - no new status. The row IS
+        the state, so a backend restart resumes the gate for free, the boot
+        countdown and the dashboard's booting card keep working, and no
+        client learns a new word.
+
+        In order:
+          0. no session right now -> nothing can be asked, so the only
+             question left is the budget: a launch that answered SSH once
+             and then dropped ages out here, because nothing else can. The
+             deadline lives in the row, not in this process.
+          1. stamp connected_at the first time SSH is up (the anchor for the
+             provisioning budget, and the only new fact this writes early);
+          2. ask for the init signal;
+          3. present -> check this session can reach docker, redial if it
+             cannot, then promote to active;
+          4. absent but cloud-init says it finished -> promote with the
+             failure recorded: waiting forever on a billing box is worse
+             than an active box carrying a warning;
+          5. absent and the budget is spent -> fail the row, and never
+             terminate. A box whose sidecar never came up is a box a rescue
+             cannot save anything from, so destroying it here would destroy
+             data to tidy up a status field.
+
+        A launch carrying a GCP data volume (Phase 112) has one extra step
+        between 3 and the promotion, and it INVERTS the trade in 4: the
+        volume must be formatted-if-new and mounted, verified by
+        `mountpoint -q`, before the row goes active - whatever the init
+        signal says. "Promote with a warning" is right for a plain box,
+        where the warning is the whole cost. An active row over an unmounted
+        volume is fake persistence: jobs would write their outputs to the
+        auto-delete boot disk believing them safe.
+        """
+        launch = self.db.find_launch_by_instance(instance_id)
+        if launch is None or launch.get("status") != "booting":
+            return              # adopted boxes have no row and stop here
+        launch_id = launch["id"]
+        connected_at = launch.get("connected_at")
+        budget = self.settings.launch.provisioning_timeout_seconds
+        if conn.state != ConnectionState.CONNECTED:
+            # Normally not an error: the next tick asks again. But a
+            # connection that answered ONCE and then dropped has a
+            # connected_at, so `_await_provisioning`'s own bound (which fires
+            # only while connected_at is NULL) no longer applies, and the
+            # supervisor retries forever - the row sat in 'booting' with no
+            # timeout ever written while the box billed. The budget is
+            # anchored in the ROW, so it ages out here whichever tick gets
+            # here first, and it survives a backend restart.
+            if connected_at and self._provisioning_overdue(connected_at):
+                self._fail_provisioning(
+                    launch_id,
+                    f"instance {instance_id} answered SSH and then stopped "
+                    f"answering: its connection has been {conn.state.value} "
+                    f"and the launch did not finish provisioning within "
+                    f"{budget:.0f}s of the first connection")
+            return
+        if not connected_at:
+            connected_at = utcnow()
+            self.db.update_launch(launch_id, connected_at=connected_at)
+        signal = await self.provisioning_signal(conn)
+        if signal in ("pending", "unknown"):
+            if self._provisioning_overdue(connected_at):
+                # "pending" and "unknown" both wait, and they are different
+                # facts: one is the box saying "not yet", the other is
+                # Manifold failing to ask it. The row that closes the launch
+                # says which, because the next step differs (read the init
+                # log / look at why the session died).
+                detail = (
+                    f"answered SSH but did not finish provisioning within "
+                    f"{budget:.0f}s (the driver, Docker and the sidecar are "
+                    f"installed by cloud-init after first boot; see "
+                    f"/var/log/manifold-init.log on the box)"
+                    if signal == "pending" else
+                    f"answered SSH, but Manifold could not ask it whether "
+                    f"provisioning had finished within {budget:.0f}s - the "
+                    f"session kept going away mid-question, so what state "
+                    f"the box reached is unknown")
+                self._fail_provisioning(
+                    launch_id, f"instance {instance_id} {detail}")
+            return
+        # The volume, BEFORE the docker check on purpose: a redial there
+        # drops this session, and mkfs/mount issued into a session that is
+        # being torn down would raise out of the gate. A mount is a kernel
+        # fact, so it survives the redial that may follow.
+        volume = self._volume_name_of(launch)
+        if volume is not None:
+            mounted, detail, terminal = await self._prepare_volume(
+                instance_id, volume, conn, allow_format=True)
+            if not mounted:
+                if terminal or self._provisioning_overdue(connected_at):
+                    # Same shape as every other provisioning failure: the row
+                    # closes, the box is left alone. `terminal` short-circuits
+                    # the budget for a state that provably cannot change by
+                    # waiting (a foreign filesystem, an interrupted mkfs) -
+                    # billing out twenty minutes to re-learn it would just be
+                    # money. The detail names the volume's exact state,
+                    # including whether mkfs was ever issued.
+                    self._fail_provisioning(
+                        launch_id,
+                        f"instance {instance_id} could not be given its data "
+                        f"volume '{volume}': {detail}")
+                return
+        # Only on failure: a redial destroys every channel on the session,
+        # and an unconditional cycle would kill a terminal somebody opened.
+        if await self._docker_access_ok(conn) is False:
+            conn.redial()
+            self.db.record_audit(
+                "backend", "connection_redialled",
+                f"{instance_id}: this SSH session could not use the docker "
+                f"socket (it was opened before cloud-init added the group), "
+                f"so it was dropped for a fresh one")
+        # Re-read before writing: a terminate that landed while we were
+        # asking must not be overwritten back to active.
+        current = self.db.get_launch(launch_id)
+        if current is None or current["status"] != "booting":
+            return
+        fields: dict = {"status": "active", "active_at": utcnow()}
+        if signal == "incomplete":
+            fields["error"] = (
+                "cloud-init finished but Manifold's setup did not complete: "
+                "the driver, Docker, the NVIDIA runtime or the sidecar may "
+                "be missing. Jobs may fail; /var/log/manifold-init.log on "
+                "the instance says which step it was.")
+            self.db.record_audit(
+                "backend", "provisioning_incomplete",
+                f"launch {launch_id}: instance {instance_id} promoted to "
+                f"active with cloud-init finished and Manifold's init marker "
+                f"absent - the box is up, its setup is not proven")
+        self.db.update_launch(launch_id, **fields)
+
+    def _fail_provisioning(self, launch_id: str, detail: str) -> None:
+        """Close a launch that never became usable, WITHOUT touching the box.
+
+        Same honest copy as the boot timeout: the instance is probably still
+        running and still billing, and only a human can decide whether that
+        is worth keeping. If it is alive, the reconcile sweep's orphan repair
+        will flip this row back to active so its cost keeps being counted -
+        which is exactly why the bootstrap sweep checks the init signal
+        itself rather than trusting a row that says active.
+        """
+        launch = self.db.get_launch(launch_id)
+        if launch is None or launch["status"] != "booting":
+            return
+        self.db.update_launch(
+            launch_id, status="failed",
+            error=f"{detail}; it may still be running and billing; check the "
+                  f"dashboard and terminate it if unwanted.",
+        )
+        self.db.record_audit(
+            "backend", "provisioning_timeout",
+            f"launch {launch_id}: {detail}; the instance was NOT terminated")
+
+    async def provisioning_signal(self, conn) -> str:
+        """What the box says about its own setup, in one word.
+
+        "ready"      Manifold's init marker is there: cloud-init ran our
+                     script to the last line, so everything it installs is
+                     installed.
+        "incomplete" cloud-init has finished but the marker is absent: the
+                     script stopped somewhere. The box is as done as it will
+                     ever be, and waiting longer only costs money.
+        "pending"    neither: still working. Ask again next tick.
+        "unknown"    the connection went away mid-question. Kept separate
+                     from "pending" even though both callers wait: "we could
+                     not ask" and "we asked and the box said no" are
+                     different answers, and a caller that wanted to treat
+                     them differently should not have to guess which it got.
+        """
+        try:
+            code, _out, _err = await conn.run(INIT_MARKER_PROBE, timeout=30.0)
+            if code == 0:
+                return "ready"
+            code, _out, _err = await conn.run(
+                CLOUD_INIT_DONE_PROBE, timeout=30.0)
+            return "incomplete" if code == 0 else "pending"
+        except (ConnectionError, OSError):
+            return "unknown"
+
+    async def _docker_access_ok(self, conn) -> bool | None:
+        """Can this SSH SESSION use the docker socket? None = could not ask.
+
+        None is not False: a redial is a real cost (it drops every channel on
+        the connection), and "we could not tell" is never grounds for paying
+        it.
+        """
+        try:
+            code, _out, _err = await conn.run(DOCKER_ACCESS_PROBE, timeout=30.0)
+        except (ConnectionError, OSError):
+            return None
+        return code == 0
+
+    # -- the volume transport (Phase 112) -----------------------------------
+
+    @staticmethod
+    def _volume_name_of(launch: dict) -> str | None:
+        """The GCP data volume this launch carries, or None.
+
+        A Lambda filesystem is already mounted by the provider before we
+        ever see the box, so only GCP rows have anything to do here.
+        """
+        if (launch.get("provider") or "lambda") != "gcp":
+            return None
+        return (launch.get("filesystem") or "") or None
+
+    async def assert_mounted_path(self, instance_id: str, remote_path: str, *,
+                                  refusal: str) -> None:
+        """Refuse to touch `remote_path` unless its volume is really mounted.
+
+        The same guard the job wrapper and the rescue's rsync carry, for the
+        two places a path under /lambda/nfs/<name> is used one command at a
+        time instead of inside a wrapped shell line: the file upload (a
+        write - SFTP CREATES the parent directory, so an unmounted path
+        silently becomes a boot-disk directory and the audit row then asserts
+        a durable location) and the persistent-file browse (a read, where an
+        empty listing of the wrong directory says "this volume holds
+        nothing" about a disk nobody looked at).
+
+        Fail closed, and not only on exit 78: "we could not prove this is a
+        mount" is not permission to write, which is the same rule the guard
+        itself follows when `mountpoint` is missing entirely.
+
+        `refusal` is the caller's own sentence about what did NOT happen -
+        the consequences differ enough (nothing uploaded / nothing listed)
+        that one generic line would be vaguer than either.
+
+        A path with no volume under it (/workspace/ephemeral, or
+        /lambda/nfs itself) has no mount to assert and returns quietly.
+
+        On the upload path this ALSO protects the volume itself: a write
+        that creates /lambda/nfs/<name> on the boot disk makes the mount
+        refuse for good afterwards (mount_command will not mount over a
+        non-empty unmounted directory), which fails every later launch
+        carrying that volume.
+        """
+        name = vol.name_for_path(remote_path)
+        if name is None:
+            return
+        path = vol.mount_path(name)
+        conn = self.connections.get(instance_id)
+        if conn is None:
+            raise LaunchRejected(
+                409, f"No managed connection to {instance_id}, so Manifold "
+                     f"cannot check whether {path} is mounted. {refusal}")
+        try:
+            code, _out, _err = await conn.run(vol.mount_guard(name),
+                                              timeout=60.0)
+        except (ConnectionError, OSError) as exc:
+            raise LaunchRejected(
+                409,
+                f"Manifold could not ask {instance_id} whether {path} is a "
+                f"mounted filesystem ({exc}), so it refused rather than "
+                f"assume. {refusal}") from exc
+        if code == 0:
+            return
+        if code == vol.NOT_A_MOUNT_EXIT:
+            raise LaunchRejected(
+                409,
+                f"{path} is not a mounted filesystem on {instance_id}. "
+                f"{refusal} An unmounted path there is the instance's boot "
+                f"disk, which is deleted with the instance.")
+        raise LaunchRejected(
+            409,
+            f"Manifold could not prove {path} is a mounted filesystem on "
+            f"{instance_id} (the check exited {code}), so it refused rather "
+            f"than assume. {refusal}")
+
+    async def _prepare_volume(self, instance_id: str, name: str, conn, *,
+                              allow_format: bool) -> tuple[bool, str, bool]:
+        """Format (at most once, ever) and mount one volume. The transport.
+
+        `allow_format` has no default, so every caller says out loud whether
+        it is one that may run mkfs. Only the provisioning gate is: the
+        mount-heal sweep passes False, because mkfs on a heal path is the
+        move that turns a recoverable mistake into an unrecoverable one.
+
+        Returns (mounted, detail, terminal). Every DECISION is
+        volumes.plan_prepare's - this function only asks the box the
+        questions that function needs, and carries out what it says. The
+        two invariants live at the seam between them:
+
+          * mkfs runs only when the table says format, and the table says
+            format only when the blkid answer read moments ago in the same
+            session was blank AND the row's formatted_at was NULL;
+          * the row is written BEFORE mkfs is issued, atomically (the UPDATE
+            is conditional on formatted_at still being NULL), so a crash
+            between the two leaves a row that says formatted over a disk
+            that is blank - which the table then refuses loudly rather than
+            formatting a second time.
+        """
+        path = vol.mount_path(name)
+        try:
+            code, _out, _err = await conn.run(vol.mounted_probe(name),
+                                              timeout=60.0)
+            if code == 0:
+                return True, f"{path} is mounted", False
+            code, out, _err = await conn.run(vol.probe_command(name),
+                                             timeout=120.0)
+        except (ConnectionError, OSError) as exc:
+            # Could not ask. Never an answer: the next tick asks again, and
+            # the provisioning budget bounds how long that can go on.
+            return False, f"the instance could not be asked about it ({exc})", \
+                False
+        row = self.db.get_volume(name)
+        plan = vol.plan_prepare(
+            name=name,
+            known=row is not None,
+            link_present=code != vol.PROBE_NO_DEVICE,
+            # Anything but a clean answer is "we could not look", which the
+            # table is careful never to read as "it is blank".
+            blkid_ok=code == 0,
+            blkid_output=out if code == 0 else "",
+            formatted_at=(row or {}).get("formatted_at"),
+            recorded_fstype=(row or {}).get("fstype"),
+        )
+        if plan.action == "refuse":
+            return False, plan.detail, plan.terminal
+
+        if plan.action == "format" and not allow_format:
+            return False, (
+                f"the volume holds no filesystem and this box is already "
+                f"active, so Manifold will not format it here - a first "
+                f"format belongs to the launch that provisions the box, not "
+                f"to a repair sweep. Relaunch with this volume, or delete "
+                f"and recreate it"), True
+        if plan.action == "format":
+            # The claim, before the command. False means another sweep took
+            # it between the read above and here - it must not be formatted
+            # twice, and the next tick will read the disk and decide.
+            if not self.db.mark_volume_formatted(name, plan.fstype):
+                return False, (
+                    f"another sweep claimed the one format volume '{name}' "
+                    f"is allowed; nothing was written"), True
+            self.db.record_audit(
+                "backend", "volume_format",
+                f"{name} on {instance_id}: {plan.detail}; formatted_at was "
+                f"recorded BEFORE mkfs.{plan.fstype} was issued, so an "
+                f"interrupted format can never be retried blindly")
+            try:
+                code, _out, err = await conn.run(
+                    vol.format_command(name, plan.fstype), timeout=900.0)
+            except (ConnectionError, OSError) as exc:
+                return False, (
+                    f"mkfs.{plan.fstype} was issued and the connection went "
+                    f"away before it answered ({exc}); the volume is recorded "
+                    f"as formatted, so Manifold will read the disk before "
+                    f"doing anything else with it"), False
+            if code != 0:
+                return False, (
+                    f"mkfs.{plan.fstype} failed (exit {code}): "
+                    f"{err[:200]}. The volume is recorded as formatted and "
+                    f"will not be formatted again; that record is written "
+                    f"before the format, so Manifold never mounted this "
+                    f"volume and nothing it ran can have written to it - if "
+                    f"Manifold's records are the whole story, delete it and "
+                    f"create another"), True
+
+        try:
+            code, _out, err = await conn.run(
+                vol.mount_command(name, plan.fstype), timeout=180.0)
+        except (ConnectionError, OSError) as exc:
+            return False, f"the mount could not be run ({exc})", False
+        if code == vol.PROBE_DIR_NOT_EMPTY:
+            return False, (
+                f"{path} already exists with files in it and nothing mounted "
+                f"there. Mounting over it would hide whatever wrote them, "
+                f"and those files are evidence - look at them on the "
+                f"instance before mounting anything at that path"), True
+        if code != 0:
+            return False, (
+                f"mounting {vol.device_link(name)} at {path} failed "
+                f"(exit {code}): {err[:200]}"), False
+        self.db.record_audit(
+            "backend", "volume_mounted",
+            f"{name} mounted at {path} on {instance_id} "
+            f"({plan.fstype}, {plan.action})")
+        return True, f"{path} is mounted", False
+
+    async def sweep_volume_mount(self, instance_id: str, conn) -> None:
+        """Re-mount an ACTIVE GCP box's volume if it is not mounted.
+
+        A RECONCILER, in the shape _sweep_bootstrap uses, and it exists for
+        one specific reason: _reconcile_launches' orphan repair flips a
+        FAILED row to active whenever the instance is alive (right, for cost
+        accounting), minting an active row that passed no gate - and the
+        gate will not re-enter, because it exits on status != "booting". A
+        reboot is the other way in: a mount is not in fstab, so it does not
+        survive one.
+
+        THE MOUNT HALF ONLY. It never formats, even when the table says a
+        format is what is missing. mkfs on a heal path is exactly the move
+        that turns a recoverable mistake into an unrecoverable one, and the
+        box is not blocked from view meanwhile: the mount guard makes every
+        job and every rescue on that box refuse loudly instead of writing to
+        the boot disk.
+        """
+        if instance_id in self._provisioning_sweeps:
+            return                  # the gate, or another heal, is asking
+        launch = self.db.find_launch_by_instance(instance_id)
+        if launch is None or launch.get("status") != "active":
+            return
+        volume = self._volume_name_of(launch)
+        if volume is None:
+            return
+        if conn.state != ConnectionState.CONNECTED:
+            return
+        self._provisioning_sweeps.add(instance_id)
+        try:
+            try:
+                code, _out, _err = await conn.run(vol.mounted_probe(volume),
+                                                  timeout=60.0)
+            except (ConnectionError, OSError):
+                return              # could not ask; the next tick asks again
+            if code == 0:
+                return              # the normal case, every tick
+            mounted, detail, _terminal = await self._prepare_volume(
+                instance_id, volume, conn, allow_format=False)
+            if mounted:
+                self.db.record_audit(
+                    "backend", "volume_remounted",
+                    f"{volume} was not mounted on active instance "
+                    f"{instance_id} and has been re-mounted")
+                return
+            # Not healed. Loud in the audit log and nowhere else: the row
+            # stays active because the box IS alive and billing, and jobs
+            # against it now refuse at the mount guard rather than writing
+            # to a disk that dies with the instance.
+            self.db.record_audit(
+                "backend", "volume_unmounted",
+                f"{volume} is NOT mounted on active instance {instance_id} "
+                f"and Manifold could not mount it: {detail}. Jobs and "
+                f"syncs that would write there will refuse until it is.")
+        finally:
+            self._provisioning_sweeps.discard(instance_id)
 
     def _open_connection(self, connection_mode: str, instance: InstanceInfo) -> None:
         """Build and start a ManagedConnection for a live instance. Shared by
@@ -2217,11 +3219,11 @@ class Orchestrator:
         boot-waiter died with the old process. Without this, the instance boots
         to 'active' and nothing dials SSH or closes out the launch: it hangs in
         'booting' forever while it bills. We re-attach - instances that adopt
-        already reconnected are marked ready; ones still booting get a fresh
-        wait-then-connect task (a fresh timeout window, so a restart never
-        shortens a genuine boot). Best-effort; never blocks startup. Call it
-        AFTER adopt_running_instances so already-active launches are settled,
-        not re-dialed.
+        already reconnected go straight to the provisioning gate; ones still
+        booting get a fresh wait-then-connect task (a fresh timeout window, so
+        a restart never shortens a genuine boot). Best-effort; never blocks
+        startup. Call it AFTER adopt_running_instances so already-active
+        launches are settled, not re-dialed.
         """
         resumed = 0
         for launch in self.db.list_launches():
@@ -2254,9 +3256,14 @@ class Orchestrator:
                 continue
             if instance_id in self.connections:
                 # adopt_running_instances already reconnected this one, so the
-                # boot finished during the downtime; just close the record.
-                self.db.update_launch(
-                    launch["id"], status="active", active_at=utcnow())
+                # boot finished during the downtime. It does NOT follow that
+                # the machine is provisioned: on GCE sshd answers minutes
+                # before cloud-init is done, so closing the record here used
+                # to be the one path that bypassed the gate entirely. Hand it
+                # to the gate instead - which, finding a box that IS ready,
+                # closes the record on its first pass anyway.
+                self._launch_tasks[launch["id"]] = asyncio.create_task(
+                    self._await_provisioning(launch["id"], instance_id))
                 resumed += 1
                 continue
             plan = self._plan_from_launch(launch)

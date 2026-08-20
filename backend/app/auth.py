@@ -186,6 +186,7 @@ ROUTE_ROLES: dict[tuple[str, str], str] = {
     ("GET", "/clusters"): "viewer",
     ("GET", "/clusters/{cluster_id}"): "viewer",
     ("GET", "/filesystems"): "viewer",
+    ("GET", "/volumes"): "viewer",
     ("GET", "/storage/files"): "viewer",
     ("GET", "/principals"): "viewer",
     ("GET", "/policy"): "viewer",
@@ -262,6 +263,11 @@ ROUTE_ROLES: dict[tuple[str, str], str] = {
     ("POST", "/clusters/{cluster_id}/terminate"): "operator",
     ("POST", "/filesystems"): "operator",
     ("DELETE", "/filesystems/{name}"): "operator",
+    # A volume bills from creation by PROVISIONED size and its deletion is
+    # unrecoverable, so it sits at the same rung as a filesystem: an
+    # operator may make and destroy storage, a viewer may only look at it.
+    ("POST", "/volumes"): "operator",
+    ("DELETE", "/volumes/{name}"): "operator",
     ("DELETE", "/storage/files/{key:path}"): "operator",
     ("POST", "/v1/chat/completions"): "operator",
     # -- govern ----------------------------------------------------------

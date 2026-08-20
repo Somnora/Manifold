@@ -324,6 +324,20 @@ async def launch_gpu(
     the instance type and region from list_launch_options for that same
     cloud - types and regions do not carry across providers.
 
+    `filesystem` means TWO different things depending on the cloud, and the
+    same field carries both because they behave identically once mounted -
+    /lambda/nfs/<name>, where jobs, sync_outputs and relative paths resolve.
+    On Lambda it is a Lambda filesystem from list_filesystems. On GCP it is
+    a DATA VOLUME from list_volumes, and three GCP-only rules apply: pass
+    the volume's own `zone` as `region` (a volume is zonal and cannot attach
+    from anywhere else), attach exactly one (a disk attaches to one instance
+    at a time, so extra_filesystems is refused), and expect the launch to
+    take slightly longer to report active - Manifold formats a new volume
+    and mounts it before promoting the launch, and FAILS the launch rather
+    than reporting active over an unmounted path. list_launch_options does
+    not know about volumes yet, so its GCP targets all say filesystem: null;
+    read list_volumes and pass the name yourself.
+
     `max_lifetime_seconds` is an optional hard ceiling on the instance's TOTAL
     lifetime, timed from the moment the provider accepts the launch, so it
     includes boot (15-40 minutes on a big box) — the backend rejects a value
@@ -426,10 +440,13 @@ async def get_launch_status(launch_id: str, note: str = "") -> dict:
     -> booting -> active | failed. Returns a stable `phase`
     (requesting_capacity | retrying_capacity | waiting_for_active | ready |
     failed | terminated), a human `phase_detail`, and `settled` (true once
-    nothing more will change). While booting it also returns
-    boot_elapsed_seconds / boot_timeout_seconds / boot_remaining_seconds.
-    For a slow boot, prefer wait_for_launch: one blocking call instead of a
-    poll loop."""
+    nothing more will change). While it waits for the instance to boot it
+    also returns boot_elapsed_seconds / boot_timeout_seconds /
+    boot_remaining_seconds; once SSH is up those stop (that deadline is
+    past) and phase_detail reports the setup step instead - a box is not
+    'active' until its drivers and runtime are installed, so a job started
+    before then would fail. For a slow boot, prefer wait_for_launch: one
+    blocking call instead of a poll loop."""
     return await _call(
         "get_launch_status", "GET", f"/launches/{launch_id}",
         note=note, args={"launch_id": launch_id},
@@ -937,6 +954,33 @@ async def list_filesystems(note: str = "") -> dict:
 
 
 @mcp.tool()
+async def list_volumes(note: str = "") -> dict:
+    """GCP data volumes: persistent disks that survive the instance they are
+    attached to, mounted at /lambda/nfs/<name> exactly like a Lambda
+    filesystem. READ ONLY here - creating and deleting a volume is a
+    dashboard action, because a volume bills from the moment it exists (by
+    PROVISIONED size, attached or not) and deleting one is unrecoverable.
+
+    Three things a volume is NOT, and they matter when you plan:
+      - it is ZONAL. `zone` on each row is the only zone an instance can
+        attach it from, so passing it to launch_gpu pins the region too.
+        GPU capacity varies by zone, so a volume can end up somewhere the
+        GPU you want is unavailable - that is a real trap, not a hint.
+      - it attaches to ONE instance at a time. `attached_to` names the
+        holder; a launch naming a held volume is refused, not queued.
+      - it has NO bytes_used, on purpose. Nothing outside the instance can
+        read a detached disk, and a 0 there would claim it is empty.
+        `size_gb` is what was provisioned, which is also what bills.
+
+    To use one, pass its name as launch_gpu's `filesystem` with
+    provider="gcp" and its own `zone` as the region. Manifold formats it on
+    first use and mounts it before the launch reports active; a launch whose
+    volume could not be mounted FAILS rather than coming up with an
+    unmounted path that looks persistent."""
+    return await _call("list_volumes", "GET", "/volumes", note=note)
+
+
+@mcp.tool()
 async def create_filesystem(name: str, region: str, note: str = "") -> dict:
     """Create a persistent filesystem in a region (e.g. before launching in
     a region that has capacity but no filebase yet). Creation is free;
@@ -950,9 +994,16 @@ async def create_filesystem(name: str, region: str, note: str = "") -> dict:
 
 
 async def _connected_instance_for_fs(filesystem: str | None) -> tuple | None:
-    """A connected instance that mounts `filesystem` (or any, if None), as
+    """A connected instance that CARRIES `filesystem` (or any, if None), as
     (instance_id, filesystem_name). None when nothing suitable is connected.
-    Lets file browsing ride the SSH connection with no S3 keys."""
+    Lets file browsing ride the SSH connection with no S3 keys.
+
+    Carries, not mounts: an instance's `filesystems` list is Lambda's
+    registry on Lambda and ATTACHED disks on GCP, and attached is not
+    mounted. This client cannot tell the difference and does not pretend to
+    - the backend asserts the mount on the browse itself and refuses with a
+    409 rather than listing an empty boot-disk directory as if the volume
+    were empty."""
     listing = await _call("list_persistent_files", "GET", "/instances", note="")
     for inst in listing.get("instances", []):
         if inst.get("connection_state") != "connected":
@@ -1056,8 +1107,15 @@ async def _pick_instance(instance_id: str | None, tool: str, note: str,
 async def upload_file(local_path: str, remote_path: str = "inbox/",
                       instance_id: str | None = None, note: str = "") -> dict:
     """Upload a file from THIS machine to an instance over the managed SSH
-    connection. remote_path ending in '/' keeps the filename; relative
-    paths land on the persistent filesystem (surviving termination).
+    connection. remote_path ending in '/' keeps the filename; a relative
+    path is resolved against the instance's persistent filesystem.
+
+    That path survives termination only while it is really mounted, so the
+    upload is REFUSED (409) when it is not - on GCP a data volume is
+    attached minutes before it is mounted, and writing into the unmounted
+    path would put the file on the boot disk, which is deleted with the
+    instance, while this tool reported it saved. Nothing is uploaded in that
+    case and nothing is lost; wait for the launch to go active and retry.
     If instance_id is omitted and exactly one instance is connected, it is
     used."""
     args = {"local_path": local_path, "remote_path": remote_path,

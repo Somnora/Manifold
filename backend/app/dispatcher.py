@@ -41,6 +41,7 @@ from .orchestrator import LaunchRejected, Orchestrator, TerminationBlocked
 from .subagent_engine import engine as subagent_engine
 from .task_queue import TaskQueue
 from .templates import JobTemplate, PERSISTENT_TOKEN
+from . import volumes
 
 logger = logging.getLogger("manifold.dispatcher")
 
@@ -264,15 +265,32 @@ def render_docker_command(
 
 
 def wrap_remote_command(docker_cmd: str, remote_log: str, *,
-                        ensure_dirs: list[str]) -> str:
-    """Wrap a docker command for remote dispatch: create the dirs it needs,
-    tee all output to a persistent log, and — critically — propagate the
-    CONTAINER's exit code through the pipe.
+                        ensure_dirs: list[str],
+                        require_mount: str | None) -> str:
+    """Wrap a docker command for remote dispatch: prove the persistent home
+    is really mounted, create the dirs it needs, tee all output to a
+    persistent log, and — critically — propagate the CONTAINER's exit code
+    through the pipe.
 
     Without `set -o pipefail` a pipeline's exit code is the LAST command's
     (tee, which always exits 0), so every job would report "succeeded" no
     matter what the container did. Found on real hardware at the Phase 15
     gate: two crashed vllm-serve jobs showed green.
+
+    `require_mount` is the filesystem/volume name whose mount this command
+    depends on, and it has NO DEFAULT on purpose: every caller has to
+    decide, out loud, whether it is about to write to persistent storage.
+    Pass None only for a command that touches none.
+
+    The guard matters because `mkdir -p /lambda/nfs/<name>/task-logs` on an
+    UNMOUNTED path silently makes an ordinary directory on the instance's
+    auto-delete boot disk. The job then runs, writes its outputs and its
+    log there, reports success - and all of it dies with the box. On GCP a
+    volume is mounted by Manifold after the instance is already CONNECTED,
+    so there is a real window in which that is the state; on Lambda the
+    same thing happens if the NFS mount ever falls off. Both refuse here
+    instead, with exit code volumes.NOT_A_MOUNT_EXIT and a message saying
+    which path was not a mount.
     """
     mkdirs = " ".join(shlex.quote(d) for d in ensure_dirs)
     # The job must SURVIVE the streaming SSH session. A backend restart (or
@@ -289,7 +307,16 @@ def wrap_remote_command(docker_cmd: str, remote_log: str, *,
     log_q = shlex.quote(remote_log)
     exit_q = shlex.quote(remote_log.rsplit(".", 1)[0] + ".exit")
     runner = f"({docker_cmd}) > {log_q} 2>&1; echo $? > {exit_q}"
+    # The guard is its OWN list, ended with `;` and never joined with `&&`.
+    # Everything below is one AND-OR list ending in `&`, and `&` binds the
+    # whole list - so `guard && mkdir ... &` backgrounds the guard too, its
+    # `exit` leaves only the background subshell, and the outer shell sails
+    # on into the `while [ ! -f <exit file> ]` wait that nothing will ever
+    # satisfy: a hung SSH command instead of a refusal. Caught by the
+    # real-shell test, which hangs when this is a `&&`.
+    guard = f"{volumes.mount_guard(require_mount)}; " if require_mount else ""
     return (
+        f"{guard}"
         f"mkdir -p {mkdirs} && rm -f {exit_q} && : > {log_q} && "
         f"nohup bash -c {shlex.quote(runner)} < /dev/null > /dev/null 2>&1 & "
         f"tail -n +1 -F {log_q} 2>/dev/null & TAILPID=$!; "
@@ -522,14 +549,15 @@ class Dispatcher:
         inside the launch path, where a crash loses the start with nothing
         recording that it was owed.
 
-        So nothing fires at the transition. This asks four questions on
-        every telemetry tick and starts the bootstrap when all four hold:
+        So nothing fires at the transition. This asks five questions on
+        every telemetry tick and starts the bootstrap when all five hold:
 
           1. the launch row is active,
           2. it carries bootstrap text,
           3. this connection is CONNECTED (the caller has already
              established that - it is why we are in this loop at all),
-          4. no detached row carries this launch's bootstrap note.
+          4. no detached row carries this launch's bootstrap note,
+          5. the box says its own setup finished (Phase 110).
 
         (4) is the exactly-once guarantee, and it is a row in SQLite rather
         than a flag in memory, so a backend restart cannot forget it and a
@@ -538,6 +566,18 @@ class Dispatcher:
         the next tick asks again. An adopted box has no launch row and no-
         ops at question 1; an auto-manage launch carries no script and
         no-ops at question 2.
+
+        (5) is asked HERE and not left to the gate, even though the gate
+        makes it true for every launch it promotes. Orphan repair flips a
+        FAILED row to active whenever the instance is alive, which is right
+        for cost accounting and mints an active row that passed no gate. A
+        GCE box that ran out of provisioning budget would otherwise be
+        repaired to active and burn its one bootstrap start on a machine
+        with no /workspace/ephemeral - which is exactly what happened on
+        2026-08-17: the script exited 1 with three "No such file or
+        directory" errors, and (4) then correctly prevented the retry that
+        would have saved it. The guarantee is this function's, so the
+        question is this function's.
         """
         from . import bootstrap as boot
         from . import detached as det
@@ -556,6 +596,14 @@ class Dispatcher:
         note = boot.note_for(launch["id"])
         if self.db.find_detached_by_note(note) is not None:
             return                      # already started; never start twice
+        # Asked last, so a launch that has already run its bootstrap never
+        # pays for it again. "incomplete" counts as go: cloud-init has
+        # stopped, the marker is never going to appear, and refusing to run
+        # the user's setup script forever on a box that is otherwise up
+        # would lose it as surely as running it too early did.
+        if await self.orchestrator.provisioning_signal(conn) not in (
+                "ready", "incomplete"):
+            return
         started = await det.start_detached(
             conn, self.db, instance_id=instance_id, command=script,
             note=note, created_by=launch.get("created_by"))
@@ -1164,6 +1212,26 @@ class Dispatcher:
                 busy_batch.add(iid)
         return busy_batch, busy_server
 
+    def _still_provisioning(self, instance_id: str) -> bool:
+        """Is this box's launch still inside the provisioning window?
+
+        CONNECTED IS NOT READY. On GCE a box answers SSH minutes before
+        cloud-init has finished, and a launch carrying a data volume is not
+        promoted until that volume is verifiably mounted. Dispatch used to
+        key on the connection alone, so queued jobs landed in that window
+        and died at the mount guard as a TERMINAL failure with no requeue -
+        the error text even had to say "if the box is still coming up,
+        requeue in a minute", which was the code describing its own bug.
+        Leaving the job QUEUED is what makes it correct: the gate promotes
+        the launch a minute later and the next tick dispatches it.
+
+        An ADOPTED box has no launch row and is never gated here - nothing
+        in Manifold knows when it provisioned, which is the same rule the
+        gate itself follows.
+        """
+        launch = self.db.find_launch_by_instance(instance_id)
+        return bool(launch) and launch.get("status") == "booting"
+
     def _pick_dispatchable(self) -> list[tuple[dict, str, ManagedConnection]]:
         """Every queued task that has an eligible connected instance RIGHT
         NOW, each bound to its instance. One pass can dispatch to several
@@ -1176,12 +1244,15 @@ class Dispatcher:
           on an auto-owned box); untargeted manual jobs take the first free
           non-auto-owned instance;
         - per instance: one batch task at a time, one server at a time,
-          server+batch coexist (see _busy_map).
+          server+batch coexist (see _busy_map);
+        - and never an instance whose launch is still 'booting' (see
+          _still_provisioning).
         """
         connected = {
             iid: conn
             for iid, conn in self.orchestrator.connections.items()
             if conn.state == ConnectionState.CONNECTED
+            and not self._still_provisioning(iid)
         }
         if not connected:
             return []
@@ -1458,6 +1529,12 @@ class Dispatcher:
             docker_cmd, remote_log,
             ensure_dirs=["/workspace/ephemeral",
                          f"/lambda/nfs/{filesystem}/task-logs"],
+            # Dispatch keys on the CONNECTION being connected, not on the
+            # launch being active, so a job can be handed to a box whose
+            # volume Manifold has not mounted yet (on GCE that window is
+            # minutes long). The guard is what makes that safe: the job
+            # refuses instead of writing its outputs to the boot disk.
+            require_mount=filesystem,
         )
 
         for attempt in (1, 2):
@@ -1501,6 +1578,27 @@ class Dispatcher:
 
         for line in stderr.splitlines():
             self.queue.append_log(task_id, f"[stderr] {line}")
+        if exit_code == volumes.NOT_A_MOUNT_EXIT:
+            # The mount guard refused before the container ever started, so
+            # NOTHING ran and nothing was written. Said in the job's own
+            # words rather than as "container exited 78", because the
+            # difference between "your job crashed" and "Manifold would not
+            # let it write to a disk that dies with the box" is the whole
+            # reason the guard exists.
+            self.queue.append_log(
+                task_id,
+                f"[manifold] refused: {volumes.mount_path(filesystem)} is not "
+                f"a mounted filesystem on {instance_id}; the job did not run")
+            self._finish_task(
+                task_id, exit_code=exit_code, output_paths=[],
+                error=(
+                    f"{volumes.mount_path(filesystem)} is not mounted on "
+                    f"{instance_id}, so this job would have written its "
+                    f"outputs to the instance's boot disk, which is deleted "
+                    f"with the instance. Nothing ran. If the box is still "
+                    f"coming up, requeue in a minute; otherwise check the "
+                    f"volume on the Volumes page."))
+            return
         self.queue.append_log(
             task_id,
             f"[manifold] exited {exit_code}; log archived at {remote_log}",
@@ -1724,6 +1822,22 @@ class Dispatcher:
 
                 # -- idle verdict. Pinned by a BATCH task only (Phase 90); a
                 # server is judged by whether anyone is using it, below.
+                if (launch or {}).get("status") == "booting":
+                    # Still provisioning (Phase 110). SSH answers minutes
+                    # before cloud-init finishes on a stock-Ubuntu image, so
+                    # this box is CONNECTED and doing nothing Manifold can
+                    # see - and the per-launch idle floor is 300s, shorter
+                    # than a ~7 minute GCE provision. Judging it here would
+                    # reap a machine mid-setup, with nothing rescuable
+                    # because its sidecar is not up yet. The boot and
+                    # provisioning budgets own this window; the idle clock
+                    # starts when the box becomes usable.
+                    self._note_activity(
+                        instance_id, "booting", True,
+                        "still provisioning (installing drivers and "
+                        "runtime); the idle timeout does not start until "
+                        "the launch is active")
+                    continue
                 if instance_id in auto_owned:
                     self._note_activity(
                         instance_id, "auto_managed", True,
@@ -2607,8 +2721,40 @@ class Dispatcher:
     async def _sample_telemetry_once(self) -> None:
         self._maybe_prune_telemetry()
         for instance_id, conn in list(self.orchestrator.connections.items()):
+            # The provisioning gate (Phase 110) goes first: it is what turns
+            # a still-'booting' launch into an active one, and the bootstrap
+            # sweep below only fires on an active launch. Same shape and the
+            # same reason - three paths open a connection and none of them
+            # is a moment at which readiness could be decided, so this asks
+            # the row and the box on every tick instead.
+            #
+            # BEFORE the connected check, unlike everything below it: a box
+            # that answered SSH once and then dropped has a launch whose
+            # provisioning budget is running, and skipping it here is what
+            # let such a row sit in 'booting' forever while the supervisor
+            # reconnected and the instance billed. The gate reads the row,
+            # so it can age that launch out with no session at all.
+            try:
+                await self.orchestrator.sweep_provisioning(instance_id, conn)
+            except Exception:   # noqa: BLE001 - a gate that could not run
+                # must never break telemetry. The launch stays 'booting',
+                # which is the truth, and the next tick asks again.
+                logger.exception("provisioning sweep failed for %s",
+                                 instance_id)
             if conn.state != ConnectionState.CONNECTED:
                 continue
+            # The volume mount-heal (Phase 112), between the two: the gate
+            # above only looks at 'booting' rows, and orphan repair mints
+            # ACTIVE rows that never passed it. Runs the mount half only -
+            # never mkfs - and no-ops on every box that is not a GCP launch
+            # carrying a volume, which is almost all of them.
+            try:
+                await self.orchestrator.sweep_volume_mount(instance_id, conn)
+            except Exception:   # noqa: BLE001 - a heal that could not run
+                # must never break telemetry. An unmounted volume is not
+                # silent damage: every writer refuses at the mount guard.
+                logger.exception("volume mount sweep failed for %s",
+                                 instance_id)
             # The launch bootstrap (Phase 104), before the probe rather
             # than after it, so a script started on this tick is confirmed
             # alive on this tick and protects its box immediately. Nothing

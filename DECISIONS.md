@@ -6617,3 +6617,553 @@ to answer (--doctor --handshake needs no running backend - verified
 against a dead port). What only a real install can settle, as with every
 desktop change: the msi layout on real Windows, and dmg behavior under
 Gatekeeper quarantine (CI-built apps are never quarantined).
+
+## 2026-08-19 — Phase 110: "the provider says active" is not "the machine works"
+
+The three findings from the first real GCP launch, fixed. On Lambda,
+provider-active effectively means sshd is up and the image is already
+provisioned, so the launch pipeline could treat the two as one fact. On a
+stock-Ubuntu GCE box they are six minutes apart: RUNNING at ~36s, sshd at
+~90s, cloud-init done (NVIDIA driver built, Docker, the NVIDIA runtime, the
+sidecar) at ~7 minutes. Everything below follows from separating them.
+
+**The launch row stays 'booting' through the new gate. No new status.** A
+'provisioning' status was designed and rejected: resume_pending_launches
+skips anything that is not 'booting', so a restart would strand every row in
+it; launch_progress would fall through to its empty-detail fallback and lose
+the boot countdown; the dashboard's booting card branches on the phase; and
+the MCP status enumeration would go stale. Keeping 'booting' makes the ROW
+the state, and restart survival comes free - which is the same reason the
+gate is a reconciler rather than a hook.
+
+**connected_at is a new column, and it is the anchor.** Persisted, not held
+in memory, because cloud-init keeps working while the backend is restarting
+- a --reload dev loop that handed every box a fresh window would never
+notice one that is stuck. Deliberately different from _wait_until_active's
+restart-forgiveness (a fresh timeout window per resume), which is right for
+a window measuring OUR polling and wrong for one measuring the box's own
+work. NULL means "we never observed SSH", never "SSH came up at time zero".
+
+**The gate is a reconciler; the launch task drives the same function as a
+fast path.** sweep_provisioning rides the telemetry tick beside
+_sweep_bootstrap, for the same reason Phase 104 gave: three sites open a
+connection (the pipeline, resume-after-downtime, adoption) and at none of
+them is readiness knowable, so nothing fires at a transition. It is also
+awaited in a bounded loop by _establish_connection and by the
+resume-after-downtime path - not as a second implementation (there is one:
+the sweep decides, the row records) but so a ready box is promoted in
+milliseconds instead of up to one telemetry interval, and so wait_for_launch
+still returns a settled launch. Lose that task to a crash and the sweep
+picks the row up exactly where it was.
+
+**A separate provisioning budget, and its expiry never destroys anything.**
+boot_timeout_seconds is 2400s calibrated to the provider-boot worst case
+alone; folding cloud-init's tail into it would make today's successful
+40-minute Lambda boots start failing. launch.provisioning_timeout_seconds
+(1200s) is measured from connected_at. When it runs out the row FAILS with
+the same honest copy the boot timeout uses - it may still be running and
+billing, check the dashboard - and the instance is left alone. Terminating
+here would be the worst possible moment for it: a box whose sidecar never
+came up is a box the rescue can save nothing from, so the tidy-up would be
+pure data loss. The wait for the FIRST connection is bounded by the same
+number, because a box whose sshd never answers never earns a connected_at
+and would otherwise sit in 'booting' forever.
+
+**The init signal moved from /var/run to /var/lib, and finally has a
+reader.** cloud-init has ended with `touch /var/run/manifold-init-done`
+since Phase 5 and nothing ever read it. /var/run is tmpfs: a driver-upgrade
+reboot mid-setup (a documented, normal event on these boxes) erases the
+marker while cloud-init's per-instance stage never runs again, so a rebooted
+box would be waited on forever. It is now /var/lib/manifold/init-done. Under
+`set -e`, reaching that line is the claim that every line above it
+succeeded, which is strictly stronger than cloud-init's own boot-finished -
+a reboot rewrites boot-finished at the end of the NEXT boot while the
+per-instance script stays incomplete. boot-finished is kept as the FALLBACK
+only: marker absent but cloud-init finished promotes the launch with the
+failure recorded on the row and in the audit log, because waiting out a
+20-minute budget on a box that is as done as it will ever be is just money.
+
+**The shipped setfacl fix was a no-op, and `|| true` hid it.** cloud-init
+has run `setfacl -m u:ubuntu:rw /var/run/docker.sock` since the GCE gate,
+correctly placed after the docker restart, precisely to repair the
+already-open SSH session that authenticated before `usermod -aG docker`.
+It never ran: setfacl comes from the `acl` package, stock GCE Ubuntu does
+not ship it, so the line was "command not found" - swallowed by its own
+`|| true`. That is why no template job could run on GCP. The package is now
+installed and BOTH lines echo a WARNING on failure instead of passing
+silently. The general lesson, worth more than the fix: `|| true` on a repair
+converts "this did not work" into "this is fine", and the one image that
+needed the repair is the one image where nobody saw it fail.
+
+**Belt and braces: the gate asks whether THIS session can reach docker.**
+Supplementary groups are fixed when a session is established, so the ACL is
+the only thing that can repair a live connection - and if it did not apply,
+the session is permanently locked out. `test ! -e /var/run/docker.sock ||
+test -w /var/run/docker.sock` asks the question that matters (the ACL
+answers it, a group list does not) and fails open on a box with no socket.
+ONLY on failure does the gate redial, because a redial drops every channel
+on the connection - an open terminal, a streaming job.
+
+**Redial is a new primitive on ManagedConnection, and it is not close().**
+close() is terminal (_closing=True, supervisor cancelled) with no restart,
+and replacing the object in orchestrator.connections would leak a supervisor
+that redials forever. redial() closes only the underlying asyncssh
+connection, which _supervise is already waiting on: it wakes, reconnects
+with the normal backoff, and the object, its state machine, its dict entry
+and its host-key pin all survive. Sidecar and model forwards are per-call,
+so they are unaffected.
+
+**_sweep_bootstrap asks the init signal itself.** Not because the gate
+leaves it false - the gate makes it true for everything it promotes - but
+because orphan repair legitimately flips a FAILED row to active whenever the
+instance is alive, which mints an active row that passed no gate. Without
+its own check, a box that exceeded the provisioning budget would be repaired
+to active and then burn its one exactly-once bootstrap marker on a machine
+with no /workspace/ephemeral. That is exactly what happened on 2026-08-17:
+the script exited 1 with three "No such file or directory" errors, and the
+marker then correctly refused the retry that would have saved it.
+
+**The idle sweep skips booting rows.** It judges every CONNECTED instance
+regardless of launch status, and the per-launch idle floor is 300s - shorter
+than a ~7 minute provision. Premature-active plus the early bootstrap's
+touch_activity had been masking that; under the gate a short idle timeout
+would have reaped a box mid-setup, with nothing rescuable. The boot and
+provisioning budgets own that window; the idle clock starts when the box
+becomes usable.
+
+**The boot countdown stops when the boot does.** launch_progress emits
+boot_elapsed/timeout/remaining only while the instance is still coming up on
+the provider. Once connected_at is set those numbers are counting down a
+deadline that no longer decides anything, so they are omitted and
+phase_detail says what is actually happening ("SSH is up on <id>; installing
+drivers and runtime (180s of 1200s)"). No new phase key and no new payload
+key: the vocabulary is unchanged, the strings are honest. The 'active'
+detail is no longer "SSH is up; the instance is ready" either - that
+sentence names the earlier milestone, and saying it was how a launch
+announced itself ready six minutes early.
+
+**Not done, named so it is a choice and not an oversight:** job dispatch
+still keys on the CONNECTION being CONNECTED, not on the launch being
+active, so a job queued against a provisioning box can still be dispatched
+into it. The first-job GPU preflight (a real `docker run --gpus all`) is
+what stands between that and a doomed container today, and it is not
+nothing, but it is a 180s bound rather than a gate. Widening dispatch to
+consult the launch status is a separate change with its own failure mode (an
+orphan-repaired box has an 'active' row that proves nothing).
+
+### Addendum (integration review): one asker at a time
+
+The gate ships with two callers - the launch tail's fast-path loop and the
+telemetry tick - and it awaits several SSH probes, so they interleave at
+every one of them. Both could read the row as still booting, both find the
+session locked out of docker, and the SECOND redial would drop the session
+the first had just rebuilt. `sweep_provisioning` is now a guard around
+`_sweep_provisioning` keyed on instance id; a skipped tick loses nothing
+because the other caller is asking the same questions of the same box and
+writes what it learns to the row. Pinned by a test that fails (two redials)
+with the guard removed.
+
+## 2026-08-19 — Phase 111: the GCP launch form stops making a healthy project look broken
+
+The owner switched the provider toggle to Google Cloud and asked what was
+wrong. Nothing was wrong - he has ample quota - and he was about to go
+request more of what he already had. The region beside it had defaulted to
+asia-east1-a (he is in the US) with a us-central1 price printed next to it.
+Everything below is that one screen.
+
+**The reassuring branch was a lie in exactly the case that mattered.** The
+old strip filtered quota rows on `limit > 0` and listed whatever survived,
+so `NVIDIA_T4_GPUS 8/8` - fully consumed, nothing free - passed the filter
+and read as quota you have. The global check tested only `limit === 0`, so
+`GPUS_ALL_REGIONS 4/4` skipped the blocking state entirely and fell through
+to the same reassuring list. And the threshold was wrong for every
+multi-GPU shape: a2-highgpu-8g needs eight, and "limit above zero" says
+nothing about whether eight are free. The gate is now `limit - usage <
+specs.gpus`, read against the SELECTED GPU and the SELECTED zone's region,
+because a quota answer about another shape or another place is not an
+answer about this launch.
+
+**Five states, and the whole point is that they do not look like each
+other.** No data (nothing rendered, or one neutral line when the read
+actually failed), global blocked, regional blocked, cannot tell, healthy.
+Only the two blocked states are amber. "Cannot tell" is its own neutral
+state - the gating row absent from Google's answer says the number is
+missing, not zero - and healthy is the same zinc as the price-basis note
+beside it, with the request link demoted out of the call-to-action
+position. The old code had three states and two of them could render the
+same sentence for opposite facts.
+
+**It never predicts the launch, in either direction.** Not "this will
+fail": an instance terminating right now hands the quota back, which is why
+the blocked copy names terminating and waiting as remedies beside
+requesting more (and names them only when usage is actually above zero -
+against a limit of 0 that advice does nothing). And not "this will
+succeed": quota is permission to ask. RESOURCE_POOL_EXHAUSTED is a separate
+answer Google gives at insert time with quota to spare, so the healthy copy
+claims room and stops - "room to ask, not a promise that Google has one
+free in this zone".
+
+**Mock mode was rendering a blocker that could not exist.** MockGCPProvider
+had no `gpu_quota` at all, so `/gcp/quota` took its `fetch is None` branch
+and answered `{"quotas": [], "project": ""}` - no request_url, though the
+TypeScript type declared it non-optional. The flagship zero-credential demo
+therefore opened on amber "No regional GPU quota here yet" with
+`<a href={undefined}>`. That is the hard rule's exact forbidden move:
+"nobody asked Google" collapsed into "Google said zero". Both halves are
+fixed. The mock now returns roomy fixture rows shaped like Google's (and
+the route says `mock: true`, as the listing routes already do, because
+agents act on this). A provider that genuinely cannot answer now returns
+503 - the same shape the credential-less path already used, which the form
+already handles - rather than a number it does not have. `request_url` is
+omitted when there is no project id, because that URL without one opens
+whichever project the browser used last, and the copy stands on its own
+without a link.
+
+**The COMMITTED_ rows were printing a number Google never sent.** Google
+fills "no limit configured" with the int64 sentinel 9223372036854775807. It
+survives JSON intact and then rounds in the JavaScript float to
+9223372036854776000 - which is what the banner was showing the user. Those
+rows are gone from the screen (they cannot gate anything anyway), and the
+mock fixture deliberately carries one so anything rendering this payload
+has to cope with it.
+
+**Only two rows can gate a launch this form produces, and the filter says
+why.** PREEMPTIBLE_* cannot, because the GCE launch path sets no
+provisioning model - every Manifold launch is on-demand. COMMITTED_* cannot,
+because Manifold buys no commitments. That leaves the selected family's
+regional metric and the global cap. The comment on the filter names the
+reason rather than the rule, so whoever ships spot launches sees that
+PREEMPTIBLE_* becomes gating on the same screen. The filtering is
+presentation only: `/gcp/quota` still returns every row Google sent, for
+agents and for the console link.
+
+**Two new catalog fields, because the alternative was string parsing.**
+`quota_metric` and `price_basis_region` ride each GCP catalog entry beside
+the existing `price_basis`. The form joins quota rows to the selection on
+them. The alternatives were parsing "us-central1" out of the price_basis
+prose (breaks the first time that sentence is reworded) or keeping a second
+copy of the accelerator -> metric table in TypeScript (drifts from
+`gcp_catalog.quota_metric` the first time Google adds a family). A shape
+that is not on the shelf gets NO metric rather than one guessed from its
+GPU name - the form renders that as "cannot tell", which is what it is.
+
+**The region default gained one step, and Lambda's blast radius is zero.**
+Order is now: a region where a filesystem already lives (unchanged - that
+is Lambda's deliberate and good behaviour), then the region the listed
+prices are quoted in, then the first available. GCP zones arrive sorted, so
+the raw first was asia-east1-a; GCP has no filesystems, so the old fallback
+always won. The new step keys on `price_basis_region`, a field only GCP
+entries carry, and it only ever picks among `regions_with_capacity` - no
+capacity is hidden and the dropdown still lists everything. Reusing the
+dropdown's own sort would NOT have worked: `/regions?provider=gcp` returns
+`name: code`, so its localeCompare is the same alphabetical order.
+
+**The price still shows outside us-central1; one line says so.** When the
+selected zone's region differs from the priced one, the note adds "you have
+asia-east1 selected, and Google prices per region - Manifold does not have
+that region's rate". Suppressing the price was rejected: relative price is
+the primary decision variable, and the GPU dropdown renders before a region
+even exists. Inventing a regional multiplier was never on the table.
+
+**`zone_to_region` no longer truncates a region.** Blind `rsplit("-", 1)`
+turned "us-central1" into "us", which then travelled as the scope label on
+quota rows - a place name Google does not have. It now strips a trailing
+single letter only, and anything already a region comes back untouched. The
+dashboard has the same three-line rule for the same reason.
+
+**Deliberately not built: staleness degradation on the price label.** An
+age threshold that flips PRICES_RECORDED amber after N days would be an
+invented judgement with no evidence stream behind it until the Billing
+Catalog API lands. The printed date is the honest staleness signal.
+
+Verified with the real component in a real browser: the mock backend on
+:8123, the static export on :3000, and playwright substituting Google's
+answer for the states mock mode cannot reach. All five states plus the
+edges (limit 0, no request_url, the int64 sentinel present in the payload,
+an 8-GPU shape against 7 free A100s) render as designed, and the GCP
+default region lands on us-central1-a against an alphabetical zone list.
+
+## 2026-08-19 — Phase 112: GCP gets persistent storage, and the fake rescue is closed
+
+The owner's GCP boxes were scratch-only: everything died with the machine.
+This attaches a Compute Engine Persistent Disk as a data volume, mounted at
+`/lambda/nfs/<name>` exactly like a Lambda filesystem. The feature is small.
+The thing that had to be built first is not.
+
+**THE FAKE-RESCUE VECTOR, which is the most important paragraph here.**
+`sync_ephemeral` ran `mkdir -p <dest> && rsync -a /workspace/ephemeral/
+<dest>` with no check that `<dest>` was a mount. `rescue()` sets
+`unsaved = []` the moment `synced_to` is set, and the termination safety
+hook reads `unsaved` to decide whether destroying a box is safe. So an
+UNMOUNTED `/lambda/nfs/<name>` meant: rsync silently creates an ordinary
+directory on the auto-delete boot disk, the rescue reports everything saved,
+the hook waves the terminate through, and the user's data burns while the
+audit log records a successful rescue. The same hazard sat on the job path -
+`_pick_dispatchable` dispatches to any CONNECTED instance without consulting
+launch status, and on GCE a box is CONNECTED minutes before it is
+provisioned, while the job wrapper `mkdir -p`s
+`/lambda/nfs/<fs>/task-logs`.
+
+Before this phase that could not happen on GCP, and only by accident:
+`sync_ephemeral` raised honestly ("no filesystem recorded") because the
+column was always empty there. Populating that column for volumes removes
+the accident. So `mountpoint -q` is now asserted before every write MANIFOLD
+ITSELF issues to that path - the job wrapper, `sync_ephemeral`, and the file
+upload - and it is UNCONDITIONAL, Lambda included, where it converts "the
+NFS quietly fell off" from a silent fake-rescue into a loud failure. A
+refusal leaves `unsaved` populated, which is exactly what makes termination
+stop and ask. `wrap_remote_command`'s `require_mount` has no default: every
+caller states out loud whether it is about to write to persistent storage.
+
+**The upload was the site this paragraph originally missed** (found in
+review, below). `POST /instances/{id}/files/upload` resolves a relative path
+under `/lambda/nfs/<name>` and `sftp_write` calls `makedirs(parent)`, so an
+upload into an unmounted volume did not merely land on the boot disk while
+the audit row asserted a durable location - it CREATED the mount point, and
+`mount_command` then refuses forever to mount over a non-empty unmounted
+directory, so one upload made the volume unmountable on that box and failed
+every later launch carrying it. Guarded now, through the same
+`mount_guard` / exit-78 mechanism, in one orchestrator helper
+(`assert_mounted_path`) rather than a second copy of the idea in a route.
+The same helper guards the persistent-file BROWSE, where the lie is the
+mirror image: an instance's `filesystems` list means ATTACHED on GCP, not
+mounted, so listing an unmounted volume answered "zero entries" about a disk
+that may be full - an empty list standing in for a failed question.
+
+**One shell detail worth the line, because it was a real bug in the first
+draft.** The guard is its own list, ended with `;`, never joined to the rest
+with `&&`. Everything after it is one AND-OR list ending in `&`, and `&`
+binds the whole list - so `guard && mkdir ... &` backgrounds the guard too,
+its `exit` leaves only the background subshell, and the outer shell sails on
+into the `while [ ! -f <exit file> ]` wait that nothing will ever satisfy.
+A hung SSH command instead of a refusal. The real-shell wrapper tests hang
+when this regresses, so they carry a subprocess timeout.
+
+**The launch row's existing `filesystem` column carries the volume name.**
+That column never meant "a Lambda filesystem"; it means "the name under
+`/lambda/nfs/` where this launch's persistent home is mounted", which a
+mounted PD satisfies identically. Ten-plus consumers therefore needed no
+change at all: dispatch, task readoption after a restart, the rescue,
+relative file routes, resume-after-restart. A separate `volume` column was
+rejected for the reason Phase 103 rejected reshaping this column - every
+missed fork produces a box claiming persistence it does not have.
+
+**A volume is still not a "filesystem kind".** It never appears in
+`/filesystems` (Lambda's registry, left alone), never backs the Storage
+page's browser, and never carries a `bytes_used`. Those are things a Lambda
+filesystem can answer and a detached Persistent Disk cannot; a `0` there
+would assert "empty" about a disk that may be full. `_storage_for` 404s a
+volume name, which is an honest refusal rather than a gap.
+
+**`auto_delete=False` is the whole of the attach.** GCE preserves and
+detaches a non-auto-delete disk when the instance is deleted, so terminate
+needs no provider change and no explicit detach - an explicit pre-delete
+detach would only add a window where the instance is alive and
+half-detached. The field is set explicitly even though proto3's bool default
+is already False. `device_name` is the volume's name because
+`/dev/disk/by-id/google-<device_name>` is built from it, and that link -
+never `/dev/sdb`, which is enumeration-ordered - is the only device path the
+format path will touch.
+
+**The format/mount decision table is a pure module (`volumes.py`), in
+data_safety.py's shape.** Inputs: `formatted_at` from SQLite, and one probe
+on the box. Two invariants hold it up. mkfs requires BOTH a blank blkid and
+a NULL `formatted_at`, read in the same session immediately before the
+command. And `formatted_at` is written BEFORE mkfs is issued, atomically
+(the UPDATE is conditional on it still being NULL) - which is what makes a
+backend restart mid-format safe: the row says formatted, blkid comes back
+blank, the table refuses loudly, and the box is untouched. blkid-empty is
+the AMBIGUOUS cell, not the safe one, and that refusal can say something
+unusually strong: because the record transitions exactly once, such a volume
+provably never held user data, which is what makes "delete it and create
+another" advice rather than a shrug. A filesystem Manifold has no record of
+writing is refused in both directions - mounting it read-write corrupts
+foreign data, formatting destroys it - and so is a disk with no volumes row
+at all, which is the restored-SQLite case wearing a different hat. `blkid`
+exiting 2 ("no signature") is separated from every other nonzero exit,
+because `|| true` there would turn "we could not look" into "it is blank"
+and then mkfs a disk holding data. That is the same move Phase 110 caught
+in cloud-init's setfacl line.
+
+**The gate promotes a volume launch only with `mountpoint -q` verified.**
+`_sweep_provisioning`'s existing "promote on incomplete with a warning"
+trade is right for a plain box - the warning is the whole cost - and it
+INVERTS here: an active row over an unmounted volume is fake persistence,
+and jobs would write outputs to the boot disk believing them safe. If the
+mount cannot be achieved the launch fails the way `_fail_provisioning`
+already does: box untouched, still billing, said out loud. Two additions to
+that shape. The volume step runs BEFORE the docker-access check, because a
+redial there drops the session and mkfs issued into a session being torn
+down would raise out of the gate; a mount is a kernel fact and survives the
+redial. And a refusal the table marks TERMINAL fails the launch immediately
+rather than billing out the whole provisioning budget to re-learn a state
+that provably cannot change by waiting.
+
+**A mount-heal sweep rides the telemetry tick, and it never formats.**
+`_reconcile_launches`' orphan repair flips a failed row to active whenever
+the instance is alive - right for cost accounting - minting an active row
+that passed no gate, and the gate will not re-enter because it exits on
+`status != "booting"`. A reboot is the other way in: the mount is
+deliberately not in fstab. So the sweep runs the mount half only.
+`_prepare_volume(allow_format=...)` has no default, so the two callers say
+which they are. A box the heal cannot fix is NOT hidden: the row stays
+active because it is alive and billing, an audit row says so, and every job
+and sync on it refuses at the mount guard rather than writing to a disk that
+dies with the box.
+
+**Admission asks Google, not SQLite.** One aggregated disk lookup answers
+exists / which zone / who holds it. The whole history of the provisioning
+work is rows drifting from boxes, so a local "attached to X" must never
+refuse a launch when X is already gone - if `users` is empty the disk is
+free, whatever any row says (pinned by a test with a deliberately stale
+row). The remaining race - two launches both reading `users=[]` - cannot be
+closed from there and is not pretended away: `RESOURCE_IN_USE_BY_ANOTHER_
+RESOURCE` gets its own named refusal instead of the generic error tail. A
+refusal names the holder plus that launch row's purpose and creator; GCE's
+`TERMINATED` means STOPPED, and a stopped instance keeps its disks, so that
+case gets its own sentence rather than "terminate the holder", which would
+read as nonsense about a box the dashboard does not show.
+
+**Names are validated against GCE's own charset before they touch
+anything.** These are the first user-supplied strings this codebase
+interpolates unquoted into shell commands (the rsync destination, the
+dispatcher's log paths) and into a device path. Lambda's names arrived from
+Lambda's registry; these arrive from Manifold's own route, so the route is
+where the charset is proven.
+
+**GET /volumes is sourced from GCE with SQLite as an overlay.** A disk bills
+for its PROVISIONED size whether attached or not, so a SQLite-sourced list
+would let one bill invisibly forever the first time the data dir was lost.
+A disk with no row still appears, flagged as one Manifold has no record of.
+The list price is labelled and dated; it is deliberately not wired into
+spend.py.
+
+**Deferred on purpose, so the gaps are choices:** resize, snapshots,
+attaching existing or unformatted disks, multiple volumes per instance,
+Storage-page browsing of a volume (nothing outside the instance can read
+one), volume-aware `list_launch_options` (a target row carries
+`filesystem_bytes_used`, and a PD cannot report one - a 0 would assert
+"empty" and the ranking would then sort on the invention), MCP create/delete
+(a volume bills from creation and deletion is unrecoverable; reading is
+enough for an agent), and spend integration. Auto-manage, clusters and
+capacity watches remain Lambda-pinned and needed no work.
+
+And one gap in the guard itself, stated rather than left to be discovered:
+`run_command`, `run_detached` and the terminal run the user's own shell line
+verbatim, and are NOT prefixed with the mount guard. They are the documented
+raw-shell escape hatch, and editing a line somebody typed is not something a
+guard should do. A command typed there can still write to an unmounted path;
+what it cannot do is get Manifold to report the result as saved.
+
+`fs_usage`, `fs_delete` and `fs_archive` were deferred out of that list and
+are now guarded too, because reading their purposes made the case: usage is
+the view people DELETE from, so measuring the boot disk says "nothing here
+is worth keeping" about a disk nobody looked at; delete both destroys and
+reports success, so a person freeing space would free none and be told it
+worked; and an archive is what people take right before terminating a box -
+unguarded it hands back a valid, well-formed, EMPTY tar.gz of the data they
+were trying to save, and nothing tells them until they need it. Each got its
+own refusal sentence rather than a copied one.
+
+The guard is scoped to a path INSIDE a volume. `/lambda/nfs` itself belongs
+to no one volume - it is the ordinary directory the mount points live in -
+so a listing of the root is not guarded, the same scoping `fs_list` has.
+
+**Not verifiable without hardware, stated plainly.** Every decision above is
+pure and pinned by tests, and the transport is not: that `sudo mkfs.ext4 -F`
+and `sudo mount -t ext4 -o discard,defaults` actually work over the managed
+connection on a GCE box, that the guest agent creates
+`/dev/disk/by-id/google-<name>` under the device_name the attach set, that
+`blkid -p` and `mountpoint` behave as assumed on that image, and that a
+deleted instance really does leave the disk intact and detached - all of
+that is real-gate work on a real machine. The mock says exit 0 to everything
+by default, which is precisely the lie this phase exists to stop believing,
+so the tests that matter use a session that answers honestly.
+
+### What four reviewers found afterwards, and what changed
+
+Phases 110/111/112 were audited by four independent adversarial reviewers.
+All four returned FAIL, and every finding below was verified against the
+code before it was fixed. Most of them are this file's own truthful-or-absent
+rule being broken by the very phases that invoked it, which is why they are
+recorded here as corrections to this entry rather than as a new one.
+
+**The claim "every write is preceded by `mountpoint -q`" was false when
+written.** The file upload was unguarded (see the paragraph above, now
+corrected), and so was the persistent-file browse. Both go through
+`assert_mounted_path` now. The docstrings in `volumes.py` that made the
+unqualified claim say what is true instead, and name the raw-shell escape
+hatch as the exception rather than leaving a reader to find it.
+
+**A launch that answered SSH once and then lost the connection never
+settled.** `_sweep_provisioning` returned on a non-CONNECTED connection
+BEFORE any budget check, the telemetry tick skipped the gate entirely for
+such a connection, and `_await_provisioning`'s own bound fires only while
+`connected_at` is NULL - which it is not, once SSH has answered once. The
+row stayed 'booting' forever with no `provisioning_timeout` audit row, the
+card counted up past its own budget, the supervisor retried forever, the
+idle sweep skips 'booting', and the box billed. The budget is anchored in
+the ROW (`connected_at`), so it is now spent by the gate with no session at
+all, the tick runs the gate before its connected check, and the fast-path
+loop is bounded unconditionally instead of only in the never-connected case.
+
+**Queued jobs were dispatched into the provisioning window and killed
+permanently.** `_pick_dispatchable` filtered on the CONNECTION, never on the
+launch, so on GCE - connected minutes before the volume is mounted - queued
+jobs died at the mount guard as a terminal exit-78 failure with no requeue.
+The error text saying "if the box is still coming up, requeue in a minute"
+was the code describing its own bug. Dispatch now skips an instance whose
+launch row is still 'booting'; adopted boxes (no row) are exempt by
+construction, the same rule the gate follows.
+
+**A row that vanished mid-boot was never closed.** `_reconcile_launches`
+closed only `active` rows on a vanished instance, and both other closers work
+through a connection this sweep reaps one loop earlier. 'failed' with the
+observed-stop stamps `_wait_until_active` already writes for the identical
+situation a few seconds earlier.
+
+**Three routes answered a question nobody asked.** `/gcp/quota` returned
+`{"quotas": []}` on every Lambda-only install - the 503 added in Phase 111
+only fired for a provider with no `gpu_quota` method, and the real provider
+always has one and returns `[]` when it has no project id. `GET /volumes`
+and `DELETE /volumes/{name}` asserted knowledge of a Google project they
+never contacted ("No data volume named X in this Google Cloud project", and
+an empty list the page renders as "No data volumes yet" - on the one
+resource that bills whether or not anyone could list it). All three consult
+`unconfigured_reason()` now, which already existed and already said the
+honest sentence. A test that pinned the empty-list answer as correct was
+reversed, with a comment saying so.
+
+**An unprovable claim was attached to destructive advice.** The
+interrupted-mkfs refusal said the volume "provably never held any of your
+data: delete it and create another". The evidence is `formatted_at` set plus
+a blank `blkid` NOW, which is equally consistent with a disk that was
+formatted, filled and later wiped externally, or with a by-id link pointing
+at a different device - a case the module concedes twenty lines later. The
+claim is scoped to Manifold's own records now and the advice keeps its
+premise attached. It also no longer contradicts the delete path, which says
+plainly that Manifold cannot read a detached disk.
+
+**And the smaller ones, each an instance of the same rule.** The
+volume-holder refusal collapsed "could not check the holder" into "the
+holder is running" and then gave advice that only works for a running
+holder; it has three branches now. The delete 404 built its "Have:" list
+from SQLite while the sentence claimed to enumerate the Google project (live,
+it declared a volume absent and then listed that same volume) - it says
+whose list it is reading. `GET /volumes` carries the `mock` flag every
+sibling agent-facing route carries, because the MCP tool relays the body
+verbatim and an agent in the zero-spend demo was reporting disks billing at
+$10-20/month that do not exist. `MockGCPProvider` held REGIONS where the real
+provider yields ZONES, so every option the Volumes panel offered was rejected
+with "'asia-east1' is not a GCE zone" and the phase-112 UI had no working
+end-to-end path that costs nothing; the seeded demo disk had no SQLite row,
+so it rendered as "not created by Manifold - unusable here". Both fixtures
+are fixed, and mock mode writes rows for its own fixture disks. The provider
+`delete_volume` call is wrapped in the same `ProviderUnavailable`/
+`ProviderError` translation as its three siblings (a failed GCE delete was
+an unhandled 500). Volume audit rows carry the real caller. The refusal text
+said "1-63 characters" while the regex requires 2-63. And the
+provisioning-timeout message said "answered SSH but did not finish
+provisioning" for `signal == "unknown"`, which means "we could not ask" - a
+distinction the signal function goes out of its way to preserve and the
+message threw away.

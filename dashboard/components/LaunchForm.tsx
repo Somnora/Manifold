@@ -5,8 +5,11 @@ import {
   api,
   ApiError,
   type Filesystem,
+  type GcpQuota,
+  type GcpQuotaRow,
   type InstanceTypeInfo,
   type Region,
+  type Volume,
 } from "@/lib/api";
 import { formatMoney } from "@/lib/format";
 import { HardwareGuide } from "@/components/HardwareGuide";
@@ -24,9 +27,14 @@ import { HardwareGuide } from "@/components/HardwareGuide";
 //      A launch may ALSO attach extra filesystems from the same region.
 //      That stays deliberately subordinate: one filesystem is the common
 //      case, and the extras row only appears once a primary is chosen.
+// Under the GCP toggle step 3 is a DATA VOLUME instead (Phase 112). Same
+// slot, same meaning once mounted (/lambda/nfs/<name>), three differences
+// the copy has to make plain: a volume is zonal, so picking one LOCKS the
+// zone above it; only one attaches per box; and a volume bills from the
+// moment it exists, by provisioned size, attached or not.
 // The form only collects input; every rule (region match, budget,
-// concurrency) is still enforced by the backend and its rejection shown
-// verbatim.
+// concurrency, whether the disk is free) is still enforced by the backend
+// and its rejection shown verbatim.
 
 // Sentinel for "launch without a filesystem" ("" = nothing chosen yet).
 const SCRATCH_ONLY = "__scratch_only__";
@@ -35,6 +43,209 @@ const SCRATCH_ONLY = "__scratch_only__";
 // the real cap and refuses past it; this only keeps the form from offering
 // a fifth pick that would be rejected on submit.
 const MAX_EXTRA_FILESYSTEMS = 4;
+
+// GCE's project-wide GPU cap. It counts every region at once, so it gates a
+// launch no matter which zone is chosen.
+const GLOBAL_GPU_METRIC = "GPUS_ALL_REGIONS";
+
+// us-central1-a -> us-central1. A GCE zone is its region plus one trailing
+// letter; anything not shaped that way (Lambda's region codes) is already a
+// region and passes through untouched. Mirrors gcp_catalog.zone_to_region.
+function regionOfZone(zone: string): string {
+  return zone.replace(/-[a-z]$/, "");
+}
+
+// What the quota rows say about launching THIS shape here. Five outcomes,
+// and keeping them apart is the whole point: "your project has room",
+// "your project does not", and "Manifold could not tell" must never render
+// as one another.
+type QuotaGate =
+  | { state: "unreadable" }                        // nothing was read at all
+  | { state: "no-metric" }                         // shape is not on the shelf
+  | { state: "missing-rows"; missing: string[] }   // the gating row is absent
+  | { state: "blocked"; row: GcpQuotaRow; global: boolean }
+  | { state: "healthy"; regional: GcpQuotaRow; globalRow: GcpQuotaRow };
+
+// The backend returns EVERY GPU quota row Google sent, unfiltered, because
+// an agent asking that question wants the whole answer. Only two of them
+// can gate a launch this form produces, and these are they:
+//   - the selected GPU family's regional metric (NVIDIA_T4_GPUS etc.)
+//   - the global GPUS_ALL_REGIONS cap
+// PREEMPTIBLE_* cannot: the GCE launch path sets no provisioning model, so
+// every Manifold launch is on-demand. COMMITTED_* cannot either: Manifold
+// buys no commitments, and Google fills those rows with the int64 "no limit
+// configured" sentinel, which lands in JavaScript as 9223372036854776000 -
+// a number that was being printed at the user. If spot launches ever ship,
+// PREEMPTIBLE_* becomes gating and this is the function to change.
+function readQuotaGate(
+  quota: GcpQuota | null,
+  type: InstanceTypeInfo | undefined,
+): QuotaGate {
+  if (!quota || !type) return { state: "unreadable" };
+  const need = type.specs.gpus;
+  const metric = type.quota_metric;
+  if (!metric) return { state: "no-metric" };
+  const globalRow = quota.quotas.find(
+    (q) => q.metric === GLOBAL_GPU_METRIC && q.scope === "global",
+  );
+  // One region's rows come back per request, so scope alone identifies the
+  // regional row - and the row's own scope is the region name to print,
+  // rather than one this form derived.
+  const regional = quota.quotas.find(
+    (q) => q.metric === metric && q.scope !== "global",
+  );
+  // A multi-GPU shape needs its whole count: a2-highgpu-8g wants 8, and
+  // "limit above zero" says nothing about whether 8 are free.
+  if (globalRow && globalRow.limit - globalRow.usage < need)
+    return { state: "blocked", row: globalRow, global: true };
+  if (regional && regional.limit - regional.usage < need)
+    return { state: "blocked", row: regional, global: false };
+  if (!globalRow || !regional)
+    return {
+      state: "missing-rows",
+      missing: [
+        ...(globalRow ? [] : [GLOBAL_GPU_METRIC]),
+        ...(regional ? [] : [metric]),
+      ],
+    };
+  return { state: "healthy", regional, globalRow };
+}
+
+// Google's own numbers, labelled as the snapshot they are - never rounded,
+// never restated as a percentage, never turned into a verdict.
+function quotaSnapshot(row: GcpQuotaRow): string {
+  const where = row.scope === "global" ? "" : ` in ${row.scope}`;
+  // A limit of zero is the fresh-project case: "0 of 0 in use" is true but
+  // says the wrong thing about why there is no room.
+  if (row.limit <= 0) return `${row.metric}${where} is 0 as of this check`;
+  return `${row.metric}${where} is ${row.usage} of ${row.limit} in use as of this check`;
+}
+
+// Why this volume cannot be attached right now, or null when it can.
+// Rendered on a DISABLED option rather than hidden: a volume missing from
+// the list reads as "you do not have one", and both reasons below are
+// things the user can act on (terminate the holder; create one here).
+function volumeBlocker(v: Volume): string | null {
+  if (v.attached_to.length > 0) return `in use by ${v.attached_to[0]}`;
+  if (!v.known_to_manifold) return "not created by Manifold";
+  return null;
+}
+
+const QUOTA_AMBER =
+  "rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-[11px] leading-relaxed text-amber-800";
+const QUOTA_NEUTRAL =
+  "rounded-lg border border-zinc-200 bg-zinc-50 px-3 py-2 text-[11px] leading-relaxed text-zinc-600";
+
+/** The GCP quota note under the provider toggle.
+ *
+ * It reports what Google said and nothing else. It never predicts the
+ * launch in either direction: not "this will fail" (an instance
+ * terminating right now hands the quota back), and not "this will
+ * succeed" (quota is permission to ask - RESOURCE_POOL_EXHAUSTED is a
+ * separate answer Google gives at insert time, with quota to spare).
+ */
+function GcpQuotaNote({
+  gate,
+  failed,
+  typeName,
+  need,
+  requestUrl,
+}: {
+  gate: QuotaGate;
+  failed: boolean;
+  typeName: string;
+  need: number;
+  requestUrl?: string;
+}) {
+  // No project id, no link: a quotas URL without one opens whichever
+  // project the browser used last, which is not the one being described.
+  const consoleLink = (label: string) =>
+    requestUrl ? (
+      <a className="underline" href={requestUrl} target="_blank" rel="noreferrer">
+        {label}
+      </a>
+    ) : (
+      <span>{label} in the Google Cloud console</span>
+    );
+  const answerTime = " Google usually answers small requests in minutes to hours.";
+
+  if (gate.state === "unreadable") {
+    // Silence unless the read actually failed. Amber here was the original
+    // bug: an unasked question rendered as a problem with the project.
+    if (!failed) return null;
+    return (
+      <p className={QUOTA_NEUTRAL}>
+        Manifold could not read this project&rsquo;s GPU quota just now, so it
+        is not saying anything about it either way. Google still checks quota
+        when it creates the machine.
+      </p>
+    );
+  }
+
+  if (gate.state === "no-metric") {
+    return (
+      <p className={QUOTA_NEUTRAL}>
+        Manifold does not know which GPU quota gates {typeName}, so it cannot
+        say what this project holds for it. {consoleLink("See your quotas")}.
+      </p>
+    );
+  }
+
+  if (gate.state === "missing-rows") {
+    return (
+      <p className={QUOTA_NEUTRAL}>
+        Google&rsquo;s quota answer did not include{" "}
+        {gate.missing.join(" or ")}, so Manifold cannot say whether there is
+        room for {typeName}. The number is missing, not zero.{" "}
+        {consoleLink("See your quotas")}.
+      </p>
+    );
+  }
+
+  // Usage above zero is the remedy nobody thinks of: some of it is very
+  // likely this project's own running instances, and terminating one frees
+  // the same room a bigger quota would. Said only when there IS usage -
+  // offering it against a limit of zero would be advice that does nothing.
+  const usageIsYours = (row: GcpQuotaRow) =>
+    row.usage > 0 ? (
+      <>
+        {" "}
+        That usage can be your own running instances - terminating one, or
+        waiting for it to finish, hands the room back.
+      </>
+    ) : null;
+
+  if (gate.state === "blocked" && gate.global) {
+    return (
+      <p className={QUOTA_AMBER}>
+        Your project&rsquo;s global GPU cap: {quotaSnapshot(gate.row)}, and{" "}
+        {typeName} needs {need}. That cap counts every region at once, so
+        another region does not get around it.{usageIsYours(gate.row)}{" "}
+        {consoleLink("Request an increase")}.{answerTime}
+      </p>
+    );
+  }
+
+  if (gate.state === "blocked") {
+    return (
+      <p className={QUOTA_AMBER}>
+        {quotaSnapshot(gate.row)}, and {typeName} needs {need}. GPU quota is
+        per region, so another region has its own.{usageIsYours(gate.row)}{" "}
+        {consoleLink("Request an increase")}.{answerTime}
+      </p>
+    );
+  }
+
+  return (
+    <p className={QUOTA_NEUTRAL}>
+      {gate.regional.metric} in {gate.regional.scope}: {gate.regional.usage} of{" "}
+      {gate.regional.limit} in use as of this check, and {gate.globalRow.usage}{" "}
+      of {gate.globalRow.limit} against the global cap. Room for the {need}{" "}
+      {typeName} needs - room to ask, not a promise that Google has one free
+      in this zone. {consoleLink("Request an increase")}.
+    </p>
+  );
+}
 
 export function LaunchForm({ onLaunched }: { onLaunched: () => void }) {
   const [types, setTypes] = useState<Record<string, InstanceTypeInfo>>({});
@@ -60,10 +271,15 @@ export function LaunchForm({ onLaunched }: { onLaunched: () => void }) {
   // asynchronously, so without this a preference landing a moment after
   // the click would silently move the launch to another cloud.
   const providerPicked = useRef(false);
-  const [gcpQuota, setGcpQuota] = useState<{
-    quotas: { metric: string; limit: number; usage: number; scope: string }[];
-    request_url: string;
-  } | null>(null);
+  const [volumes, setVolumes] = useState<Volume[]>([]);
+  // A volume read that FAILED is not an empty list of volumes. Kept apart so
+  // the picker can say "could not ask Google" instead of "you have none".
+  const [volumesFailed, setVolumesFailed] = useState(false);
+  const [gcpQuota, setGcpQuota] = useState<GcpQuota | null>(null);
+  // A failed read is its OWN state, never null-and-silent and never zero:
+  // "nobody could ask Google" and "Google said none" are different answers
+  // and the form must be able to tell them apart.
+  const [gcpQuotaFailed, setGcpQuotaFailed] = useState(false);
   const [loadError, setLoadError] = useState("");
 
   useEffect(() => {
@@ -115,24 +331,67 @@ export function LaunchForm({ onLaunched }: { onLaunched: () => void }) {
     };
   }, []);
 
+  // Volumes are GCP-only and, like the quota read, kept off the catalog
+  // load so a slow or unconfigured project cannot take the form down.
+  useEffect(() => {
+    if (provider !== "gcp") {
+      setVolumes([]);
+      setVolumesFailed(false);
+      return;
+    }
+    let cancelled = false;
+    api
+      .volumes()
+      .then((r) => {
+        if (cancelled) return;
+        setVolumes(r.volumes);
+        setVolumesFailed(false);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setVolumes([]);
+        setVolumesFailed(true);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [provider]);
+
   // The GCP quota read is separate from the catalog load: it can be slow or
   // 503 (no ADC yet) without taking the form down, and it only matters
   // under the GCP toggle.
   useEffect(() => {
     if (provider !== "gcp") {
       setGcpQuota(null);
+      setGcpQuotaFailed(false);
       return;
     }
     api
       .gcpQuota(region || undefined)
-      .then(setGcpQuota)
-      .catch(() => setGcpQuota(null));
+      .then((q) => {
+        setGcpQuota(q);
+        setGcpQuotaFailed(false);
+      })
+      .catch(() => {
+        setGcpQuota(null);
+        setGcpQuotaFailed(true);
+      });
   }, [provider, region]);
 
   const selectedType = types[instanceType];
   const fsRegions = useMemo(
     () => new Set(filesystems.map((f) => f.region)),
     [filesystems],
+  );
+
+  // Step 3 is provider-scoped. On Lambda it is a filesystem, filtered BY the
+  // chosen region. On GCP it is a data volume, which MOVES the chosen zone -
+  // the opposite direction, and why it gets its own effects below rather
+  // than a branch inside the filesystem ones.
+  const isGcp = provider === "gcp";
+  const selectedVolume = useMemo(
+    () => (isGcp ? (volumes.find((v) => v.name === filesystem) ?? null) : null),
+    [isGcp, volumes, filesystem],
   );
 
   // GPUs: available first (cheapest -> priciest), then the rest by price.
@@ -170,14 +429,43 @@ export function LaunchForm({ onLaunched }: { onLaunched: () => void }) {
   }, [regions, availableForType, fsRegions]);
 
   // When the GPU changes, keep the region valid for it — preferring a region
-  // where a filesystem already lives.
+  // where a filesystem already lives, then the region the listed prices are
+  // quoted in.
+  //
+  // That second step is GCP's: its zones arrive alphabetically, so the raw
+  // first pick was asia-east1-a sitting beside a us-central1 price. It keys
+  // on price_basis_region, a field only GCP entries carry, so Lambda keeps
+  // exactly the behaviour it had. Nothing is hidden either way: the default
+  // only ever picks from regions_with_capacity, and the dropdown still
+  // lists every region.
   useEffect(() => {
+    // A chosen volume owns the zone. Moving it here to a zone with capacity
+    // would silently unpin the volume and produce a launch the backend
+    // refuses; the zone-capacity blocker below says so instead.
+    if (selectedVolume) return;
     const avail = selectedType?.regions_with_capacity ?? [];
     if (avail.length === 0) return; // out of capacity: Launch stays disabled
     if (!avail.includes(region)) {
-      setRegion(avail.find((r) => fsRegions.has(r)) ?? avail[0]);
+      const priced = selectedType?.price_basis_region;
+      setRegion(
+        avail.find((r) => fsRegions.has(r)) ??
+          (priced
+            ? avail.find((r) => regionOfZone(r) === priced)
+            : undefined) ??
+          avail[0],
+      );
     }
-  }, [instanceType, selectedType, fsRegions]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [instanceType, selectedType, fsRegions, selectedVolume]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // A volume is ZONAL, so choosing one IS choosing the zone. Stated as its
+  // own effect because it runs the other way round from every filesystem
+  // rule on this form: the choice sets the zone instead of being filtered
+  // by it.
+  useEffect(() => {
+    if (selectedVolume && region !== selectedVolume.zone) {
+      setRegion(selectedVolume.zone);
+    }
+  }, [selectedVolume]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Filesystems are region-locked: keep the choice inside the chosen region.
   const filesystemsInRegion = useMemo(
@@ -185,12 +473,22 @@ export function LaunchForm({ onLaunched }: { onLaunched: () => void }) {
     [filesystems, region],
   );
   useEffect(() => {
+    if (isGcp) {
+      // Volumes are not filtered by region (they set it), so the only thing
+      // to repair here is a name that does not exist on this cloud: a
+      // Lambda filesystem left behind by the provider toggle, or a volume
+      // deleted since the list was read.
+      if (filesystem === SCRATCH_ONLY) return;
+      if (volumes.some((v) => v.name === filesystem)) return;
+      setFilesystem(SCRATCH_ONLY);
+      return;
+    }
     if (filesystem === SCRATCH_ONLY) return; // an explicit choice sticks
     if (filesystemsInRegion.some((f) => f.name === filesystem)) return;
     // Prefer a real filesystem when the region has one; otherwise fall to
     // scratch-only so a filesystem-less region is still launchable.
     setFilesystem(filesystemsInRegion[0]?.name ?? SCRATCH_ONLY);
-  }, [region, filesystemsInRegion]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [region, filesystemsInRegion, isGcp, volumes]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Extras are region-locked too, and an extra can never be the primary.
   // Whenever either changes, drop the ones that no longer make sense rather
@@ -212,11 +510,40 @@ export function LaunchForm({ onLaunched }: { onLaunched: () => void }) {
     [filesystemsInRegion, filesystem, extraFilesystems],
   );
 
+  // Read against the SELECTED GPU (its whole GPU count) and the selected
+  // zone's region - a quota answer about some other shape or some other
+  // place is not an answer about this launch.
+  const quotaGate = useMemo(
+    () => readQuotaGate(gcpQuota, selectedType),
+    [gcpQuota, selectedType],
+  );
+
+  // The listed prices are one region's. When the chosen zone is somewhere
+  // else, say so beside them - the price still shows, because relative
+  // price is how a GPU gets picked and the GPU is picked before a region
+  // exists. Manifold does not have the other region's rate, and will not
+  // invent a multiplier for it.
+  const pricedRegion = selectedType?.price_basis_region;
+  const priceRegionMismatch =
+    !!pricedRegion && !!region && regionOfZone(region) !== pricedRegion;
+
   const outOfCapacity =
     !!selectedType && selectedType.regions_with_capacity.length === 0;
   const scratchOnly = filesystem === SCRATCH_ONLY;
+  // The zone trap, and the reason the docs lead with it: a volume can only
+  // attach in its own zone, and GPU capacity varies by zone - so data can
+  // sit in a zone where the GPU you want is unavailable. Neither side is
+  // moved silently; the user picks which one to change.
+  const volumeZoneHasNoCapacity =
+    !!selectedVolume &&
+    !!selectedType &&
+    !selectedType.regions_with_capacity.includes(selectedVolume.zone);
   const canLaunch =
-    !!instanceType && !!region && !!filesystem && !outOfCapacity;
+    !!instanceType &&
+    !!region &&
+    !!filesystem &&
+    !outOfCapacity &&
+    !volumeZoneHasNoCapacity;
 
   async function submit(e: React.FormEvent) {
     e.preventDefault();
@@ -295,37 +622,33 @@ export function LaunchForm({ onLaunched }: { onLaunched: () => void }) {
 
       {provider === "gcp" && Object.keys(types).length > 0 && (
         <div className="mb-4 space-y-2">
-          <p className="rounded-lg border border-zinc-200 bg-zinc-50 px-3 py-2 text-[11px] leading-relaxed text-zinc-600">
+          <p className={QUOTA_NEUTRAL}>
             {Object.values(types).find((t) => t.price_basis)?.price_basis}
-            {" "}Launches are scratch-only for now (no persistent
-            filesystems on GCP yet).
+            {priceRegionMismatch ? (
+              <>
+                {" "}You have {regionOfZone(region)} selected, and Google
+                prices per region - Manifold does not have that
+                region&rsquo;s rate.
+              </>
+            ) : null}
+            {" "}A data volume gives a GCP box a persistent home at
+            /lambda/nfs/&lt;name&gt;; without one everything on the instance
+            is deleted when it terminates.
           </p>
-          {gcpQuota && (
-            <p className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-[11px] leading-relaxed text-amber-800">
-              {(() => {
-                const rows = gcpQuota.quotas.filter(
-                  (q) => q.scope !== "global" && q.limit > 0);
-                const global = gcpQuota.quotas.find(
-                  (q) => q.metric === "GPUS_ALL_REGIONS");
-                if (global && global.limit === 0)
-                  return "Your project's global GPU quota is 0, so no GPU launch can succeed yet. ";
-                if (rows.length === 0)
-                  return "No regional GPU quota here yet. ";
-                return `GPU quota here: ${rows
-                  .map((q) => `${q.metric} ${q.usage}/${q.limit}`)
-                  .join(", ")}. `;
-              })()}
-              <a
-                className="underline"
-                href={gcpQuota.request_url}
-                target="_blank"
-                rel="noreferrer"
-              >
-                Request an increase
-              </a>{" "}
-              - Google usually answers small requests in minutes to hours.
+          {volumesFailed ? (
+            <p className={QUOTA_NEUTRAL}>
+              Manifold could not read this project&rsquo;s data volumes just
+              now, so it is not saying you have none - it is saying it could
+              not ask. Launching without one is still scratch-only.
             </p>
-          )}
+          ) : null}
+          <GcpQuotaNote
+            gate={quotaGate}
+            failed={gcpQuotaFailed}
+            typeName={instanceType}
+            need={selectedType?.specs.gpus ?? 0}
+            requestUrl={gcpQuota?.request_url}
+          />
         </div>
       )}
 
@@ -386,22 +709,36 @@ export function LaunchForm({ onLaunched }: { onLaunched: () => void }) {
           </select>
         </label>
         <label className="block text-xs font-medium text-zinc-600">
-          3. Filesystem
+          {isGcp ? "3. Data volume" : "3. Filesystem"}
           <select
             className={`${field} mt-1`}
             value={filesystem}
             onChange={(e) => setFilesystem(e.target.value)}
           >
-            {filesystemsInRegion.map((f) => (
-              <option key={f.name} value={f.name}>
-                {f.name}
-              </option>
-            ))}
+            {isGcp
+              ? volumes.map((v) => {
+                  const blocked = volumeBlocker(v);
+                  return (
+                    <option key={v.name} value={v.name} disabled={!!blocked}>
+                      {v.name} · {v.size_gb} GiB · {v.zone}
+                      {blocked ? ` · ${blocked}` : ""}
+                    </option>
+                  );
+                })
+              : filesystemsInRegion.map((f) => (
+                  <option key={f.name} value={f.name}>
+                    {f.name}
+                  </option>
+                ))}
             <option value={SCRATCH_ONLY}>
               None - scratch only
-              {filesystemsInRegion.length === 0
-                ? " (no filesystem in this region)"
-                : ""}
+              {isGcp
+                ? volumes.length === 0 && !volumesFailed
+                  ? " (no volumes in this project)"
+                  : ""
+                : filesystemsInRegion.length === 0
+                  ? " (no filesystem in this region)"
+                  : ""}
             </option>
           </select>
         </label>
@@ -497,6 +834,23 @@ export function LaunchForm({ onLaunched }: { onLaunched: () => void }) {
           </span>
         </label>
       </div>
+
+      {/* The three things about a volume that are not true of a filesystem,
+          said where the choice is made rather than in a doc. */}
+      {selectedVolume ? (
+        <p className="mt-2 text-[11px] text-zinc-500">
+          {selectedVolume.name} mounts at {selectedVolume.mount_point} and
+          survives this instance. It is zonal, so the zone above is locked to{" "}
+          {selectedVolume.zone}; only one volume attaches per instance; and it
+          bills for its full {selectedVolume.size_gb} GiB whether an instance
+          is attached or not (about $
+          {selectedVolume.list_price_usd_per_month.toFixed(2)}/month at
+          Google&rsquo;s list price).
+          {selectedVolume.formatted_at
+            ? ""
+            : " Manifold formats it on first use, before this launch reports ready."}
+        </p>
+      ) : null}
 
       {/* Extra filesystems: deliberately quiet and below the main grid. One
           filesystem is the normal launch; this row exists for the run that
@@ -606,6 +960,14 @@ export function LaunchForm({ onLaunched }: { onLaunched: () => void }) {
             <span className="text-amber-700">
               {selectedType.description} is out of capacity everywhere right
               now. Pick another GPU, or set a capacity watch below.
+            </span>
+          ) : volumeZoneHasNoCapacity ? (
+            <span className="text-amber-700">
+              {selectedVolume!.name} lives in {selectedVolume!.zone}, and{" "}
+              {instanceType} is not available there. A volume can only attach
+              in its own zone, so pick a GPU this zone has, or launch without
+              the volume - Manifold will not quietly move the zone and leave
+              your data behind.
             </span>
           ) : scratchOnly ? (
             <span className="text-amber-700">

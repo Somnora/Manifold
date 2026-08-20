@@ -108,11 +108,37 @@ export type InstanceTypeInfo = {
   // Present when the price is a dated list price rather than a live meter
   // (GCP v1). The string IS the honesty label; show it near the number.
   price_basis?: string;
+  // The region price_basis is quoted in ("us-central1"), as a field so no
+  // screen has to parse it out of that sentence. GCP only.
+  price_basis_region?: string;
+  // The provider quota metric a launch of this shape is gated on
+  // ("NVIDIA_T4_GPUS"). GCP only, and absent for a shape whose gating
+  // metric is unknown - never guessed from the GPU name.
+  quota_metric?: string;
   specs: { vcpus: number; memory_gib: number; storage_gib: number; gpus: number };
   regions_with_capacity: string[];
 };
 
 export type Region = { code: string; name: string };
+
+// One provider quota row, verbatim: `scope` is "global" or the region
+// Google reported it for, and limit/usage are Google's own numbers.
+export type GcpQuotaRow = {
+  metric: string;
+  limit: number;
+  usage: number;
+  scope: string;
+};
+
+export type GcpQuota = {
+  quotas: GcpQuotaRow[];
+  project: string;
+  // Absent when the backend has no project id to name in the link. A quota
+  // console URL without one opens whichever project the browser used last,
+  // which is not the project these rows describe.
+  request_url?: string;
+  mock?: boolean;
+};
 
 export type ModelPreset = {
   label: string;
@@ -138,6 +164,36 @@ export type Filesystem = {
   mount_point: string;
   is_in_use: boolean;
   bytes_used: number;
+};
+
+// A GCP data volume (Phase 112): a Persistent Disk that outlives the
+// instance it is attached to, mounted at /lambda/nfs/<name>.
+//
+// Deliberately NOT a Filesystem. There is no bytes_used and there never
+// will be one from this route: nothing outside the instance can read a
+// detached disk, and a 0 here would claim it is empty. `size_gb` is what
+// was provisioned, which is also what bills. `zone` is not `region` because
+// a Persistent Disk is zonal: it can only attach from its own zone.
+export type Volume = {
+  name: string;
+  zone: string;
+  size_gb: number;
+  status: string | null;
+  // Instance ids GCE reports as holding this disk. A PD attaches to ONE
+  // instance at a time, so a non-empty list means a launch will be refused.
+  attached_to: string[];
+  mount_point: string;
+  list_price_usd_per_month: number;
+  // Whether Manifold holds its own row for this disk. False means it was
+  // created outside Manifold (or the data dir was replaced): it will not be
+  // formatted and will not be mounted, because neither is safe on a disk
+  // whose history is unknown.
+  known_to_manifold: boolean;
+  // Present only when known_to_manifold. formatted_at null = never
+  // formatted, which is what permits exactly one format.
+  created_at?: string;
+  formatted_at?: string | null;
+  fstype?: string | null;
 };
 
 export type Instance = {
@@ -242,12 +298,19 @@ export type Launch = {
   error: string | null;
   lambda_instance_id: string | null;
   launched_at: string | null;
+  // Phase 110: the first moment SSH answered. Not the same fact as
+  // active_at - a stock-Ubuntu GCE box is reachable minutes before its
+  // drivers and runtime are installed. Null means we never saw it connect.
+  connected_at?: string | null;
   active_at: string | null;
   terminated_at: string | null;
   // Structured progress (backend-computed; see launch_progress).
   phase?: string;
   phase_detail?: string;
   settled?: boolean;
+  // The boot countdown, present only while the instance is still coming up
+  // on the provider. Once connected_at is set that deadline is past and
+  // these stop being sent; phase_detail carries the setup step instead.
   boot_elapsed_seconds?: number;
   boot_timeout_seconds?: number;
   boot_remaining_seconds?: number;
@@ -753,12 +816,10 @@ export const api = {
 
   // Phase 87: the number that actually gates a first GCP launch. Fresh
   // projects hold ZERO GPU quota, so the form shows it before the click.
+  // Every row the provider returned, unfiltered; the caller decides which
+  // of them can gate the launch it is about to make.
   gcpQuota: (region?: string) =>
-    request<{
-      quotas: { metric: string; limit: number; usage: number; scope: string }[];
-      project: string;
-      request_url: string;
-    }>(`/gcp/quota${region ? `?region=${region}` : ""}`),
+    request<GcpQuota>(`/gcp/quota${region ? `?region=${region}` : ""}`),
 
   createFilesystem: (name: string, region: string) =>
     request<Filesystem>("/filesystems", {
@@ -769,6 +830,26 @@ export const api = {
   filesystems: () =>
     request<{ filesystems: Filesystem[] }>("/filesystems").then(
       (r) => r.filesystems,
+    ),
+
+  // Sourced from Google, with Manifold's own row as an overlay: a disk
+  // bills for its provisioned size whether attached or not, so a list built
+  // from local state would let one bill invisibly forever.
+  volumes: () =>
+    request<{ volumes: Volume[]; price_basis: string }>("/volumes"),
+
+  createVolume: (name: string, zone: string, sizeGb: number) =>
+    request<Volume>("/volumes", {
+      method: "POST",
+      body: JSON.stringify({ name, zone, size_gb: sizeGb }),
+    }),
+
+  // confirm_name is the whole safety mechanism: there is no rescue path for
+  // a volume, and Manifold cannot read a detached disk to say what is lost.
+  deleteVolume: (name: string, confirmName: string) =>
+    request<{ deleted: string; zone: string; size_gb: number }>(
+      `/volumes/${encodeURIComponent(name)}?confirm_name=${encodeURIComponent(confirmName)}`,
+      { method: "DELETE" },
     ),
 
   deleteFilesystem: (name: string, confirmName: string) =>

@@ -69,6 +69,7 @@ from .auth import (
     valid_principal_name,
 )
 from . import localmodels
+from . import volumes
 from .dispatcher import Dispatcher, ParameterError, coerce_parameters
 from .model_client import MockModelClient, ModelClientError
 from .notifications import NotificationCenter, os_notify
@@ -346,6 +347,14 @@ class TaskRequest(BaseModel):
 class CreateFilesystemRequest(BaseModel):
     name: str
     region: str
+
+
+class CreateVolumeRequest(BaseModel):
+    """A GCP data volume (Phase 112). `zone` and not `region`: a Persistent
+    Disk is zonal and can only attach to an instance in its own zone."""
+    name: str
+    zone: str
+    size_gb: int
 
 
 class WatchRequest(BaseModel):
@@ -733,7 +742,17 @@ def create_app(
     providers = ProviderRegistry()
     providers.register('lambda', LambdaProvider(lambda_client))
     if mock:
-        providers.register('gcp', MockGCPProvider())
+        mock_gcp = MockGCPProvider()
+        providers.register('gcp', mock_gcp)
+        # The demo disk needs Manifold's OWN row to be usable. Without one
+        # it lists as "not created by Manifold - unusable here" and the
+        # launch form disables it, so the zero-credential demo opened on the
+        # blocker the fixture exists to avoid. Mock only (this writes to the
+        # '<stem>-mock.db' the branch above derived), and idempotent.
+        for _name, _disk in mock_gcp.volumes.items():
+            if db.get_volume(_name) is None:
+                db.create_volume(name=_name, zone=_disk["zone"],
+                                 size_gb=int(_disk["size_gb"]))
     else:
         def _local_public_key(_settings=settings) -> str:
             """The local SSH public key, for GCE instance metadata.
@@ -1367,11 +1386,37 @@ def create_app(
             known = ", ".join(sorted(n for n, _ in orchestrator.providers.items()))
             raise HTTPException(
                 422, f"Unknown provider '{provider}'. Registered: {known}.")
-        specs = await cloud.list_instance_types()
+        # Same translation /launch-options and /gcp/quota already do. Without
+        # it a provider that cannot answer - an ADC whose refresh token aged
+        # out is the ordinary case - propagates out of the route as a bare
+        # 500, and the launch form renders the whole panel as "HTTP 500".
+        # The provider layer has already written the sentence that fixes it
+        # ("Run `gcloud auth application-default login`... nothing else needs
+        # changing"); throwing that away and showing a status code instead is
+        # the same failure as an empty list standing in for an unasked
+        # question. Reported by the owner from the front page, 2026-08-19.
+        try:
+            specs = await cloud.list_instance_types()
+        except ProviderUnavailable as exc:
+            raise HTTPException(503, str(exc))
+        except ProviderError as exc:
+            raise HTTPException(502, str(exc))
         basis = ""
+        basis_region = ""
+        quota_metrics: dict[str, str] = {}
         if provider == "gcp":
-            from .providers.gcp_catalog import PRICE_BASIS
-            basis = PRICE_BASIS
+            from .providers import gcp_catalog
+            basis = gcp_catalog.PRICE_BASIS
+            basis_region = gcp_catalog.PRICE_BASIS_REGION
+            # The regional quota metric each shape is gated on, joined by
+            # catalog name. Structured, because the alternative is the
+            # client re-deriving it from a display string or keeping its own
+            # copy of the accelerator -> metric table, and a second copy
+            # drifts from gcp_catalog.quota_metric the first time Google
+            # adds a family. A shape that is not on the shelf gets NO
+            # metric: absent, never guessed.
+            quota_metrics = {e.name: gcp_catalog.quota_metric(e)
+                             for e in gcp_catalog.SHELF}
         return {
             t.name: {
                 "description": t.description,
@@ -1382,6 +1427,13 @@ def create_app(
                 # Dated list price, not a live meter: the label rides every
                 # entry so no screen can show the number without it.
                 **({"price_basis": basis} if basis else {}),
+                # The region that price is quoted in, as a field rather than
+                # a sentence, so a screen can tell whether the selected zone
+                # is the one being priced.
+                **({"price_basis_region": basis_region} if basis_region
+                   else {}),
+                **({"quota_metric": quota_metrics[t.name]}
+                   if t.name in quota_metrics else {}),
                 # storage size is not part of the cross-provider spec;
                 # 0 is honest here where a guess would not be.
                 "specs": {"vcpus": t.vcpus, "memory_gib": t.ram_gb,
@@ -1413,11 +1465,35 @@ def create_app(
 
         Fresh projects hold ZERO GPU quota, and that - not code - is what
         blocks a first GCP launch. The launch form shows this number before
-        the click; the error after the click links the request page."""
+        the click; the error after the click links the request page.
+
+        Every GPU row Google returned comes back unfiltered - an agent
+        asking this question wants the whole answer, and the console link
+        opens the same list. Which rows can actually gate a launch is the
+        caller's judgement, not this route's."""
         cloud = orchestrator.providers.get_provider("gcp")
+        # An UNCONFIGURED project first, because that is the path that
+        # actually happens: a Lambda-only install still has a real
+        # RealGCPProvider registered, so it has a gpu_quota method, and that
+        # method returns [] without asking Google when there is no project
+        # id. The 503 below never fired for it and the route answered
+        # `{"quotas": [], "project": ""}` - an empty list standing in for a
+        # question nobody asked, which is what this pair of checks exists to
+        # stop. unconfigured_reason() is the sentence that fixes it.
+        reason = getattr(cloud, "unconfigured_reason", lambda: None)()
+        if reason:
+            raise HTTPException(503, reason)
         fetch = getattr(cloud, "gpu_quota", None)
         if fetch is None:
-            return {"quotas": [], "project": ""}
+            # A provider that cannot read quota must not answer with zero.
+            # `{"quotas": []}` is indistinguishable from "Google says you
+            # hold none", and that reading turns a healthy project into a
+            # blocker on the launch form. 503 is what the credential-less
+            # path already returns, and callers already handle it.
+            raise HTTPException(
+                503,
+                "This Google Cloud provider cannot read quota, so Manifold "
+                "cannot say what the project holds.")
         from .providers.gcp_catalog import zone_to_region
         target = zone_to_region(region) if region else "us-central1"
         try:
@@ -1426,11 +1502,17 @@ def create_app(
             raise HTTPException(503, str(exc))
         except ProviderError as exc:
             raise HTTPException(502, str(exc))
-        return {"quotas": rows,
-                "project": getattr(cloud, "project_id", ""),
-                "request_url": (
-                    f"https://console.cloud.google.com/iam-admin/quotas"
-                    f"?project={getattr(cloud, 'project_id', '')}")}
+        project = getattr(cloud, "project_id", "")
+        # Agents act on this data: fixture rows must be self-identifying.
+        out = {"quotas": rows, "project": project, "mock": mock}
+        if project:
+            # Without a project id there is no honest link to give: that URL
+            # lands on whichever project the browser used last, which is not
+            # the one these numbers describe.
+            out["request_url"] = (
+                f"https://console.cloud.google.com/iam-admin/quotas"
+                f"?project={project}")
+        return out
 
     @app.get("/launch-options")
     async def launch_options_route(provider: str | None = None):
@@ -1456,9 +1538,15 @@ def create_app(
             types = await lambda_client.list_instance_types()
             filesystems = await lambda_client.list_filesystems()
         else:
-            # Persistent filesystems are a Lambda feature, and request_launch
-            # refuses one on any other provider - so every target here is
-            # honestly scratch-only rather than pretending co-location.
+            # DELIBERATELY EMPTY, still (Phase 112). GCP now has persistent
+            # storage - data volumes - but a target row carries
+            # filesystem_bytes_used, and a Persistent Disk cannot report one
+            # from outside the instance: a 0 there would assert "empty"
+            # about a disk that may be full, and the ranking would then sort
+            # on that invention. So GCP targets stay honestly storage-less
+            # and a caller that wants a volume reads GET /volumes and passes
+            # the name itself. Making these rows volume-aware needs a target
+            # shape that can say "size unknown" first.
             filesystems = []
             try:
                 specs = await cloud.list_instance_types()
@@ -2747,11 +2835,21 @@ def create_app(
                           dest: str = Form("inbox/")):
         """Upload a local file to the instance over SFTP. `dest` ending in
         '/' is a directory (keeps the original filename); relative paths
-        land on the persistent filesystem."""
+        land on the persistent filesystem, and are REFUSED when that path is
+        not a mounted filesystem right now."""
         conn = _connected(instance_id)
         target = dest + (file.filename or "upload.bin") if dest.endswith("/") \
             else dest
         remote = _resolve_remote_path(instance_id, target)
+        # The third write site under /lambda/nfs/<name>, guarded like the
+        # other two. sftp_write makedirs the parent, so without this the
+        # upload CREATES the mount point on the boot disk: the bytes die with
+        # the instance while the audit row below records a durable location,
+        # and the volume can never be mounted on that box again.
+        await orchestrator.assert_mounted_path(
+            instance_id, remote,
+            refusal=("Nothing was uploaded and nothing was lost: the file "
+                     "is still on your machine."))
 
         async def chunks():
             while True:
@@ -2858,7 +2956,20 @@ def create_app(
     @app.get("/instances/{instance_id}/files/list")
     async def fs_list(instance_id: str, root_name: str = "persistent",
                       path: str = ""):
-        """One directory level, served by the sidecar (local disk speed)."""
+        """One directory level, served by the sidecar (local disk speed).
+
+        Under the persistent root the volume's mount is asserted first: an
+        instance's `filesystems` list means ATTACHED on GCP, not mounted, so
+        without this an unmounted volume lists the empty boot-disk directory
+        and answers "zero entries" for a disk that may be full. That is an
+        empty list standing in for a failed question, and no caller can tell
+        it from the real thing."""
+        if root_name == "persistent":
+            await orchestrator.assert_mounted_path(
+                instance_id, f"{volumes.MOUNT_ROOT}/{path.strip('/')}",
+                refusal=("Nothing was listed: an empty answer from that path "
+                         "would have said the volume holds nothing, when in "
+                         "fact Manifold never looked at it."))
         try:
             return await _sidecar_or_409(instance_id).list_dir(root_name, path)
         except SidecarError as exc:
@@ -2867,7 +2978,18 @@ def create_app(
     @app.get("/instances/{instance_id}/files/usage")
     async def fs_usage(instance_id: str, root_name: str = "persistent",
                        path: str = ""):
-        """Recursive child sizes, heaviest first — the cleanup view."""
+        """Recursive child sizes, heaviest first — the cleanup view.
+
+        Mount asserted for the same reason fs_list asserts it, with a
+        sharper edge: this view exists to decide what to DELETE. An
+        unmounted volume measures the empty boot-disk directory and reports
+        a volume with nothing worth keeping in it."""
+        if root_name == "persistent":
+            await orchestrator.assert_mounted_path(
+                instance_id, f"{volumes.MOUNT_ROOT}/{path.strip('/')}",
+                refusal=("Nothing was measured: sizes from that path would "
+                         "have described the boot disk, not the volume, and "
+                         "this is the view people delete from."))
         try:
             return await _sidecar_or_409(instance_id).usage(root_name, path)
         except SidecarError as exc:
@@ -2877,7 +2999,20 @@ def create_app(
     async def fs_delete(instance_id: str, root_name: str, path: str,
                         recursive: bool = False):
         """Delete a file or directory on the instance. Destructive and
-        audited; directories require recursive=true (the UI confirms)."""
+        audited; directories require recursive=true (the UI confirms).
+
+        The mount assertion matters most here, because this route both
+        destroys and reports success. Against an unmounted volume it would
+        delete whatever the boot disk happens to hold at that path and
+        answer as though the volume had been cleaned - so somebody freeing
+        space would free none, be told it worked, and find the volume just
+        as full next time. Refusing is the only honest answer available."""
+        if root_name == "persistent":
+            await orchestrator.assert_mounted_path(
+                instance_id, f"{volumes.MOUNT_ROOT}/{path.strip('/')}",
+                refusal=("Nothing was deleted: that path is not the volume "
+                         "right now, so the delete would have hit the boot "
+                         "disk and reported the volume cleaned."))
         try:
             result = await _sidecar_or_409(instance_id).delete_path(
                 root_name, path, recursive
@@ -2896,12 +3031,23 @@ def create_app(
     async def fs_archive(instance_id: str, path: str):
         """Download a whole directory as one .tar.gz: tar runs ON the
         instance (compression where bandwidth is cheap), the archive is
-        streamed down over SFTP, and the temp file is removed after."""
+        streamed down over SFTP, and the temp file is removed after.
+
+        Mount asserted because of what this archive is FOR: people take one
+        before terminating a box. Against an unmounted volume it would tar
+        the empty boot-disk directory and hand back a valid, well-formed,
+        empty archive of the data they were trying to save - and they would
+        have no way to tell until they needed it."""
         import hashlib
         import posixpath
         from fastapi.responses import StreamingResponse
         conn = _connected(instance_id)
         remote = _resolve_remote_path(instance_id, path)
+        await orchestrator.assert_mounted_path(
+            instance_id, remote,
+            refusal=("Nothing was archived: that path is not the volume "
+                     "right now, so the archive would have held the boot "
+                     "disk's contents under the volume's name."))
         parent, name = posixpath.dirname(remote), posixpath.basename(remote)
         if not name:
             raise HTTPException(400, "cannot archive a filesystem root")
@@ -4032,8 +4178,10 @@ def create_app(
     async def list_launches():
         now = utcnow()
         boot_timeout = settings.launch.boot_timeout_seconds
+        provisioning = settings.launch.provisioning_timeout_seconds
         return {"launches": [
-            launch_progress(l, boot_timeout, now) for l in db.list_launches()
+            launch_progress(l, boot_timeout, now, provisioning)
+            for l in db.list_launches()
         ]}
 
     @app.get("/launches/{launch_id}")
@@ -4042,7 +4190,8 @@ def create_app(
         if launch is None:
             raise HTTPException(404, f"launch {launch_id} not found")
         return launch_progress(
-            launch, settings.launch.boot_timeout_seconds, utcnow()
+            launch, settings.launch.boot_timeout_seconds, utcnow(),
+            settings.launch.provisioning_timeout_seconds,
         )
 
     @app.get("/launches/{launch_id}/wait")
@@ -4057,7 +4206,8 @@ def create_app(
         if launch is None:
             raise HTTPException(404, f"launch {launch_id} not found")
         return launch_progress(
-            launch, settings.launch.boot_timeout_seconds, utcnow()
+            launch, settings.launch.boot_timeout_seconds, utcnow(),
+            settings.launch.provisioning_timeout_seconds,
         )
 
     # -- cost/utilization intelligence (read-only; advisory) -----------------------
@@ -4374,6 +4524,46 @@ def create_app(
         there is no rescue path for a whole filesystem."""
         return await orchestrator.delete_filesystem(
             name, confirm_name=confirm_name)
+
+    # -- GCP data volumes (Phase 112) ------------------------------------------------
+    #
+    # Deliberately NOT part of /filesystems. That route is Lambda's registry
+    # and every field on it (mount_point from Lambda, is_in_use, bytes_used)
+    # is something Lambda can answer and a detached Persistent Disk cannot.
+    # A volume that appeared there carrying bytes_used=0 would assert "empty"
+    # about a disk that may be full, which is the truthful-or-absent rule's
+    # exact forbidden move. Volumes get their own route, their own fields,
+    # and no invented ones. `_storage_for` will 404 a volume name for the
+    # same reason - an honest refusal, not a gap.
+
+    @app.get("/volumes")
+    async def list_volumes():
+        body = await orchestrator.list_volumes()
+        # Self-identifying fixture state, like every sibling route: an agent
+        # in the zero-spend demo would otherwise report disks billing at
+        # $10-20/month that do not exist.
+        body["mock"] = mock
+        return body
+
+    @app.post("/volumes", status_code=201)
+    async def create_volume(req: CreateVolumeRequest):
+        """Create a GCP data volume: a Persistent Disk that survives the
+        instances it is attached to, mounted at /lambda/nfs/<name>.
+
+        Creation bills immediately and by PROVISIONED size, attached or
+        not - unlike a Lambda filesystem, which bills by what it holds."""
+        return await orchestrator.create_volume(
+            req.name, req.zone, req.size_gb, caller=current_principal())
+
+    @app.delete("/volumes/{name}")
+    async def delete_volume(name: str, confirm_name: str = ""):
+        """Permanently delete a data volume. Refuses while GCE reports it
+        attached, and (428) until confirm_name repeats the exact name. No
+        force flag: there is no rescue path for a whole volume, and
+        Manifold cannot even read a detached disk to tell you what is on
+        it."""
+        return await orchestrator.delete_volume(
+            name, confirm_name=confirm_name, caller=current_principal())
 
     async def _storage_for(filesystem: str) -> StorageClient:
         filesystems = {fs.name: fs for fs in await lambda_client.list_filesystems()}

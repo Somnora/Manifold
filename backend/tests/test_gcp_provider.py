@@ -59,6 +59,9 @@ def test_gpu_description_matches_the_hardware_guide_families():
 def test_zone_to_region():
     assert gcp_catalog.zone_to_region("us-central1-a") == "us-central1"
     assert gcp_catalog.zone_to_region("europe-west4-b") == "europe-west4"
+    # Already a region: unchanged. Blind rsplit made this "us", which then
+    # travelled as a quota row's scope - a place Google does not have.
+    assert gcp_catalog.zone_to_region("us-central1") == "us-central1"
 
 
 # -- the provider, with the SDK faked ----------------------------------------
@@ -112,12 +115,17 @@ async def test_catalog_failure_degrades_to_empty_not_invented(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_launch_refuses_filesystems_and_unknown_types():
+async def test_launch_refuses_a_second_volume_and_unknown_types():
+    """Phase 112 replaced the blanket scratch-only refusal with the rule
+    that actually holds: ONE data volume per instance. A Persistent Disk
+    attaches to one machine at a time and Manifold mounts one persistent
+    home, so a second name is refused here as well as at admission. Both
+    refusals land before the SDK is ever touched."""
     p = configured(public_key_fn=lambda: "ssh-ed25519 AAAA test")
     with pytest.raises(ProviderError) as exc:
         await p.launch_instance("us-central1-a", "g2-standard-4",
-                                [], ["somefs"])
-    assert "scratch-only" in str(exc.value)
+                                [], ["vol-a", "vol-b"])
+    assert "at most one data volume" in str(exc.value)
     with pytest.raises(ProviderError) as exc:
         await p.launch_instance("us-central1-a", "gpu_1x_a10", [], [])
     assert "not on the GCP shelf" in str(exc.value)
@@ -176,15 +184,17 @@ async def test_terminate_of_a_missing_instance_is_idempotent(monkeypatch):
 # -- the seams (mock mode / test app) ----------------------------------------
 
 
-def test_gcp_launch_with_filesystem_is_refused_before_money(client):
-    """The orchestrator refuses provider+filesystem combinations before a
-    launch row exists - the message names the fix, not a stack trace."""
+def test_gcp_launch_with_a_volume_is_refused_before_money(client):
+    """Phase 112 opened this door for GCP volumes; it did not open it for a
+    project nobody has set up. The refusal still lands before a launch row
+    exists, and it names the command that fixes it rather than a stack
+    trace or a disk error."""
     resp = client.post("/instances", json={
         "provider": "gcp", "instance_type": "g2-standard-4",
         "region": "us-central1-a", "filesystem": "manifold-data",
     })
     assert resp.status_code == 400
-    assert "scratch-only" in resp.json()["detail"]
+    assert "gcloud auth application-default login" in resp.json()["detail"]
 
 
 def test_regions_are_provider_scoped(client):
@@ -196,10 +206,37 @@ def test_regions_are_provider_scoped(client):
     assert gcp == []
 
 
-def test_quota_route_survives_an_unconfigured_provider(client):
+def test_an_unconfigured_project_refuses_instead_of_answering_none(client):
+    """REVERSED from what this test asserted before (it pinned 200 with
+    `{"quotas": []}` as correct, which was the bug wearing a test's clothes).
+
+    Phase 111 added a 503 for a provider with no gpu_quota method - but in
+    real mode RealGCPProvider is registered unconditionally, always HAS that
+    method, and the method returns [] without contacting Google when there
+    is no project id. So every Lambda-only install got
+    `200 {"quotas": [], "project": ""}`: an empty list standing in for a
+    question nobody asked, which the launch form can only render as "Google
+    says you hold zero GPUs". The provider already knew the honest sentence
+    (unconfigured_reason); the route just never asked it."""
     resp = client.get("/gcp/quota")
-    assert resp.status_code == 200
-    assert resp.json()["quotas"] == []
+    assert resp.status_code == 503
+    assert "gcloud auth application-default login" in resp.json()["detail"]
+    assert "quotas" not in resp.json()
+
+
+def test_a_provider_that_cannot_read_quota_says_so_instead_of_zero(client):
+    """Phase 111. `{"quotas": []}` is indistinguishable from "Google says
+    you hold zero GPUs", and the launch form could only render it as the
+    amber blocker - on a project with ample quota. A provider with no quota
+    support must refuse to answer, not answer with a number."""
+    class QuotalessProvider:
+        pass
+
+    client.app.state.orchestrator.providers.register("gcp",
+                                                     QuotalessProvider())
+    resp = client.get("/gcp/quota")
+    assert resp.status_code == 503
+    assert "cannot say" in resp.json()["detail"]
 
 
 def test_catalog_carries_the_price_label_for_gcp_only(client):
@@ -207,6 +244,59 @@ def test_catalog_carries_the_price_label_for_gcp_only(client):
     label, and Lambda's live prices must never grow one."""
     lam = client.get("/instance-types").json()
     assert all("price_basis" not in t for t in lam.values())
+    # Same for the two fields the launch form joins quota rows on: they are
+    # GCP facts, and Lambda must never grow a hand-written one.
+    assert all("quota_metric" not in t for t in lam.values())
+    assert all("price_basis_region" not in t for t in lam.values())
+
+
+# -- mock mode: the zero-credential demo ---------------------------------------
+
+
+def mock_mode_client(tmp_path, monkeypatch):
+    """A TestClient over a mock-mode app - where GCP is MockGCPProvider and
+    the catalog is non-empty, which the unconfigured real provider is not."""
+    from fastapi.testclient import TestClient
+    from app.main import create_app
+    from tests.conftest import make_settings
+
+    monkeypatch.delenv("MANIFOLD_MOCK_FORCE", raising=False)
+    return TestClient(create_app(make_settings(tmp_path), mock=True))
+
+
+def test_gcp_catalog_carries_its_quota_metric_and_price_region(tmp_path,
+                                                               monkeypatch):
+    """Phase 111. The launch form joins quota rows to the selected GPU on
+    these two fields. Structured, because the alternative is the client
+    parsing "us-central1" out of a prose sentence or keeping a second copy
+    of the accelerator -> metric table that drifts from gcp_catalog."""
+    with mock_mode_client(tmp_path, monkeypatch) as c:
+        types = c.get("/instance-types?provider=gcp").json()
+        assert types, "mock GCP must offer a catalog"
+        shelf = types["n1-standard-8-t4"]
+        assert shelf["quota_metric"] == "NVIDIA_T4_GPUS"
+        assert shelf["price_basis_region"] == gcp_catalog.PRICE_BASIS_REGION
+        assert gcp_catalog.PRICE_BASIS_REGION in shelf["price_basis"]
+        # A shape the shelf does not carry has NO metric rather than one
+        # guessed from its GPU name: the form renders that as "cannot tell".
+        assert "quota_metric" not in types["g2-standard-12"]
+
+
+def test_mock_quota_is_roomy_and_says_it_is_fixture(tmp_path, monkeypatch):
+    """Phase 111. Mock mode had no gpu_quota at all, so the flagship
+    zero-spend demo opened on "no regional GPU quota here yet" with a dead
+    request link. Fixture rows now answer, and say they are fixture."""
+    with mock_mode_client(tmp_path, monkeypatch) as c:
+        body = c.get("/gcp/quota?region=us-central1-a").json()
+        assert body["mock"] is True
+        rows = {q["metric"]: q for q in body["quotas"]}
+        glob = rows["GPUS_ALL_REGIONS"]
+        assert glob["scope"] == "global"
+        assert glob["limit"] - glob["usage"] >= 8
+        t4 = rows["NVIDIA_T4_GPUS"]
+        # Scope is the region asked for, spelled the way Google spells it.
+        assert t4["scope"] == "us-central1"
+        assert t4["limit"] - t4["usage"] >= 1
 
 
 @pytest.mark.asyncio
