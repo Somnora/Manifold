@@ -1386,7 +1386,21 @@ def create_app(
             known = ", ".join(sorted(n for n, _ in orchestrator.providers.items()))
             raise HTTPException(
                 422, f"Unknown provider '{provider}'. Registered: {known}.")
-        specs = await cloud.list_instance_types()
+        # Same translation /launch-options and /gcp/quota already do. Without
+        # it a provider that cannot answer - an ADC whose refresh token aged
+        # out is the ordinary case - propagates out of the route as a bare
+        # 500, and the launch form renders the whole panel as "HTTP 500".
+        # The provider layer has already written the sentence that fixes it
+        # ("Run `gcloud auth application-default login`... nothing else needs
+        # changing"); throwing that away and showing a status code instead is
+        # the same failure as an empty list standing in for an unasked
+        # question. Reported by the owner from the front page, 2026-08-19.
+        try:
+            specs = await cloud.list_instance_types()
+        except ProviderUnavailable as exc:
+            raise HTTPException(503, str(exc))
+        except ProviderError as exc:
+            raise HTTPException(502, str(exc))
         basis = ""
         basis_region = ""
         quota_metrics: dict[str, str] = {}

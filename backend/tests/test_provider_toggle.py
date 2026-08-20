@@ -511,3 +511,29 @@ def test_a_flip_takes_effect_on_the_very_next_launch(client, mock_client):
     assert second.status_code == 202, second.text
     assert second.json()["launch"]["provider"] == "gcp"
     assert len(gcp.instances) == 1
+
+
+def test_a_catalog_that_cannot_be_read_says_the_fix_not_http_500(client):
+    """The launch form's FIRST call is the catalog, so this route decides
+    what the whole panel says when Google cannot be reached.
+
+    `_catalog_for` called the provider with no translation, so an expired
+    ADC - the ordinary case, refresh tokens age out - left ProviderUnavailable
+    to propagate as a bare 500, and the form rendered its entire body as the
+    string "HTTP 500". The provider layer had already written the sentence
+    that fixes it; the route threw it away. Reported by the owner from the
+    front page on 2026-08-19 and reproduced against a credential-less
+    backend.
+    """
+    client.app.state.orchestrator.providers.register("gcp",
+                                                     _UnreadableCatalog())
+
+    for route in ("/instance-types?provider=gcp", "/gpu-guide?provider=gcp"):
+        resp = client.get(route)
+        assert resp.status_code == 503, f"{route}: {resp.text}"
+        # The one command that fixes it survives the trip intact.
+        assert resp.json()["detail"] == _UnreadableCatalog.FIX
+
+    # Lambda's catalog is untouched: one cloud being unreachable must not
+    # take the other one's launch form down with it.
+    assert client.get("/instance-types").status_code == 200
