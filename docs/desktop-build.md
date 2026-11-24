@@ -69,8 +69,8 @@ manifold-backend` is a complete standalone product - run it (optionally
 
 ## CI
 
-`.github/workflows/desktop.yml` builds the .dmg (macos-14/arm64) and .msi
-(windows-2022/x64) on every `v*` tag or manual dispatch, and uploads them
+`.github/workflows/desktop.yml` builds two .dmgs (macos-15 for Apple
+Silicon, macos-15-intel for Intel) and the .msi (windows-2022/x64) on every `v*` tag or manual dispatch, and uploads them
 as artifacts. On macOS it then spawns the built bundle's own sidecar path
 (the shim) and requires the real MCP JSON-RPC handshake to answer - the
 regression this packaging exists to prevent, proven on every build.
@@ -112,7 +112,10 @@ The bundles are **unsigned** until accounts exist:
   `APPLE_CERTIFICATE`/`APPLE_ID` secrets are set in the workflow.
 - **Windows:** SmartScreen shows "unrecognized app" (More info -> Run
   anyway). Fix = an Authenticode certificate wired into the same step.
-- An Intel-mac build is a second matrix row (macos-13) if anyone needs it.
+- Intel Macs get their own dmg (`Manifold_<ver>_x64.dmg`) from the
+  `macos-15-intel` runner. GitHub retires its last x86_64 macOS image around
+  Aug 2027; after that an Intel build needs a self-hosted Intel runner or a
+  local build on an Intel Mac (same steps as above).
 
 ## Known limits (v1)
 

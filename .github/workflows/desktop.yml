@@ -1,4 +1,5 @@
-# Desktop builds: .dmg (macOS arm64) and .msi (Windows x64) on demand or tag.
+# Desktop builds: .dmg (macOS arm64 AND Intel x64) and .msi (Windows x64)
+# on demand or tag.
 #
 # Unsigned by design for now - signing needs org secrets:
 #   macOS: Developer ID cert + notarization (APPLE_CERT*, APPLE_ID...)
@@ -17,7 +18,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-14
+          # Apple Silicon. GitHub is retiring macos-14 (changelog 2026-10-01); macos-15 is arm64.
+          - os: macos-15
+            bundles: dmg
+          # Intel. PyInstaller and the shim build for the HOST arch, so an
+          # x64 dmg needs an x64 runner (no cross-compile). macos-15-intel is
+          # GitHub's last x86_64 macOS image, supported until ~Aug 2027.
+          - os: macos-15-intel
             bundles: dmg
           - os: windows-2022
             bundles: msi
@@ -99,9 +106,16 @@ jobs:
           # action nests them.
           mapfile -t installers < <(find dist -type f \( -name '*.dmg' -o -name '*.msi' \) | sort)
           printf 'publishing %s\n' "${installers[@]}"
-          test "${#installers[@]}" -ge 2 || { echo "expected a .dmg AND a .msi, found ${#installers[@]}" >&2; exit 1; }
+          # Name each expected installer rather than counting: a count of 3
+          # would pass with two arm64 dmgs and no Intel one. Tauri puts the
+          # arch in the dmg name (_aarch64.dmg / _x64.dmg).
+          missing=0
+          for pat in '*_aarch64.dmg' '*_x64.dmg' '*.msi'; do
+            find dist -type f -name "$pat" | grep -q . || { echo "missing installer matching $pat" >&2; missing=1; }
+          done
+          test "$missing" -eq 0 || exit 1
           gh release create "${{ github.ref_name }}" \
             "${installers[@]}" \
             --repo "${{ github.repository }}" \
             --title "Manifold ${{ github.ref_name }}" \
-            --notes "Unsigned builds: macOS shows an \"unidentified developer\" warning (right-click the app -> Open); Windows shows a SmartScreen warning (More info -> Run anyway). See docs/desktop-build.md."
+            --notes "macOS: _aarch64.dmg is Apple Silicon (M1 and later), _x64.dmg is Intel. Unsigned builds: macOS shows an \"unidentified developer\" warning (right-click the app -> Open); Windows shows a SmartScreen warning (More info -> Run anyway). See docs/desktop-build.md."

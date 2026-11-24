@@ -7167,3 +7167,24 @@ provisioning-timeout message said "answered SSH but did not finish
 provisioning" for `signal == "unknown"`, which means "we could not ask" - a
 distinction the signal function goes out of its way to preserve and the
 message threw away.
+
+## 2026-11-24 — Phase 113: an Intel Mac gets its own dmg
+
+**What.** The desktop workflow builds a second macOS dmg on the
+`macos-15-intel` runner (`Manifold_<ver>_x64.dmg`), and the Apple Silicon row
+moves from `macos-14` (GitHub announced its retirement on 2026-10-01) to `macos-15`. The
+release job now names each installer it requires (`*_aarch64.dmg`,
+`*_x64.dmg`, `*.msi`) instead of counting files.
+
+**Alternatives.** (1) A universal binary: Tauri can lipo the Rust shell, but
+the PyInstaller onedir backend freezes for the host arch only, so "universal"
+would mean freezing twice and merging ~100MB of `_internal/` per-file - a
+fragile build for one user. (2) Cross-building x64 on the arm64 runner under
+Rosetta: possible, but the dmg handshake test would then run translated, not
+native, and prove less. (3) A runner-label count of 3: passes with two arm64
+dmgs and no Intel one, which is the exact failure this phase exists to catch.
+
+**Why.** Separate native builds are the same pipeline twice, each proven by
+the same mount-and-handshake step on its own arch. Shelf life: GitHub
+supports x86_64 macOS images until about Aug 2027; after that this row needs
+a self-hosted Intel runner or a local build.
